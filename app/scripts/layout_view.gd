@@ -2,6 +2,7 @@ extends Control
 
 const LayoutGeometry = preload("res://scripts/layout_geometry.gd")
 const WireframeShader = preload("res://shaders/layout_wireframe.gdshader")
+enum CameraMode { DRONE, ORBIT }
 
 signal selected(path: String)
 signal camera_changed(camera: Dictionary)
@@ -19,6 +20,18 @@ var distance := 8.0
 var yaw := 0.6
 var pitch := 0.3
 var world_up := Vector3.UP
+var camera_mode: CameraMode = CameraMode.DRONE:
+	set(value):
+		camera_mode = value
+		set_mouse_capture(false)
+		orbiting = false
+		dragging = false
+		queue_redraw()
+var mouse_captured := false
+var move_speed := 2.0
+var look_sensitivity := 0.003
+var _flight_keys: Dictionary = {}
+var _capture_cursor := Vector2.ZERO
 var orbiting := false
 var dragging := false
 var drag_start := Vector2.ZERO
@@ -48,6 +61,9 @@ func _view_rect() -> Rect2:
 
 func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_STOP
+	focus_mode = Control.FOCUS_CLICK
+	focus_exited.connect(func(): set_mouse_capture(false))
+	set_process(false)
 	clip_contents = true
 	wire_viewport = SubViewport.new()
 	wire_viewport.own_world_3d = true
@@ -65,6 +81,109 @@ func _ready() -> void:
 	selection_material.set_shader_parameter("wire_color", Color("62dac2"))
 	resized.connect(_sync_view)
 	_rebuild_geometry()
+
+func set_mouse_capture(capture: bool, restore_cursor := true) -> void:
+	if capture and (camera_mode != CameraMode.DRONE or not is_visible_in_tree()):
+		return
+	if capture == mouse_captured:
+		return
+	mouse_captured = capture
+	orbiting = false
+	dragging = false
+	_flight_keys.clear()
+	set_process(capture)
+	if capture:
+		var rectangle := _view_rect()
+		_capture_cursor = get_local_mouse_position().clamp(rectangle.position, rectangle.end)
+		grab_focus()
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	else:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		if restore_cursor and is_inside_tree() and get_window().has_focus():
+			get_viewport().warp_mouse(get_global_transform_with_canvas() * _capture_cursor)
+	queue_redraw()
+
+func _notification(what: int) -> void:
+	if what in [NOTIFICATION_WM_WINDOW_FOCUS_OUT, NOTIFICATION_APPLICATION_FOCUS_OUT]:
+		set_mouse_capture(false, false)
+		orbiting = false
+		dragging = false
+	elif what == NOTIFICATION_VISIBILITY_CHANGED and not is_visible_in_tree():
+		set_mouse_capture(false, false)
+
+func _exit_tree() -> void:
+	set_mouse_capture(false, false)
+
+func _unhandled_key_input(event: InputEvent) -> void:
+	if not event is InputEventKey or not event.pressed or event.echo:
+		return
+	if event.ctrl_pressed or event.alt_pressed or event.meta_pressed:
+		return
+	var focused := get_viewport().gui_get_focus_owner()
+	if focused is LineEdit or focused is TextEdit:
+		return
+	if event.keycode == KEY_Z and camera_mode == CameraMode.DRONE:
+		if has_focus() or _view_rect().has_point(get_local_mouse_position()):
+			set_mouse_capture(true)
+			get_viewport().set_input_as_handled()
+
+func _input(event: InputEvent) -> void:
+	if not mouse_captured:
+		return
+	if event is InputEventMouseMotion:
+		_look(event.screen_relative, true)
+		get_viewport().set_input_as_handled()
+	elif event is InputEventMouseButton:
+		if event.pressed:
+			if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+				move_speed = minf(move_speed * 1.25, 1e9)
+			elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				move_speed = maxf(move_speed / 1.25, 0.0001)
+		# Captured clicks must not select or drag scene objects or activate UI.
+		get_viewport().set_input_as_handled()
+	elif event is InputEventKey:
+		if event.pressed and not event.echo and (event.keycode == KEY_ESCAPE or
+			(event.keycode == KEY_Z and not (event.ctrl_pressed or event.alt_pressed or event.meta_pressed))):
+			set_mouse_capture(false)
+			get_viewport().set_input_as_handled()
+			return
+		if event.ctrl_pressed or event.alt_pressed or event.meta_pressed:
+			_flight_keys.clear()
+			return
+		var key: int = event.physical_keycode if event.physical_keycode != 0 else event.keycode
+		if key in [KEY_W, KEY_A, KEY_S, KEY_D, KEY_Q, KEY_E, KEY_SHIFT]:
+			if event.pressed:
+				_flight_keys[key] = true
+			else:
+				_flight_keys.erase(key)
+			get_viewport().set_input_as_handled()
+
+func _process(delta: float) -> void:
+	if not mouse_captured:
+		return
+	var basis := _basis()
+	var movement := basis.x * (int(_flight_keys.has(KEY_D)) - int(_flight_keys.has(KEY_A)))
+	movement += basis.z * (int(_flight_keys.has(KEY_S)) - int(_flight_keys.has(KEY_W)))
+	movement += world_up * (int(_flight_keys.has(KEY_E)) - int(_flight_keys.has(KEY_Q)))
+	if movement.is_zero_approx():
+		return
+	var boost := 4.0 if _flight_keys.has(KEY_SHIFT) else 1.0
+	center += movement.normalized() * move_speed * boost * minf(delta, 0.1)
+	_camera_updated()
+
+func _look(motion: Vector2, drone: bool) -> void:
+	var eye := center + _basis().z * distance
+	var sensitivity := look_sensitivity if drone else 0.008
+	yaw -= motion.x * sensitivity
+	pitch = clampf(pitch + motion.y * sensitivity, -1.5, 1.5)
+	if drone:
+		# Keep the eye fixed: center remains a point in front of a flying camera.
+		center = eye - _basis().z * distance
+	_camera_updated()
+
+func _camera_updated() -> void:
+	camera_changed.emit(camera())
+	queue_redraw()
 
 func _rebuild_geometry() -> void:
 	if wire_viewport == null:
@@ -160,6 +279,7 @@ func frame_selection(all := false) -> void:
 	if minimum.is_finite():
 		center = (minimum + maximum) * 0.5
 		distance = maxf((maximum - minimum).length() * 1.25, 0.1)
+		move_speed = maxf(distance * 0.25, 0.01)
 		camera_changed.emit(camera())
 	queue_redraw()
 
@@ -186,7 +306,15 @@ func _draw() -> void:
 		var point := _project(_world(light.transform, [0, 0, 0]))
 		if point.is_finite():
 			draw_circle(point, 5, Color("f2d28b"), false, 1.5, true)
-	draw_string(ThemeDB.fallback_font, Vector2(18, 28), ("REMIX" if rendering else "LAYOUT") + "  ·  Middle/right drag: orbit  ·  Wheel: zoom  ·  F: frame", HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color("9bb0c0"))
+	var help := "Orbit · Right/middle drag: orbit · Wheel: zoom · F: frame"
+	if camera_mode == CameraMode.DRONE:
+		help = "Drone · Z: fly · Right/middle drag: look · Wheel: zoom · F: frame"
+	if mouse_captured:
+		help = "Drone · WASD: move · Q/E: down/up · Shift: fast · Wheel: speed · Z/Esc: release"
+		var aim := _view_rect().get_center()
+		draw_line(aim - Vector2(5, 0), aim + Vector2(5, 0), Color("c3d1df"))
+		draw_line(aim - Vector2(0, 5), aim + Vector2(0, 5), Color("c3d1df"))
+	draw_string(ThemeDB.fallback_font, Vector2(18, 28), ("REMIX" if rendering else "LAYOUT") + " · " + help, HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color("9bb0c0"))
 	if scene.is_empty():
 		draw_string(ThemeDB.fallback_font, size * 0.5 - Vector2(150, 0), "Open a project or create one from a capture", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color("9bb0c0"))
 
@@ -208,7 +336,11 @@ func _pick(position: Vector2) -> String:
 	return geometry.pick(origin, direction)
 
 func _gui_input(event: InputEvent) -> void:
+	if mouse_captured:
+		return
 	if event is InputEventMouseButton:
+		if event.pressed:
+			grab_focus()
 		if event.button_index in [MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT]:
 			orbiting = event.pressed
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
@@ -231,7 +363,6 @@ func _gui_input(event: InputEvent) -> void:
 				delta = delta.snapped(Vector3.ONE)
 			translation_requested.emit(delta)
 	if event is InputEventMouseMotion and orbiting:
-		yaw -= event.relative.x * 0.008
-		pitch = clampf(pitch + event.relative.y * 0.008, -1.5, 1.5)
-	camera_changed.emit(camera())
-	queue_redraw()
+		_look(event.relative, camera_mode == CameraMode.DRONE)
+	elif event is InputEventMouseButton:
+		_camera_updated()

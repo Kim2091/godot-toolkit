@@ -50,6 +50,12 @@ func run() -> void:
 	var texture := ImageTexture.create_from_image(background)
 	view.rendered_texture = texture
 	await settle()
+	# A drone look changes the pivot while keeping the eye fixed. The shared
+	# camera projection must still align the selection overlay with Remix.
+	view._look(Vector2(15, -8), true)
+	view.center += view._basis().x * 0.1
+	view.queue_redraw()
+	await settle()
 	var overlay_pixels := pixels(view.wire_viewport.get_texture().get_image())
 	check(overlay_pixels > 100 and overlay_pixels < layout_pixels * 0.75, "Remix overlay must draw only selected geometry")
 	var projected: Vector2 = view._project(Vector3(-1.1, 0, 0))

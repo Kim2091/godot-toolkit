@@ -160,6 +160,12 @@ func _build_ui() -> void:
 		viewport.show_render = value
 		viewport.queue_redraw())
 	view_tools.add_child(render_toggle)
+	var camera_mode := OptionButton.new()
+	camera_mode.add_item("Drone", LayoutView.CameraMode.DRONE)
+	camera_mode.add_item("Orbit", LayoutView.CameraMode.ORBIT)
+	camera_mode.tooltip_text = "Drone: press Z over the viewport for WASD movement and mouse look. Press Z or Escape to release."
+	camera_mode.item_selected.connect(func(index: int): viewport.camera_mode = camera_mode.get_item_id(index))
+	view_tools.add_child(camera_mode)
 	_button("Frame all", func(): viewport.frame_selection(true), view_tools)
 	_button("Frame selection", func(): viewport.frame_selection(), view_tools)
 	var snap := CheckButton.new()
@@ -519,4 +525,5 @@ func _unhandled_key_input(event: InputEvent) -> void:
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		viewport.set_mouse_capture(false)
 		_guard_unsaved(func(): get_tree().quit())

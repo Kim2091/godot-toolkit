@@ -26,7 +26,7 @@ To launch the already built app directly:
 ## Workflow
 
 1. Choose **New from capture**, select a Remix capture, and create the project in a new directory. Or choose **Open** for an existing Toolkit workfile.
-2. Start Remix with **Start / restart Remix**. Initial shader compilation can take tens of seconds. Orbit with middle/right drag, zoom with the wheel, and frame the selection with **F**.
+2. Start Remix with **Start / restart Remix**. Initial shader compilation can take tens of seconds. The camera defaults to **Drone**: press **Z** over the viewport to capture the mouse, look around with the mouse, and fly with **WASD**. **Q/E** moves down/up, **Shift** moves faster, and the wheel adjusts flight speed. Press **Z** or **Escape** to release the cursor. While released, middle/right drag looks around and the wheel zooms. Choose **Orbit** for orbit controls; **F** frames the selection in either mode. Controls work in both Layout and Remix views.
 3. Ingest an asset, select it in the asset library, then select a captured mesh and choose **Add mesh**, **Replace mesh**, or **Replace material**. Lights also attach to the selected captured asset.
 4. Select the authored object to edit its translation, rotation, scale, or USD properties. Shift-drag translates the selection; **Snap** snaps movement to whole scene units. Edits to a captured asset's replacement affect every captured instance of that hash.
 5. Save the project, or choose **Package mod** to create a new, self-contained replacement mod directory containing `mod.usda` and its dependencies.
@@ -75,6 +75,8 @@ python scripts/bootstrap.py gpu-test
 Native tests cover capture immutability, composition, shared instance edits, transaction rollback, undo/redo, material and mesh replacement, and packaging. Protocol tests cover normal sessions, invalid versions, truncation, oversized messages, and recoverable command errors. The Godot ingestion test checks DDS formats, mipmaps, channel values, glTF ingestion, and material dependency packaging. The GPU test checks visible rendered geometry and worker restart while retaining unsaved edits; it needs an active desktop session and supported GPU. Test screenshots and generated projects are retained under `.work/integration` and `.work/ingestion`.
 
 Layout tests cover nearest-hit picking with transformed instances, shared geometry, cache invalidation, GPU wireframe visibility, selection, resizing, and alignment of the transparent selection overlay with the Remix view.
+
+Camera tests cover drone movement and mouse look in Y-up and Z-up scenes, diagonal speed, speed adjustment, cursor release, focus loss, text-entry shortcuts, and switching back to Orbit.
 
 Texture tests cover referenced layers, Windows-style paths, authoring-layer overrides, missing and cleared assets, material sampling settings, and a four-color DDS texture verifying both UV axes across nine tiles (including negative UVs and UVs above one) in the Remix viewport.
 
