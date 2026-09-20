@@ -1,0 +1,1 @@
+{"enabled_classes": ["RefCounted", "OS", "Image", "ImageTexture", "RenderingServer", "Texture2D", "RenderingDevice", "Texture2DRD", "RDTextureFormat", "RDTextureView"]}

@@ -1,0 +1,179 @@
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index 19e9072329..9ac9c55ff5 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -590,7 +590,13 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
+ 
+ 	// We don't actually use this extension, but some runtime components on some platforms
+ 	// can and will fill the validation layers with useless info otherwise if not enabled.
++#ifdef WINDOWS_ENABLED
++	_register_requested_device_extension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, false);
++	_register_requested_device_extension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, false);
++#else
+ 	_register_requested_device_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, false);
++	_register_requested_device_extension(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME, false);
++#endif
+ 
+ 	if (Engine::get_singleton()->is_generate_spirv_debug_info_enabled()) {
+ 		_register_requested_device_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, true);
+@@ -3199,6 +3205,7 @@ RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQue
+ 
+ 	// Make a virtual queue on top of a real queue. Use the queue from the family with the least amount of virtual queues created.
+ 	uint32_t family_index = p_cmd_queue_family.id - 1;
++	if (p_identify_as_main_queue) main_queue_family_index = family_index;
+ 	TightLocalVector<Queue> &queue_family = queue_families[family_index];
+ 	uint32_t picked_queue_index = UINT_MAX;
+ 	uint32_t picked_virtual_count = UINT_MAX;
+@@ -3232,6 +3239,38 @@ RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQue
+ 	return CommandQueueID(command_queue);
+ }
+ 
++bool RenderingDeviceDriverVulkan::command_queue_add_external_sync(CommandQueueID p_queue, uint64_t p_wait, uint64_t p_signal) {
++	CommandQueue *queue = (CommandQueue *)p_queue.id;
++	queue->external_waits.push_back((VkSemaphore)p_wait);
++	queue->external_signals.push_back((VkSemaphore)p_signal);
++	return true;
++}
++
++void RenderingDeviceDriverVulkan::command_copy_external_texture(CommandBufferID p_buffer, uint64_t p_image, TextureID p_target, uint32_t p_width, uint32_t p_height) {
++	const auto *buffer = (const CommandBufferInfo *)p_buffer.id;
++	const auto *target = (const TextureInfo *)p_target.id;
++	VkImageMemoryBarrier barrier = {};
++	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++	barrier.image = (VkImage)p_image;
++	barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++	barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++	barrier.dstQueueFamilyIndex = main_queue_family_index;
++	barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++	barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++	vkCmdPipelineBarrier(buffer->vk_command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	VkImageCopy copy = {};
++	copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	copy.dstSubresource = copy.srcSubresource;
++	copy.extent = { p_width, p_height, 1 };
++	vkCmdCopyImage(buffer->vk_command_buffer, (VkImage)p_image, VK_IMAGE_LAYOUT_GENERAL, target->vk_view_create_info.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
++	barrier.srcQueueFamilyIndex = main_queue_family_index;
++	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++	barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++	barrier.dstAccessMask = 0;
++	vkCmdPipelineBarrier(buffer->vk_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++}
++
+ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) {
+ 	DEV_ASSERT(p_cmd_queue.id != 0);
+ 
+@@ -3298,6 +3337,15 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 			signal_semaphores.push_back(semaphore);
+ 		}
+ 
++		for (VkSemaphore semaphore : command_queue->external_waits) {
++			wait_semaphores.push_back(semaphore);
++			wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++		}
++		for (VkSemaphore semaphore : command_queue->external_signals) {
++			signal_semaphores.push_back(semaphore);
++		}
++		command_queue->external_waits.clear();
++		command_queue->external_signals.clear();
+ 		VkSubmitInfo submit_info = {};
+ 		submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+ 		submit_info.waitSemaphoreCount = wait_semaphores.size();
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.h b/drivers/vulkan/rendering_device_driver_vulkan.h
+index 0e2726a593..3f01d441d4 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.h
++++ b/drivers/vulkan/rendering_device_driver_vulkan.h
+@@ -372,7 +372,10 @@ public:
+ 
+ 	// ----- QUEUE -----
+ private:
++	uint32_t main_queue_family_index = 0;
+ 	struct CommandQueue {
++		LocalVector<VkSemaphore> external_waits;
++		LocalVector<VkSemaphore> external_signals;
+ 		LocalVector<VkSemaphore> image_semaphores;
+ 		LocalVector<SwapChain *> image_semaphores_swap_chains;
+ 		LocalVector<uint32_t> pending_semaphores_for_execute;
+@@ -385,6 +388,8 @@ private:
+ 
+ public:
+ 	virtual CommandQueueID command_queue_create(CommandQueueFamilyID p_cmd_queue_family, bool p_identify_as_main_queue = false) override final;
++	virtual bool command_queue_add_external_sync(CommandQueueID, uint64_t, uint64_t) override;
++	virtual void command_copy_external_texture(CommandBufferID, uint64_t, TextureID, uint32_t, uint32_t) override;
+ 	virtual Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) override final;
+ 	virtual void command_queue_free(CommandQueueID p_cmd_queue) override final;
+ 
+diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
+index bb3d1032ff..d68fa6626d 100644
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -1248,6 +1248,31 @@ Error RenderingDevice::buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p
+ 	return _buffer_update(buffer, p_buffer, p_offset, p_size, p_data);
+ }
+ 
++void RenderingDevice::external_frame_flush() {
++	ERR_RENDER_THREAD_GUARD();
++	_flush_and_stall_for_all_frames(false);
++	_begin_frame();
++}
++
++Error RenderingDevice::texture_copy_from_external(RID p_target, uint64_t p_image, uint64_t p_ready, uint64_t p_released) {
++	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
++	Texture *texture = texture_owner.get_or_null(p_target);
++	ERR_FAIL_NULL_V(texture, ERR_INVALID_PARAMETER);
++	ERR_FAIL_COND_V(!p_image || !p_ready || !p_released, ERR_INVALID_PARAMETER);
++	ERR_FAIL_COND_V(!driver->command_queue_add_external_sync(main_queue, p_ready, p_released), ERR_UNAVAILABLE);
++	struct Copy { uint64_t image; RDD::TextureID target; uint32_t width; uint32_t height; };
++	Copy *copy = memnew(Copy);
++	*copy = {p_image, texture->driver_id, texture->width, texture->height};
++	CallbackResource resource;
++	resource.rid = p_target;
++	resource.usage = CALLBACK_RESOURCE_USAGE_COPY_TO;
++	return driver_callback_add([](RDD *p_driver, RDD::CommandBufferID p_command, void *p_userdata) {
++		Copy *data = (Copy *)p_userdata;
++		p_driver->command_copy_external_texture(p_command, data->image, data->target, data->width, data->height);
++		memdelete(data);
++	}, copy, VectorView<CallbackResource>(&resource, 1));
++}
++
+ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void *p_userdata, VectorView<CallbackResource> p_resources) {
+ 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+ 
+@@ -9329,6 +9354,8 @@ void RenderingDevice::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("texture_set_discardable", "texture", "discardable"), &RenderingDevice::texture_set_discardable);
+ 	ClassDB::bind_method(D_METHOD("texture_is_discardable", "texture"), &RenderingDevice::texture_is_discardable);
+ 
++	ClassDB::bind_method(D_METHOD("external_frame_flush"), &RenderingDevice::external_frame_flush);
++	ClassDB::bind_method(D_METHOD("texture_copy_from_external", "target", "image", "ready", "released"), &RenderingDevice::texture_copy_from_external);
+ 	ClassDB::bind_method(D_METHOD("texture_copy", "from_texture", "to_texture", "from_pos", "to_pos", "size", "src_mipmap", "dst_mipmap", "src_layer", "dst_layer"), &RenderingDevice::texture_copy);
+ 	ClassDB::bind_method(D_METHOD("texture_clear", "texture", "color", "base_mipmap", "mipmap_count", "base_layer", "layer_count"), &RenderingDevice::texture_clear);
+ 	ClassDB::bind_method(D_METHOD("texture_resolve_multisample", "from_texture", "to_texture"), &RenderingDevice::texture_resolve_multisample);
+diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
+index f2b1085565..28f5530fab 100644
+--- a/servers/rendering/rendering_device.h
++++ b/servers/rendering/rendering_device.h
+@@ -321,6 +321,8 @@ public:
+ 		CallbackResourceUsage usage = CALLBACK_RESOURCE_USAGE_NONE;
+ 	};
+ 
++	void external_frame_flush();
++	Error texture_copy_from_external(RID p_target, uint64_t p_image, uint64_t p_ready, uint64_t p_released);
+ 	Error driver_callback_add(RDD::DriverCallback p_callback, void *p_userdata, VectorView<CallbackResource> p_resources);
+ 
+ 	/*****************/
+diff --git a/servers/rendering/rendering_device_driver.h b/servers/rendering/rendering_device_driver.h
+index c9d566f215..30e8b50486 100644
+--- a/servers/rendering/rendering_device_driver.h
++++ b/servers/rendering/rendering_device_driver.h
+@@ -438,6 +438,11 @@ public:
+ 	// ----- QUEUE -----
+ 
+ 	virtual CommandQueueID command_queue_create(CommandQueueFamilyID p_cmd_queue_family, bool p_identify_as_main_queue = false) = 0;
++
++	// External frames are copied into an ordinary engine texture. Synchronization belongs
++	// to the main submission, so the imported image can be released after the copy.
++	virtual bool command_queue_add_external_sync(CommandQueueID, uint64_t, uint64_t) { return false; }
++	virtual void command_copy_external_texture(CommandBufferID, uint64_t, TextureID, uint32_t, uint32_t) {}
+ 	virtual Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) = 0;
+ 	virtual void command_queue_free(CommandQueueID p_cmd_queue) = 0;
+ 

@@ -1,0 +1,16 @@
+/.work/
+/ref/
+/build/
+/dist/
+/app/.godot/
+/app/bin/
+/app/materials/
+*.user
+__pycache__/
+.pytest_cache/
+/imgui.ini
+/metrics.txt
+/remix-native.log
+/app/imgui.ini
+/app/metrics.txt
+/app/remix-native.log

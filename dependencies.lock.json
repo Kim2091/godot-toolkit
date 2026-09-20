@@ -1,0 +1,8 @@
+{
+  "godot": {"url": "https://github.com/godotengine/godot.git", "commit": "57277407e77e61b161f35dbd7aeb510f7a9e26a6", "reference": "godot"},
+  "remix": {"url": "https://github.com/sambow23/dxvk-remix-gmod.git", "commit": "0440ede46318d9e95dcda6073050659fe5b34f9d", "reference": "dxvk-remix-gmod"},
+  "godot-cpp": {"url": "https://github.com/godotengine/godot-cpp.git", "commit": "714c9e2c165db2dcb7e6ea57e62a04204d3cfbfa"},
+  "usd": {"url": "https://github.com/PixarAnimationStudios/OpenUSD/archive/refs/tags/v25.11.tar.gz", "archive": "openusd.tar.gz", "source": "OpenUSD-25.11", "sha256": "c37c633b5037a4552f61574670ecca8836229b78326bd62622f3422671188667"},
+  "tbb2021": {"url": "https://github.com/oneapi-src/oneTBB/archive/refs/tags/v2021.13.0.tar.gz", "archive": "tbb2021.tar.gz", "source": "oneTBB-2021.13.0", "sha256": "3ad5dd08954b39d113dc5b3f8a8dc6dc1fd5250032b7c491eb07aed5c94133e1"},
+  "assimp": {"url": "https://github.com/assimp/assimp/archive/refs/tags/v6.0.2.tar.gz", "archive": "assimp.tar.gz", "source": "assimp-6.0.2", "sha256": "d1822d9a19c9205d6e8bc533bf897174ddb360ce504680f294170cc1d6319751"}
+}

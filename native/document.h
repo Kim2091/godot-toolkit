@@ -1,0 +1,66 @@
+#pragma once
+
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+#include <nlohmann/json.hpp>
+#include <pxr/usd/usd/stage.h>
+
+namespace editor {
+using Json = nlohmann::json;
+namespace fs = std::filesystem;
+
+struct Edit {
+  std::string label;
+  pxr::SdfLayerHandle layer;
+  std::string before;
+  std::string after;
+};
+
+class Document {
+public:
+  Json dispatch(const Json& request);
+  Json describe() const;
+  Json scene() const;
+  Json inspect(const std::string& path) const;
+  void open(const fs::path& path);
+  void create(const fs::path& capture, const fs::path& project);
+  void save();
+  void package(const fs::path& directory);
+  void edit(const std::string& label, const std::function<void()>& operation);
+  void undo();
+  void redo();
+  Json ingest(const Json& request);
+  pxr::UsdStageRefPtr stage() const { return stage_; }
+  uint64_t revision() const { return revision_; }
+
+private:
+  void require_stage() const;
+  void select_layer(const std::string& identifier);
+  void set_property(const Json& request);
+  void set_transform(const Json& request);
+  std::string anchor_for(const std::string& path) const;
+  std::string authored_path(const std::string& path) const;
+  std::string add_reference(const Json& request);
+  std::string add_light(const Json& request);
+  void replace_material(const Json& request);
+  void mutate(const Json& request, Json& result);
+  bool dirty() const;
+  pxr::UsdStageRefPtr stage_;
+  pxr::SdfLayerHandle edit_layer_;
+  fs::path project_path_;
+  std::vector<Edit> undo_;
+  std::vector<Edit> redo_;
+  std::map<std::string, std::string> saved_layers_;
+  uint64_t revision_ = 0;
+};
+
+Json compose_scene(const pxr::UsdStageRefPtr& stage, uint64_t revision);
+using TextureConverter = std::function<void(const fs::path&, const fs::path&, const std::string&)>;
+Json ingest_asset(const Json& request, const fs::path& project_directory,
+                  const TextureConverter& convert = {}, const std::function<bool()>& canceled = {});
+std::string layer_text(const pxr::SdfLayerHandle& layer);
+void atomic_save_layer(const pxr::SdfLayerHandle& layer);
+}

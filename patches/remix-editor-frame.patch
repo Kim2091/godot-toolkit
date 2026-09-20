@@ -1,0 +1,290 @@
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index faa0fdc6..ef9e4ccf 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -427,6 +427,8 @@ namespace dxvk {
+       &devExtensions.khrDriverProperties,
+ #if defined(_WIN32)
+       &devExtensions.khrExternalMemoryWin32,
++#else
++      &devExtensions.khrExternalMemoryFd,
+ #endif
+       &devExtensions.khrImageFormatList,
+       &devExtensions.khrSamplerMirrorClampToEdge,
+@@ -453,6 +455,8 @@ namespace dxvk {
+       &devExtensions.khrExternalSemaphore,
+ #if defined(_WIN32)
+       &devExtensions.khrExternalSemaphoreWin32,
++#else
++      &devExtensions.khrExternalSemaphoreFd,
+ #endif
+       &devExtensions.extShaderAtomicFloat,
+     };
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index decaf9bd..c4122b47 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -2162,6 +2162,26 @@ namespace dxvk {
+   }
+ 
+ 
++  // NV-DXVK start: External editor frame ownership transfer
++  void DxvkContext::externalImageBarrier(const Rc<DxvkImage>& image, bool acquire, bool firstFrame) {
++    spillRenderPass(false);
++    m_execBarriers.recordCommands(m_cmd);
++    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++    barrier.image = image->handle();
++    barrier.oldLayout = firstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
++    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    const auto family = m_device->queues().graphics.queueFamily;
++    barrier.srcQueueFamilyIndex = firstFrame ? VK_QUEUE_FAMILY_IGNORED : (acquire ? VK_QUEUE_FAMILY_EXTERNAL : family);
++    barrier.dstQueueFamilyIndex = firstFrame ? VK_QUEUE_FAMILY_IGNORED : (acquire ? family : VK_QUEUE_FAMILY_EXTERNAL);
++    barrier.srcAccessMask = acquire ? 0 : VK_ACCESS_MEMORY_WRITE_BIT;
++    barrier.dstAccessMask = acquire ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT) : 0;
++    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    m_cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++    m_cmd->trackResource<DxvkAccess::Write>(image);
++  }
++  // NV-DXVK end
++
+   void DxvkContext::transformImage(
+     const Rc<DxvkImage>&            dstImage,
+     const VkImageSubresourceRange&  dstSubresources,
+diff --git a/src/dxvk/dxvk_context.h b/src/dxvk/dxvk_context.h
+index 4b87eac3..b0b23d02 100644
+--- a/src/dxvk/dxvk_context.h
++++ b/src/dxvk/dxvk_context.h
+@@ -859,6 +859,9 @@ namespace dxvk {
+      * \param [in] srcLayout Current layout
+      * \param [in] dstLayout Desired layout
+      */
++    // NV-DXVK start: External editor frame ownership transfer
++    void externalImageBarrier(const Rc<DxvkImage>& image, bool acquire, bool firstFrame);
++    // NV-DXVK end
+     void transformImage(
+       const Rc<DxvkImage>&            dstImage,
+       const VkImageSubresourceRange&  dstSubresources,
+diff --git a/src/dxvk/dxvk_extensions.h b/src/dxvk/dxvk_extensions.h
+index a25fadb1..c7eee412 100644
+--- a/src/dxvk/dxvk_extensions.h
++++ b/src/dxvk/dxvk_extensions.h
+@@ -367,10 +367,14 @@ namespace dxvk {
+ // NV-DXVK start: Win32 external-handle extensions are platform-specific
+ #if defined(_WIN32)
+     DxvkExt khrExternalMemoryWin32            = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,              DxvkExtMode::Optional };
++#else
++    DxvkExt khrExternalMemoryFd = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, DxvkExtMode::Optional };
+ #endif
+     DxvkExt khrExternalSemaphore              = { VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,                 DxvkExtMode::Optional };
+ #if defined(_WIN32)
+     DxvkExt khrExternalSemaphoreWin32         = { VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,           DxvkExtMode::Optional };
++#else
++    DxvkExt khrExternalSemaphoreFd = { VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME, DxvkExtMode::Optional };
+ #endif
+ // NV-DXVK end
+     DxvkExt extBufferDeviceAddress            = { VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,              DxvkExtMode::Optional };
+diff --git a/src/linux/remix_linux_api.cpp b/src/linux/remix_linux_api.cpp
+index a00da745..73d94fa8 100644
+--- a/src/linux/remix_linux_api.cpp
++++ b/src/linux/remix_linux_api.cpp
+@@ -376,6 +376,15 @@ namespace {
+ }
+ 
+ extern "C" {
++#if defined(REMIX_NATIVE_WITH_RTX_RENDERER)
++  REMIXAPI int REMIXAPI_CALL remixapi_EditorConfigureSharedFrame(EditorSharedFrame* frame) {
++    if (!frame) return -1;
++    std::lock_guard lock(g_apiMutex);
++    try { return g_runtime.configureEditorFrame(*frame); }
++    catch (...) { return -10; }
++  }
++#endif
++
+ 
+   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_Startup(
+       const remixapi_StartupInfo* info) {
+diff --git a/src/linux/remix_native_renderer.cpp b/src/linux/remix_native_renderer.cpp
+index 4072095f..f4114af8 100644
+--- a/src/linux/remix_native_renderer.cpp
++++ b/src/linux/remix_native_renderer.cpp
+@@ -136,6 +136,7 @@ namespace dxvk {
+       fork_hooks::clearPresentedScreenshotRequest();
+     }
+ 
++    destroyEditorFrame();
+     m_swapchainImageViews.clear();
+     m_swapchainImages.clear();
+     m_context = nullptr;
+@@ -464,6 +465,7 @@ namespace dxvk {
+       return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+     }
+ 
++    if (m_editorImage != nullptr) return presentEditorFrame();
+     remixapi_WindowState windowState = {};
+     remixapi_ErrorCode status = m_window.getWindowState(windowState);
+     if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
+@@ -587,6 +589,113 @@ namespace dxvk {
+     return REMIXAPI_ERROR_CODE_SUCCESS;
+   }
+ 
++
++  int RemixNativeRuntime::configureEditorFrame(EditorSharedFrame& frame) {
++    if (!isInitialized() || frame.version != 1 || frame.width < 16 || frame.height < 16 ||
++        frame.width > 8192 || frame.height > 8192 || m_editorImage != nullptr) return -1;
++    auto vk = m_device->vkd();
++    auto device = vk->device();
++    auto memoryFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR"));
++    auto semaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
++    if (!memoryFd || !semaphoreFd) return -2;
++    VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
++    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++    VkImageCreateInfo image = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    image.pNext = &external;
++    image.imageType = VK_IMAGE_TYPE_2D;
++    image.format = VK_FORMAT_R8G8B8A8_UNORM;
++    image.extent = { frame.width, frame.height, 1 };
++    image.mipLevels = 1; image.arrayLayers = 1; image.samples = VK_SAMPLE_COUNT_1_BIT;
++    image.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    if (vk->vkCreateImage(device, &image, nullptr, &m_editorNativeImage) != VK_SUCCESS) return -3;
++    VkMemoryRequirements requirements;
++    vk->vkGetImageMemoryRequirements(device, m_editorNativeImage, &requirements);
++    auto properties = m_device->adapter()->memoryProperties();
++    frame.memory_type = UINT32_MAX;
++    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
++      if ((requirements.memoryTypeBits & (1u << i)) && (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { frame.memory_type = i; break; }
++    if (frame.memory_type == UINT32_MAX) return -4;
++    frame.allocation_size = requirements.size;
++    VkExportMemoryAllocateInfo exports = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
++    exports.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++    VkMemoryDedicatedAllocateInfo dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
++    dedicated.pNext = &exports; dedicated.image = m_editorNativeImage;
++    VkMemoryAllocateInfo allocation = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    allocation.pNext = &dedicated; allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = frame.memory_type;
++    if (vk->vkAllocateMemory(device, &allocation, nullptr, &m_editorMemory) != VK_SUCCESS ||
++        vk->vkBindImageMemory(device, m_editorNativeImage, m_editorMemory, 0) != VK_SUCCESS) return -5;
++    VkExportSemaphoreCreateInfo exportSemaphore = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
++    exportSemaphore.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
++    VkSemaphoreCreateInfo semaphore = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++    semaphore.pNext = &exportSemaphore;
++    if (vk->vkCreateSemaphore(device, &semaphore, nullptr, &m_editorReady) != VK_SUCCESS ||
++        vk->vkCreateSemaphore(device, &semaphore, nullptr, &m_editorReleased) != VK_SUCCESS) return -6;
++    VkMemoryGetFdInfoKHR memoryInfo = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
++    memoryInfo.memory = m_editorMemory; memoryInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++    VkSemaphoreGetFdInfoKHR semaphoreInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
++    semaphoreInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
++    if (memoryFd(device, &memoryInfo, &frame.memory_fd) != VK_SUCCESS) return -7;
++    semaphoreInfo.semaphore = m_editorReady;
++    if (semaphoreFd(device, &semaphoreInfo, &frame.ready_fd) != VK_SUCCESS) return -8;
++    semaphoreInfo.semaphore = m_editorReleased;
++    if (semaphoreFd(device, &semaphoreInfo, &frame.released_fd) != VK_SUCCESS) return -9;
++    VkPhysicalDeviceIDProperties identity = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++    VkPhysicalDeviceProperties2 properties2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
++    properties2.pNext = &identity;
++    m_device->adapter()->vki()->vkGetPhysicalDeviceProperties2(m_device->adapter()->handle(), &properties2);
++    std::copy_n(identity.deviceUUID, 16, frame.device_uuid);
++    DxvkImageCreateInfo dxImage = {};
++    dxImage.type = image.imageType; dxImage.format = image.format; dxImage.extent = image.extent;
++    dxImage.numLayers = 1; dxImage.mipLevels = 1; dxImage.sampleCount = VK_SAMPLE_COUNT_1_BIT;
++    dxImage.usage = image.usage; dxImage.stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++    dxImage.access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    dxImage.tiling = image.tiling; dxImage.layout = VK_IMAGE_LAYOUT_GENERAL;
++    m_editorImage = new DxvkImage(m_device.ptr(), dxImage, m_editorNativeImage);
++    DxvkImageViewCreateInfo view = {};
++    view.type = VK_IMAGE_VIEW_TYPE_2D; view.format = image.format;
++    view.usage = image.usage; view.aspect = VK_IMAGE_ASPECT_COLOR_BIT; view.numLevels = 1; view.numLayers = 1;
++    m_editorView = m_device->createImageView(m_editorImage, view);
++    SDL_HideWindow(m_window.handle());
++    return 0;
++  }
++
++  remixapi_ErrorCode RemixNativeRuntime::presentEditorFrame() {
++    m_context->externalImageBarrier(m_editorImage, true, m_editorFrameNumber == 0);
++    DxvkRenderTargets targets;
++    targets.color[0].view = m_editorView;
++    targets.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    m_context->bindRenderTargets(targets);
++    VkClearValue clear = {}; clear.color.float32[3] = 1;
++    m_context->clearRenderTarget(m_editorView, VK_IMAGE_ASPECT_COLOR_BIT, clear);
++    m_context->getSceneManager().getLightManager().queueAutoInstancePersistent();
++    m_context->endFrame(0, m_editorImage, true);
++    m_context->onPresent(m_editorImage);
++    m_context->externalImageBarrier(m_editorImage, false, false);
++    auto commands = m_context->endRecording();
++    m_device->submitCommandList(commands, m_editorFrameNumber ? m_editorReleased : VK_NULL_HANDLE, m_editorReady);
++    // Do not advertise a frame until the ready semaphore is signaled. If this worker
++    // crashes, the editor never submits a GPU wait for work that cannot finish.
++    m_device->waitForIdle();
++    m_device->incrementPresentCount();
++    ++m_editorFrameNumber;
++    m_context->beginRecording(m_device->createCommandList());
++    return REMIXAPI_ERROR_CODE_SUCCESS;
++  }
++
++  void RemixNativeRuntime::destroyEditorFrame() {
++    m_editorView = nullptr; m_editorImage = nullptr;
++    if (m_device != nullptr) {
++      auto vk = m_device->vkd(); auto device = vk->device();
++      if (m_editorReady) vk->vkDestroySemaphore(device, m_editorReady, nullptr);
++      if (m_editorReleased) vk->vkDestroySemaphore(device, m_editorReleased, nullptr);
++      if (m_editorNativeImage) vk->vkDestroyImage(device, m_editorNativeImage, nullptr);
++      if (m_editorMemory) vk->vkFreeMemory(device, m_editorMemory, nullptr);
++    }
++    m_editorReady = VK_NULL_HANDLE; m_editorReleased = VK_NULL_HANDLE;
++    m_editorNativeImage = VK_NULL_HANDLE; m_editorMemory = VK_NULL_HANDLE; m_editorFrameNumber = 0;
++  }
++
+   remixapi_FeatureAvailability RemixNativeRuntime::getFeatureAvailability() const {
+     remixapi_FeatureAvailability result = {};
+     result.compiledFeatures =
+diff --git a/src/linux/remix_native_runtime.h b/src/linux/remix_native_runtime.h
+index 1f0f2587..93d37307 100644
+--- a/src/linux/remix_native_runtime.h
++++ b/src/linux/remix_native_runtime.h
+@@ -30,6 +30,7 @@
+ #include <remix/remix_c.h>
+ 
+ #include "remix_sdl_window.h"
++#include "editor_shared_frame.h"
+ 
+ #if defined(REMIX_NATIVE_WITH_RTX_RENDERER)
+ #include "../util/rc/util_rc_ptr.h"
+@@ -92,6 +93,7 @@ namespace dxvk {
+       "Synchronize native output with the display. Disabled uses Immediate, then Mailbox, then FIFO fallback. Frame generation may require V-Sync off.",
+       args.flags = RtxOptionFlags::UserSetting);
+     // NV-DXVK end
++    int configureEditorFrame(EditorSharedFrame& frame);
+     RtxContext* context() const {
+       return m_context.ptr();
+     }
+@@ -116,6 +118,15 @@ namespace dxvk {
+     void createSwapchainViews();
+     static bool processSdlEvent(const SDL_Event* event, void* userData);
+ 
++    remixapi_ErrorCode presentEditorFrame();
++    void destroyEditorFrame();
++    Rc<DxvkImage> m_editorImage;
++    Rc<DxvkImageView> m_editorView;
++    VkImage m_editorNativeImage = VK_NULL_HANDLE;
++    VkDeviceMemory m_editorMemory = VK_NULL_HANDLE;
++    VkSemaphore m_editorReady = VK_NULL_HANDLE;
++    VkSemaphore m_editorReleased = VK_NULL_HANDLE;
++    uint64_t m_editorFrameNumber = 0;
+     RemixSdlWindow m_window;
+     Rc<DxvkInstance> m_instance;
+     Rc<DxvkDevice> m_device;
+diff --git a/src/linux/remix_sdl_window.h b/src/linux/remix_sdl_window.h
+index 371a0f97..b811b68e 100644
+--- a/src/linux/remix_sdl_window.h
++++ b/src/linux/remix_sdl_window.h
+@@ -85,7 +85,9 @@ namespace dxvk {
+     std::thread::id m_ownerThread;
+     bool m_ownsVideoSubsystem = false;
+     bool m_appInBackground = false;
++#if defined(__ANDROID__)
+     mutable void* m_surfaceWindow = nullptr;
++#endif
+     bool m_closeRequested = false;
+     bool m_guiWantsKeyboard = false;
+     bool m_guiWantsMouse = false;

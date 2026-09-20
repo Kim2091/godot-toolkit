@@ -1,0 +1,320 @@
+#include "channel.h"
+#include "shared_frame.h"
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
+#include <remix/remix_c.h>
+
+using Json = nlohmann::json;
+namespace {
+void checked(remixapi_ErrorCode code, const char* operation) {
+  if (code != REMIXAPI_ERROR_CODE_SUCCESS) throw std::runtime_error(std::string(operation) + " failed (Remix code " + std::to_string(code) + ")");
+}
+uint64_t hash64(const std::string& value) {
+  uint64_t h = 14695981039346656037ull;
+  for (unsigned char c : value) { h ^= c; h *= 1099511628211ull; }
+  return h ? h : 1;
+}
+remixapi_Float3D vector3(const Json& v) { return {v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()}; }
+remixapi_Transform transform(const Json& values) {
+  if (values.size() != 16) throw std::runtime_error("Expected 16 transform elements");
+  remixapi_Transform result{};
+  for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) result.matrix[r][c] = values.at(c * 4 + r).get<float>();
+  return result;
+}
+#ifdef _WIN32
+using NativePath = std::wstring;
+NativePath native_path(const std::string& value) { return std::filesystem::u8path(value).wstring(); }
+#else
+using NativePath = std::string;
+NativePath native_path(const std::string& value) { return value; }
+#endif
+
+class Renderer {
+public:
+  ~Renderer() {
+    if (running_) { clear(); api_.Shutdown(); }
+#ifdef _WIN32
+    if (window_) DestroyWindow(window_);
+    if (library_) FreeLibrary(reinterpret_cast<HMODULE>(library_));
+#else
+    if (library_) dlclose(library_);
+#endif
+  }
+  Json start(const Json& message) {
+    if (running_) throw std::runtime_error("Renderer already started");
+    auto path = native_path(message.at("library").get<std::string>());
+    checked(remixapi_lib_loadRemixDllAndInitialize(path.c_str(), &api_, &library_), "Load runtime");
+    remixapi_StartupInfo info{};
+    info.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
+    width_ = message.value("width", 1280u); height_ = message.value("height", 720u);
+    if (width_ < 16 || height_ < 16 || width_ > 8192 || height_ > 8192) throw std::runtime_error("Invalid viewport size");
+#ifdef _WIN32
+    const wchar_t* class_name = L"GodotRemixRenderer";
+    WNDCLASSW window_class{}; window_class.lpfnWndProc = DefWindowProcW;
+    window_class.hInstance = GetModuleHandleW(nullptr); window_class.lpszClassName = class_name;
+    RegisterClassW(&window_class);
+    window_ = CreateWindowExW(0, class_name, L"Remix render preview", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+      CW_USEDEFAULT, CW_USEDEFAULT, int(width_), int(height_), nullptr, nullptr, window_class.hInstance, nullptr);
+    if (!window_) throw std::runtime_error("Could not create renderer window");
+    info.hwnd = reinterpret_cast<remixapi_HWND>(window_);
+#else
+    info.windowTitle = "Remix render preview"; info.windowWidth = width_; info.windowHeight = height_;
+#endif
+    info.editorModeEnabled = true;
+    info.combineGuiInFinalColor = false;
+    checked(api_.Startup(&info), "Startup");
+    running_ = true;
+#ifndef _WIN32
+    if (message.contains("frame_channel")) {
+      auto configure = reinterpret_cast<ConfigureSharedFrame>(dlsym(library_, "remixapi_EditorConfigureSharedFrame"));
+      if (!configure) throw std::runtime_error("Runtime lacks the editor shared-frame patch");
+      EditorSharedFrame frame;
+      frame.width = width_; frame.height = height_;
+      struct Fds { EditorSharedFrame& f; ~Fds() { for (int fd : {f.memory_fd, f.ready_fd, f.released_fd}) if (fd >= 0) close(fd); } } fds{frame};
+      int result = configure(&frame);
+      if (result) throw std::runtime_error("Could not configure shared GPU output (" + std::to_string(result) + ")");
+      auto endpoint = message.at("frame_channel").get<std::string>();
+      sockaddr_un address{}; address.sun_family = AF_UNIX;
+      if (endpoint.size() >= sizeof(address.sun_path)) throw std::runtime_error("GPU frame channel path is too long");
+      std::copy(endpoint.begin(), endpoint.end(), address.sun_path);
+      int connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      if (connection < 0) throw std::runtime_error("Could not create the GPU frame channel");
+      struct Socket { int fd; ~Socket() { close(fd); } } socket_owner{connection};
+      if (connect(connection, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) throw std::runtime_error("Could not connect the GPU frame channel");
+      iovec payload{&frame, sizeof(frame)};
+      alignas(cmsghdr) char control[CMSG_SPACE(3 * sizeof(int))]{};
+      msghdr message{}; message.msg_iov = &payload; message.msg_iovlen = 1;
+      message.msg_control = control; message.msg_controllen = sizeof(control);
+      auto* header = CMSG_FIRSTHDR(&message);
+      header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(3 * sizeof(int));
+      int descriptors[]{frame.memory_fd, frame.ready_fd, frame.released_fd};
+      std::memcpy(CMSG_DATA(header), descriptors, sizeof(descriptors));
+      if (sendmsg(connection, &message, MSG_NOSIGNAL) != sizeof(frame)) throw std::runtime_error("Could not send GPU frame handles");
+      shared_ = true;
+    }
+#endif
+    checked(api_.SetConfigVariable("rtx.fallbackLightMode", "0"), "Disable fallback lighting");
+    // The pinned native fork's RTXDI path gives black analytical lighting in the
+    // embedded viewport. Its RIS path is covered by our rendered-image test.
+    checked(api_.SetConfigVariable("rtx.useRTXDI", "False"), "Select preview light sampling");
+    api_.SetUIState(REMIXAPI_UI_STATE_NONE);
+    camera_ = {{"position", {0, 2, 5}}, {"forward", {0, 0, -1}}, {"up", {0, 1, 0}}, {"right", {1, 0, 0}}, {"fov", 60.0}};
+    return {{"status", "ready"}, {"presentation", shared_ ? "shared_vulkan" : "native_window"}, {"width", width_}, {"height", height_}};
+  }
+  void clear() {
+    for (auto mesh : meshes_) api_.DestroyMesh(mesh);
+    for (auto light : lights_) api_.DestroyLight(light);
+    for (const auto& material : materials_) api_.DestroyMaterial(material.second);
+    meshes_.clear(); lights_.clear(); materials_.clear(); instances_.clear();
+    mesh_cache_.clear();
+  }
+  void scene(const Json& scene) {
+    require_running();
+    const auto meters_per_unit = scene.value("meters_per_unit", 0.01);
+    if (!std::isfinite(meters_per_unit) || meters_per_unit <= 0) throw std::runtime_error("Invalid USD scene units");
+    auto scale = std::to_string(0.01 / meters_per_unit);
+    checked(api_.SetConfigVariable("rtx.sceneScale", scale.c_str()), "Set USD scene scale");
+    clear();
+    try {
+      Json fallback{{"id", "default"}, {"albedo", {0.7, 0.7, 0.7}}};
+      material(fallback);
+      for (auto& m : scene.at("materials")) material(m);
+      for (auto& m : scene.at("meshes")) mesh(m);
+      for (auto& light : scene.at("lights")) add_light(light);
+      revision_ = scene.at("revision").get<uint64_t>();
+    } catch (...) { clear(); throw; }
+  }
+  void camera(const Json& data) { camera_ = data; }
+  void settings(const Json& data) {
+    require_running();
+    for (auto it = data.begin(); it != data.end(); ++it) checked(api_.SetConfigVariable(it.key().c_str(), it.value().get<std::string>().c_str()), "Set render setting");
+  }
+  Json frame() {
+    require_running();
+#ifdef _WIN32
+    MSG message;
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    if (!IsWindow(window_)) return {{"status", "closed"}};
+#else
+    checked(api_.PumpEvents(), "PumpEvents");
+    remixapi_WindowState state{};
+    checked(api_.GetWindowState(&state), "GetWindowState");
+    if (state.closeRequested) return {{"status", "closed"}};
+    if (!shared_) { width_ = state.drawableWidth; height_ = state.drawableHeight; }
+#endif
+    remixapi_CameraInfoParameterizedEXT parameters{};
+    parameters.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
+    parameters.position = vector3(camera_.at("position")); parameters.forward = vector3(camera_.at("forward"));
+    parameters.up = vector3(camera_.at("up")); parameters.right = vector3(camera_.at("right"));
+    parameters.fovYInDegrees = camera_.value("fov", 60.f);
+    parameters.nearPlane = camera_.value("near", 0.01f); parameters.farPlane = camera_.value("far", 100000.f);
+    parameters.aspect = float(width_) / float(std::max(height_, 1u));
+    remixapi_CameraInfo camera{};
+    camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO; camera.pNext = &parameters; camera.type = REMIXAPI_CAMERA_TYPE_WORLD;
+    checked(api_.SetupCamera(&camera), "SetupCamera");
+    for (const auto& instance : instances_) checked(api_.DrawInstance(&instance), "DrawInstance");
+    for (auto light : lights_) checked(api_.DrawLightInstance(light), "DrawLightInstance");
+    remixapi_PresentInfo present{}; present.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
+    checked(api_.Present(&present), "Present");
+    return {{"status", "presented"}, {"revision", revision_}, {"frame", ++frame_}};
+  }
+private:
+  void require_running() { if (!running_) throw std::runtime_error("Start the renderer first"); }
+  void material(const Json& data) {
+    remixapi_MaterialInfo info{}; info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+    info.hash = hash64(data.dump());
+    auto albedo = native_path(data.value("albedo_texture", std::string()));
+    auto normal = native_path(data.value("normal_texture", std::string()));
+    auto roughness = native_path(data.value("roughness_texture", std::string()));
+    auto metal = native_path(data.value("metallic_texture", std::string()));
+    auto emission = native_path(data.value("emissive_texture", std::string()));
+    info.albedoTexture = albedo.c_str(); info.normalTexture = normal.c_str(); info.emissiveTexture = emission.c_str();
+    info.emissiveIntensity = data.value("emissive_intensity", 0.f);
+    info.emissiveColorConstant = vector3(data.value("emissive", Json::array({0, 0, 0})));
+    info.spriteSheetRow = 1; info.spriteSheetCol = 1;
+    remixapi_MaterialInfoOpaqueEXT opaque{}; opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.albedoConstant = vector3(data.value("albedo", Json::array({0.7, 0.7, 0.7})));
+    opaque.opacityConstant = data.value("opacity", 1.f); opaque.roughnessConstant = data.value("roughness", 0.5f);
+    opaque.metallicConstant = data.value("metallic", 0.f); opaque.roughnessTexture = roughness.c_str(); opaque.metallicTexture = metal.c_str();
+    opaque.alphaTestType = data.value("alpha_test", 7); opaque.alphaReferenceValue = data.value("alpha_reference", 128);
+    remixapi_MaterialInfoTranslucentEXT glass{}; glass.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
+    glass.refractiveIndex = data.value("ior", 1.5f);
+    glass.transmittanceTexture = albedo.c_str();
+    glass.transmittanceColor = vector3(data.value("transmittance", Json::array({1, 1, 1})));
+    glass.transmittanceMeasurementDistance = 1.f;
+    info.pNext = data.value("kind", std::string("opaque")) == "translucent" ? static_cast<void*>(&glass) : static_cast<void*>(&opaque);
+    remixapi_MaterialHandle handle{};
+    checked(api_.CreateMaterial(&info, &handle), "CreateMaterial");
+    materials_.emplace(data.at("id").get<std::string>(), handle);
+  }
+  void mesh(const Json& data) {
+    const auto geometry_hash = hash64(data.at("surfaces").dump());
+    if (auto cached = mesh_cache_.find(geometry_hash); cached != mesh_cache_.end()) {
+      add_instance(data, cached->second);
+      return;
+    }
+    std::vector<std::vector<remixapi_HardcodedVertex>> vertices;
+    std::vector<std::vector<uint32_t>> indices;
+    std::vector<remixapi_MeshInfoSurfaceTriangles> surfaces;
+    for (const auto& surface : data.at("surfaces")) {
+      vertices.emplace_back(); indices.push_back(surface.at("indices").get<std::vector<uint32_t>>());
+      for (const auto& v : surface.at("vertices")) {
+        if (v.size() != 8) throw std::runtime_error("Invalid mesh vertex");
+        remixapi_HardcodedVertex vertex{};
+        for (int i = 0; i < 3; ++i) { vertex.position[i] = v[i].get<float>(); vertex.normal[i] = v[i + 3].get<float>(); }
+        vertex.texcoord[0] = v[6].get<float>(); vertex.texcoord[1] = v[7].get<float>(); vertex.color = 0xffffffff;
+        vertices.back().push_back(vertex);
+      }
+      for (auto index : indices.back()) if (index >= vertices.back().size()) throw std::runtime_error("Mesh index is out of bounds");
+      // USD uses counter-clockwise fronts; the Remix external mesh API uses clockwise fronts.
+      for (size_t i = 0; i + 2 < indices.back().size(); i += 3) std::swap(indices.back()[i + 1], indices.back()[i + 2]);
+      remixapi_MeshInfoSurfaceTriangles info{};
+      info.vertices_values = vertices.back().data(); info.vertices_count = vertices.back().size();
+      info.indices_values = indices.back().data(); info.indices_count = indices.back().size();
+      info.material = materials_.at(surface.at("material").get<std::string>());
+      surfaces.push_back(info);
+    }
+    if (surfaces.empty()) return;
+    remixapi_MeshInfo info{}; info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+    info.hash = geometry_hash; info.surfaces_values = surfaces.data(); info.surfaces_count = uint32_t(surfaces.size());
+    remixapi_MeshHandle handle{};
+    checked(api_.CreateMesh(&info, &handle), "CreateMesh"); meshes_.push_back(handle);
+    mesh_cache_[geometry_hash] = handle;
+    add_instance(data, handle);
+  }
+  void add_instance(const Json& data, remixapi_MeshHandle handle) {
+    remixapi_InstanceInfo instance{}; instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+    instance.mesh = handle; instance.transform = transform(data.at("transform")); instance.doubleSided = data.value("double_sided", false);
+    instances_.push_back(instance);
+  }
+  void add_light(const Json& data) {
+    remixapi_LightInfo info{}; info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO; info.hash = hash64(data.at("id").get<std::string>());
+    remixapi_LightInfoUSDEXT usd{}; usd.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_USD_EXT;
+    const std::map<std::string, remixapi_StructType> types{{"SphereLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT},
+      {"RectLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_RECT_EXT}, {"DiskLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISK_EXT},
+      {"CylinderLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_CYLINDER_EXT}, {"DistantLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT}};
+    const auto type = data.at("type").get<std::string>();
+    auto matrix = transform(data.at("transform"));
+    auto color = vector3(data.at("color"));
+    float intensity = data.value("intensity", 1.f), radius = data.value("radius", 0.5f), width = data.value("width", 1.f);
+    float height = data.value("height", 1.f), length = data.value("length", 1.f);
+    float angle = data.value("angle", 0.53f) * float(3.141592653589793 / 180.0);
+    float cone = data.value("cone_angle", 180.f) * float(3.141592653589793 / 180.0);
+    remixapi_LightInfoDomeEXT dome{}; dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
+    auto texture = native_path(data.value("texture", std::string()));
+    if (type == "DomeLight") {
+      dome.transform = matrix; dome.colorTexture = texture.c_str(); info.pNext = &dome;
+      info.radiance = {color.x * intensity, color.y * intensity, color.z * intensity};
+    } else {
+      auto found = types.find(type);
+      if (found == types.end()) return;
+      usd.lightType = found->second; usd.transform = matrix; usd.pColor = &color; usd.pIntensity = &intensity;
+      usd.pRadius = &radius; usd.pWidth = &width; usd.pHeight = &height; usd.pLength = &length;
+      usd.pAngleRadians = &angle; usd.pConeAngleRadians = &cone; info.pNext = &usd;
+    }
+    remixapi_LightHandle light{};
+    checked(api_.CreateLight(&info, &light), "CreateLight"); lights_.push_back(light);
+  }
+  remixapi_Interface api_{};
+  remixapi_HMODULE library_{};
+  bool running_ = false;
+  bool shared_ = false;
+  uint32_t width_ = 1280, height_ = 720;
+  uint64_t revision_ = 0, frame_ = 0;
+  Json camera_;
+  std::map<std::string, remixapi_MaterialHandle> materials_;
+  std::vector<remixapi_MeshHandle> meshes_;
+  std::map<uint64_t, remixapi_MeshHandle> mesh_cache_;
+  std::vector<remixapi_InstanceInfo> instances_;
+  std::vector<remixapi_LightHandle> lights_;
+#ifdef _WIN32
+  HWND window_ = nullptr;
+#endif
+};
+}
+
+int main() {
+#ifdef _WIN32
+  constexpr bool shared_frames = false;
+  editor::Channel channel(reinterpret_cast<intptr_t>(GetStdHandle(STD_INPUT_HANDLE)), reinterpret_cast<intptr_t>(GetStdHandle(STD_OUTPUT_HANDLE)));
+#else
+  constexpr bool shared_frames = true;
+  signal(SIGPIPE, SIG_IGN);
+  editor::Channel channel(STDIN_FILENO, STDOUT_FILENO);
+#endif
+  Renderer renderer;
+  try {
+    Json request;
+    while (channel.receive(request)) {
+      Json response{{"id", request.value("id", 0)}, {"ok", true}};
+      bool shutdown = false;
+      try {
+        const auto op = request.at("op").get<std::string>();
+        if (op == "hello") response["result"] = {{"protocol", editor::protocol_version}, {"renderer", "dxvk-remix"}, {"shared_frames", shared_frames}};
+        else if (op == "start") response["result"] = renderer.start(request);
+        else if (op == "scene") renderer.scene(request.at("scene"));
+        else if (op == "camera") renderer.camera(request.at("camera"));
+        else if (op == "settings") renderer.settings(request.at("settings"));
+        else if (op == "frame") response["result"] = renderer.frame();
+        else if (op == "shutdown") shutdown = true;
+        else throw std::runtime_error("Unknown renderer operation: " + op);
+      } catch (const std::exception& error) { response["ok"] = false; response["error"] = error.what(); }
+      channel.send(response);
+      if (shutdown) break;
+    }
+    return 0;
+  } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+}
