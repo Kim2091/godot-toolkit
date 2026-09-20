@@ -88,17 +88,24 @@ func rebuild(scene: Dictionary) -> void:
 		entries.append(entry)
 
 func pick(origin: Vector3, direction: Vector3) -> String:
+	return raycast(origin, direction).get("path", "")
+
+func raycast(origin: Vector3, direction: Vector3, exclude := "") -> Dictionary:
 	var closest := INF
-	var path := ""
+	var result := {}
 	for entry in entries:
-		if not entry.invertible or entry.bounds.intersects_ray(origin, direction) == null:
+		if entry.matches(exclude) or not entry.invertible or entry.bounds.intersects_ray(origin, direction) == null:
 			continue
 		var local_direction := (entry.inverse.basis * direction).normalized()
 		var hit := entry.geometry.intersect_ray(entry.inverse * origin, local_direction)
 		if hit.is_empty():
 			continue
-		var distance_squared := origin.distance_squared_to(entry.transform * Vector3(hit.position))
+		var position := entry.transform * Vector3(hit.position)
+		var distance_squared := origin.distance_squared_to(position)
 		if distance_squared < closest:
 			closest = distance_squared
-			path = entry.id
-	return path
+			var normal := (entry.inverse.basis.transposed() * Vector3(hit.normal)).normalized()
+			# Pick the camera-facing side, including mirrored/double-sided geometry.
+			if normal.dot(direction) > 0: normal = -normal
+			result = {"path": entry.id, "position": position, "normal": normal}
+	return result

@@ -24,6 +24,20 @@ func run() -> void:
 		quit(1)
 		return
 	client.response_received.connect(func(response: Dictionary): responses.append(response))
+	# Queue before starting the writer to deterministically exercise coalescing.
+	client.send({"op": "scene", "scene": {"revision": 1}})
+	client.send({"op": "lights", "revision": 2})
+	client.send({"op": "preview_transform", "path": "/Light", "revision": 2})
+	client.send({"op": "lights", "revision": 3})
+	check(client.messages.map(func(m: Dictionary): return m.op) == ["scene", "preview_transform", "lights"], "Light snapshots must coalesce while retaining the base geometry")
+	check(client.messages.back().revision == 3, "Coalescing must retain the latest complete light snapshot")
+	client.send({"op": "scene", "scene": {"revision": 4}})
+	check(client.messages.size() == 1 and client.messages[0].op == "scene", "Full scenes must supersede pending lights and previews")
+	client.send({"op": "lights", "revision": 5})
+	client.send({"op": "preview_transform", "path": "/Mesh", "revision": 4})
+	client.send({"op": "lights", "revision": 6})
+	check(client.messages[1].op == "preview_transform", "Light updates must retain a pending mesh preview cancellation")
+	client.messages.clear(); client.next_id = 0
 	client.writer = Thread.new()
 	client.writer.start(client._exchange_loop.bind(client.generation))
 	# Non-ASCII content crosses transport boundaries. The unknown operation is

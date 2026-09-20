@@ -140,7 +140,7 @@ func _build_ui() -> void:
 	var types := ["SphereLight", "SpotLight", "RectLight", "DiskLight", "CylinderLight", "DistantLight", "DomeLight"]
 	for type in types:
 		lights.get_popup().add_item(type.trim_suffix("Light"))
-	lights.get_popup().id_pressed.connect(func(id: int): _command({"op": "add_light", "path": selection, "type": types[id]}))
+	lights.get_popup().id_pressed.connect(func(id: int): _spawn_light(types[id]))
 	_button("Duplicate", func(): _command({"op": "duplicate", "path": selection}), toolbar)
 	_button("Delete", func(): _command({"op": "delete", "path": selection}), toolbar)
 	var authoring_area := VSplitContainer.new()
@@ -200,6 +200,11 @@ func _build_ui() -> void:
 	camera_mode.tooltip_text = "Drone: press Z over the viewport for WASD movement and mouse look. Press Z or Escape to release."
 	camera_mode.item_selected.connect(func(index: int): viewport.camera_mode = camera_mode.get_item_id(index))
 	view_tools.add_child(camera_mode)
+	var transform_tool := OptionButton.new()
+	transform_tool.add_item("Move", 0); transform_tool.add_item("Rotate", 1)
+	transform_tool.tooltip_text = "Drag the colored axes or rings. Snap uses 1 unit / 15°. Escape cancels a drag."
+	transform_tool.item_selected.connect(func(index: int): viewport.gizmo.set_mode(index))
+	view_tools.add_child(transform_tool)
 	_button("Frame all", func(): viewport.frame_selection(true), view_tools)
 	_button("Frame selection", func(): viewport.frame_selection(), view_tools)
 	var snap := CheckButton.new()
@@ -214,8 +219,12 @@ func _build_ui() -> void:
 		if renderer != null and renderer.is_ready and not restoring_view:
 			renderer.send({"op": "camera", "camera": camera}))
 	viewport.translation_requested.connect(_translate)
+	viewport.transform_committed.connect(func(path: String, matrix: Array): _command({"op": "transform", "path": path, "world_matrix": matrix}))
+	viewport.transform_preview_requested.connect(func(path: String, delta: Array):
+		if renderer != null and renderer.is_ready:
+			renderer.send({"op": "preview_transform", "path": path, "delta": delta, "revision": state.revision}))
 	center_panel.add_child(viewport)
-	_label("Shift + drag moves the selection. Changes to captured assets affect every instance.", center_panel, 11).autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_label("Drag axes to move or rings to rotate. Ctrl+T: place at cursor. Escape cancels. Captured attachments affect every instance.", center_panel, 11).autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	var right := VBoxContainer.new()
 	right.custom_minimum_size.x = 260
 	center_right.add_child(right)
@@ -293,7 +302,7 @@ func _command(data: Dictionary) -> void:
 	if result.is_empty():
 		if data.op in ["add_capture", "select_capture"]:
 			_refresh_captures()
-		if data.op in ["set_authoring_property", "reset_authoring_property", "set_light_type", "transform"] and library_selection.is_empty():
+		if data.op in ["set_authoring_property", "reset_authoring_property", "set_light_type", "transform", "set_parent"] and library_selection.is_empty():
 			_select(selection)
 		return
 	if result.has("selection"):
@@ -307,7 +316,7 @@ func _command(data: Dictionary) -> void:
 			library_selection = ""; selection = ""; last_scene = {}
 			viewport.set_mouse_capture(false); viewport.rendered_texture = null
 		state = result.document
-		_refresh(state.get("revision", -1) != previous_revision)
+		_refresh(state.get("revision", -1) != previous_revision, result.get("scene_update") == "lights")
 		if capture_changed:
 			_sync_renderer()
 	if data.op in ["open", "create"]:
@@ -319,7 +328,7 @@ func _command(data: Dictionary) -> void:
 	elif data.op == "package":
 		_log("Mod packaged at " + data.path)
 
-func _refresh(scene_changed := true) -> void:
+func _refresh(scene_changed := true, lights_only := false) -> void:
 	refreshing = true
 	_refresh_captures()
 	project_label.text = String(state.get("path", "No project")).get_file() + (" •" if state.get("dirty", false) else "")
@@ -337,6 +346,9 @@ func _refresh(scene_changed := true) -> void:
 		entries[prim.path] = item
 		if prim.path == selection:
 			item.select(0)
+	# Inactive USD prims can still resolve by path, but are absent from the tree.
+	if not selection.is_empty() and not entries.has(selection):
+		selection = ""; library_selection = ""
 	layer_picker.clear()
 	for layer in state.get("layers", []):
 		layer_picker.add_item(layer.name + (" (capture)" if layer.capture else ""))
@@ -351,9 +363,20 @@ func _refresh(scene_changed := true) -> void:
 		_select(selection)
 	if scene_changed and state.get("open", false):
 		var first := last_scene.is_empty()
-		last_scene = _request({"op": "scene"})
+		lights_only = lights_only and not first
+		if lights_only:
+			var changes := _request({"op": "lights"})
+			# Queued scene messages may still hold the old dictionary on the writer
+			# thread. Share immutable geometry, but never mutate that dictionary.
+			last_scene = last_scene.duplicate()
+			last_scene["lights"] = changes.lights
+			last_scene["revision"] = changes.revision
+			for warning in changes.get("warnings", []): _log(warning)
+		else:
+			last_scene = _request({"op": "scene"})
+			last_scene["geometry_revision"] = last_scene.revision
 		restoring_view = first
-		viewport.set_scene(last_scene, false)
+		viewport.set_scene(last_scene, false, lights_only)
 		if first:
 			var camera = sessions.camera_for(state.path, state.get("active_capture", ""))
 			if not viewport.restore_view_state(camera, false):
@@ -361,10 +384,13 @@ func _refresh(scene_changed := true) -> void:
 			camera_mode.select(viewport.camera_mode)
 		restoring_view = false
 		if renderer.is_ready:
-			renderer.send({"op": "scene", "scene": last_scene})
-			renderer.send({"op": "camera", "camera": viewport.camera()})
-		for warning in state.get("warnings", []) + last_scene.get("warnings", []):
-			_log(warning)
+			if lights_only:
+				renderer.send({"op": "lights", "lights": last_scene.lights, "revision": last_scene.revision, "geometry_revision": last_scene.geometry_revision})
+			else:
+				renderer.send({"op": "scene", "scene": last_scene})
+				renderer.send({"op": "camera", "camera": viewport.camera()})
+		if not lights_only:
+			for warning in state.get("warnings", []) + last_scene.get("warnings", []): _log(warning)
 
 func _tree_selected() -> void:
 	if refreshing:
@@ -374,12 +400,37 @@ func _tree_selected() -> void:
 		_select(item.get_metadata(0))
 
 func _select(path: String) -> void:
+	var details := _request({"op": "inspect", "path": path}) if not path.is_empty() else {}
+	if details.is_empty(): path = ""
 	selection = path
 	library_selection = ""
 	viewport.selected_path = path
 	viewport.queue_redraw()
 	inspector.project_directory = String(state.get("path", "")).get_base_dir()
-	inspector.show_selection(_request({"op": "inspect", "path": path}) if not path.is_empty() else {})
+	inspector.show_selection(details)
+	viewport.gizmo.set_target(details)
+
+func _spawn_light(type: String) -> void:
+	var defaults := _request({"op": "light_defaults", "type": type})
+	if defaults.is_empty(): return
+	var pose: Transform3D = viewport.light_spawn_transform(type, defaults.properties)
+	library_selection = ""
+	_command({"op": "add_light", "type": type, "world_matrix": viewport.TransformGizmo.to_array(pose)})
+
+func _place_selection_at_cursor() -> void:
+	if selection.is_empty() or not state.get("open", false): return
+	var position: Vector2 = viewport._view_rect().get_center() if viewport.mouse_captured else viewport.get_local_mouse_position()
+	if not viewport._view_rect().has_point(position): return
+	var details := _request({"op": "inspect", "path": selection})
+	if not details.has("world_transform") or not details.get("authoring", {}).get("editable", false): return
+	var hit: Dictionary = viewport.surface_at(position, selection)
+	if hit.is_empty():
+		_log("No surface under the cursor.")
+		return
+	viewport.gizmo.cancel()
+	var pose: Transform3D = viewport.placement_transform(viewport.TransformGizmo.from_array(details.world_transform), hit, details)
+	library_selection = ""
+	_command({"op": "transform", "path": selection, "world_matrix": viewport.TransformGizmo.to_array(pose)})
 
 func _translate(delta: Vector3) -> void:
 	_command({"op": "transform", "path": selection, "world_delta": [delta.x, delta.y, delta.z]})
@@ -531,8 +582,8 @@ func _refresh_assets() -> void:
 
 func _use_asset(op: String) -> void:
 	var ids: Array = assets.selected_ids()
-	if ids.is_empty() or selection.is_empty():
-		_log("Select a scene object and an asset first.")
+	if ids.is_empty() or (op != "add_mesh" and selection.is_empty()):
+		_log("Select a mesh asset first." if op == "add_mesh" else "Select a scene object and an asset first.")
 		return
 	var id: String = ids[0]
 	var kind: String = assets.catalog.entries[id].get("kind", "unknown")
@@ -549,7 +600,12 @@ func _use_asset(op: String) -> void:
 	if op == "replace_material" and not inspector.selected_material.is_empty():
 		target = inspector.selected_material
 	library_selection = ""
-	_command({"op": op, "path": target, "asset": assets.catalog.absolute_path(id)})
+	var command := {"op": op, "asset": assets.catalog.absolute_path(id)}
+	if op == "add_mesh":
+		command["translation"] = viewport._array(viewport.center)
+	else:
+		command["path"] = target
+	_command(command)
 
 func _sync_renderer() -> void:
 	if renderer == null:
@@ -607,11 +663,14 @@ func _process(_delta: float) -> void:
 func _unhandled_key_input(event: InputEvent) -> void:
 	if welcome.visible:
 		return
-	if not event.is_pressed() or event.is_echo() or get_viewport().gui_get_focus_owner() is LineEdit:
+	if not event.is_pressed() or event.is_echo() or get_viewport().gui_get_focus_owner() is LineEdit or get_viewport().gui_get_focus_owner() is TextEdit:
 		return
 	if event is InputEventKey:
 		if event.is_command_or_control_pressed():
-			if event.keycode == KEY_S:
+			if event.keycode == KEY_T and not event.alt_pressed and not event.shift_pressed:
+				_place_selection_at_cursor()
+				get_viewport().set_input_as_handled()
+			elif event.keycode == KEY_S:
 				_save_from_ui()
 			elif event.keycode == KEY_Z:
 				_command({"op": "redo" if event.shift_pressed else "undo"})

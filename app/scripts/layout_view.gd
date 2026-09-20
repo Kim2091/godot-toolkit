@@ -2,11 +2,15 @@ extends Control
 
 const LayoutGeometry = preload("res://scripts/layout_geometry.gd")
 const WireframeShader = preload("res://shaders/layout_wireframe.gdshader")
+const TransformGizmo = preload("res://scripts/transform_gizmo.gd")
 enum CameraMode { DRONE, ORBIT }
 
 signal selected(path: String)
 signal camera_changed(camera: Dictionary)
 signal translation_requested(delta: Vector3)
+signal transform_preview_requested(path: String, delta: Array)
+signal transform_committed(path: String, matrix: Array)
+var gizmo := TransformGizmo.new()
 
 var scene: Dictionary = {}
 var selected_path := "":
@@ -60,9 +64,10 @@ func _view_rect() -> Rect2:
 	return Rect2((size - extent) * 0.5, extent)
 
 func _ready() -> void:
+	gizmo.view = self
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	focus_mode = Control.FOCUS_CLICK
-	focus_exited.connect(func(): set_mouse_capture(false))
+	focus_exited.connect(func(): set_mouse_capture(false); gizmo.cancel())
 	set_process(false)
 	clip_contents = true
 	wire_viewport = SubViewport.new()
@@ -87,6 +92,7 @@ func set_mouse_capture(capture: bool, restore_cursor := true) -> void:
 		return
 	if capture == mouse_captured:
 		return
+	gizmo.cancel()
 	mouse_captured = capture
 	orbiting = false
 	dragging = false
@@ -105,10 +111,12 @@ func set_mouse_capture(capture: bool, restore_cursor := true) -> void:
 
 func _notification(what: int) -> void:
 	if what in [NOTIFICATION_WM_WINDOW_FOCUS_OUT, NOTIFICATION_APPLICATION_FOCUS_OUT]:
+		gizmo.cancel()
 		set_mouse_capture(false, false)
 		orbiting = false
 		dragging = false
 	elif what == NOTIFICATION_VISIBILITY_CHANGED and not is_visible_in_tree():
+		gizmo.cancel()
 		set_mouse_capture(false, false)
 
 func _exit_tree() -> void:
@@ -120,6 +128,8 @@ func _unhandled_key_input(event: InputEvent) -> void:
 	if event.ctrl_pressed or event.alt_pressed or event.meta_pressed:
 		return
 	var focused := get_viewport().gui_get_focus_owner()
+	if event.keycode == KEY_ESCAPE and gizmo.active:
+		gizmo.cancel(); get_viewport().set_input_as_handled(); return
 	if focused is LineEdit or focused is TextEdit:
 		return
 	if event.keycode == KEY_Z and camera_mode == CameraMode.DRONE:
@@ -231,10 +241,11 @@ func _sync_view() -> void:
 	wire_camera.cull_mask = 2 if rendering else 1
 	_invalidate_wireframe()
 
-func set_scene(data: Dictionary, frame_all := false) -> void:
+func set_scene(data: Dictionary, frame_all := false, lights_only := false) -> void:
+	gizmo.cancel()
 	scene = data
 	world_up = Vector3(0, 0, 1) if data.get("up_axis", "Y") == "Z" else Vector3.UP
-	_rebuild_geometry()
+	if not lights_only: _rebuild_geometry()
 	if frame_all:
 		frame_selection(true)
 	queue_redraw()
@@ -333,6 +344,13 @@ func frame_selection(all := false) -> void:
 			continue
 		minimum = minimum.min(entry.bounds.position)
 		maximum = maximum.max(entry.bounds.end)
+	for light in scene.get("lights", []):
+		if not all and light.id != selected_path and light.get("source_path", "") != selected_path: continue
+		var transform := TransformGizmo.from_array(light.transform)
+		# Use a nonzero extent for directional lights and tiny point emitters.
+		var radius := maxf(maxf(light.get("radius", 0.5), 0.1) * maxf(transform.basis.x.length(), maxf(transform.basis.y.length(), transform.basis.z.length())), 0.1)
+		minimum = minimum.min(transform.origin - Vector3.ONE * radius)
+		maximum = maximum.max(transform.origin + Vector3.ONE * radius)
 	if minimum.is_finite():
 		center = (minimum + maximum) * 0.5
 		distance = maxf((maximum - minimum).length() * 1.25, 0.1)
@@ -360,9 +378,10 @@ func _draw() -> void:
 	if wire_viewport != null:
 		draw_texture_rect(wire_viewport.get_texture(), _view_rect(), false)
 	for light in scene.get("lights", []):
-		var point := _project(_world(light.transform, [0, 0, 0]))
+		var point := _project(gizmo.world.origin if gizmo.active and light.id == gizmo.path else _world(light.transform, [0, 0, 0]))
 		if point.is_finite():
 			draw_circle(point, 5, Color("f2d28b"), false, 1.5, true)
+	gizmo.draw()
 	var help := "Orbit · Right/middle drag: orbit · Wheel: zoom · F: frame"
 	if camera_mode == CameraMode.DRONE:
 		help = "Drone · Z: fly · Right/middle drag: look · Wheel: zoom · F: frame"
@@ -385,16 +404,82 @@ func _pick(position: Vector2) -> String:
 	for light in scene.get("lights", []):
 		if position.distance_to(_project(_world(light.transform, [0, 0, 0]))) < 12:
 			return light.id
+	var ray := _ray(position)
+	return geometry.pick(ray.origin, ray.direction)
+
+func _ray(position: Vector2) -> Dictionary:
 	var rectangle := _view_rect()
 	var basis := _basis()
 	var local := (position - rectangle.get_center()) * (2 * tan(deg_to_rad(30))) / rectangle.size.y
 	var direction := (basis.x * local.x - basis.y * local.y - basis.z).normalized()
 	var origin := center + basis.z * distance
-	return geometry.pick(origin, direction)
+	return {"origin": origin, "direction": direction}
+
+func surface_at(position: Vector2, exclude := "") -> Dictionary:
+	if not _view_rect().has_point(position): return {}
+	var ray := _ray(position)
+	var hit := geometry.raycast(ray.origin, ray.direction, exclude)
+	if not hit.is_empty(): return hit
+	# An empty part of the scene can still be placed on the stage's ground plane.
+	var point = Plane(world_up, 0).intersects_ray(ray.origin, ray.direction)
+	if point == null: return {}
+	return {"position": point, "normal": world_up if world_up.dot(ray.direction) < 0 else -world_up, "path": ""}
+
+func light_clearance(type: String, properties: Dictionary, basis: Basis, normal: Vector3) -> float:
+	var radius := float(properties.get("inputs:radius", 0))
+	var x := normal.dot(basis.x); var y := normal.dot(basis.y); var z := normal.dot(basis.z)
+	match type:
+		"SphereLight", "SpotLight":
+			return radius * maxf(basis.x.length(), maxf(basis.y.length(), basis.z.length()))
+		"RectLight":
+			return (absf(x) * float(properties.get("inputs:width", 1)) + absf(y) * float(properties.get("inputs:height", 1))) * 0.5
+		"DiskLight": return radius * Vector2(x, y).length()
+		"CylinderLight": return absf(x) * float(properties.get("inputs:length", 1)) * 0.5 + radius * Vector2(y, z).length()
+	return 0
+
+func placement_transform(pose: Transform3D, hit: Dictionary, details: Dictionary) -> Transform3D:
+	var normal: Vector3 = hit.normal
+	var clearance := 0.0
+	if details.get("authoring", {}).get("kind") == "light":
+		var properties := {}
+		for property: Dictionary in details.get("properties", []): properties[property.name] = property.value
+		clearance = light_clearance(details.authoring.type, properties, pose.basis, normal)
+	else:
+		var lowest := INF
+		for entry in geometry.entries:
+			if not entry.matches(details.path): continue
+			var bounds: AABB = entry.bounds
+			var bottom: float = normal.dot(bounds.get_center() - pose.origin) - normal.abs().dot(bounds.size * 0.5)
+			lowest = minf(lowest, bottom)
+		if is_finite(lowest): clearance = -lowest
+	pose.origin = hit.position + normal * (clearance + 0.01 / float(scene.get("meters_per_unit", 1)))
+	return pose
+
+func light_spawn_transform(type: String, properties: Dictionary) -> Transform3D:
+	var position := _view_rect().get_center()
+	var hit := surface_at(position)
+	if hit.is_empty(): return Transform3D(_basis(), center)
+	# USD lights emit along local -Z. Aim area/spot lights at the hit surface.
+	var normal: Vector3 = hit.normal
+	var up := world_up if absf(normal.dot(world_up)) < 0.99 else _basis().x
+	var pose := Transform3D(Basis.looking_at(-normal, up), hit.position)
+	var clearance := light_clearance(type, properties, pose.basis, normal)
+	pose.origin += normal * (clearance + 0.01 / float(scene.get("meters_per_unit", 1)))
+	return pose
+
+func _gizmo_preview(path: String, delta: Transform3D) -> void:
+	for i in range(wire_instances.size()):
+		var entry = geometry.entries[i]
+		if entry.id == path or entry.id.begins_with(path + "/"):
+			wire_instances[i].transform = delta * entry.transform
+	_invalidate_wireframe()
+	transform_preview_requested.emit(path, TransformGizmo.to_array(delta))
 
 func _gui_input(event: InputEvent) -> void:
 	if mouse_captured:
 		return
+	if gizmo.handle_input(event):
+		accept_event(); return
 	if event is InputEventMouseButton:
 		if event.pressed:
 			grab_focus()

@@ -69,9 +69,11 @@ func send(message: Dictionary) -> void:
 	next_id += 1
 	message["id"] = next_id
 	message["version"] = PROTOCOL_VERSION
-	if message.get("op") in ["scene", "camera"]:
+	if message.get("op") in ["scene", "lights", "camera", "preview_transform"]:
 		for i in range(messages.size() - 1, -1, -1):
-			if messages[i].get("op") == message.op:
+			var same: bool = messages[i].get("op") == message.op
+			if message.op == "preview_transform": same = same and messages[i].get("path") == message.path
+			if same or (message.op == "scene" and messages[i].get("op") in ["preview_transform", "lights"]):
 				messages.remove_at(i)
 	messages.append(message)
 	mutex.unlock()
@@ -142,6 +144,8 @@ func _exchange_loop(worker_generation: int) -> void:
 		if decoded.get("ok", false):
 			if message.op == "scene":
 				applied.revision = message.scene.get("revision", -1)
+			elif message.op == "lights":
+				applied.revision = decoded.get("result", {}).get("revision", applied.revision)
 			elif message.op == "camera":
 				applied.camera = message.camera.duplicate(true)
 			elif message.op == "frame":

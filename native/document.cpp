@@ -11,9 +11,11 @@
 #include <pxr/usd/ar/resolver.h>
 #include <pxr/usd/sdf/copyUtils.h>
 #include <pxr/usd/sdf/layerUtils.h>
+#include <pxr/usd/sdf/namespaceEdit.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/editContext.h>
 #include <pxr/usd/usdGeom/imageable.h>
+#include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/xform.h>
 #include <pxr/usd/usdGeom/xformable.h>
@@ -50,6 +52,17 @@ bool is_capture(const SdfLayerHandle& layer) {
   return it != data.end() && it->second.IsHolding<std::string>() && it->second.Get<std::string>() == "capture";
 }
 constexpr const char* capture_catalog = "remix_studio_captures";
+constexpr const char* standalone_root = "/RootNode/StudioAssets";
+Json matrix_json(const GfMatrix4d& matrix) {
+  Json values = Json::array();
+  for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) values.push_back(matrix[r][c]);
+  return values;
+}
+GfMatrix4d invertible_inverse(const GfMatrix4d& matrix) {
+  if (!std::isfinite(matrix.GetDeterminant()) || std::abs(matrix.GetDeterminant()) < 1e-12)
+    throw std::runtime_error("Parent transform is singular");
+  return matrix.GetInverse();
+}
 GfVec3d vector3(const Json& data) {
   if (!data.is_array() || data.size() != 3) throw std::runtime_error("Expected three numeric components");
   GfVec3d v(data[0].get<double>(), data[1].get<double>(), data[2].get<double>());
@@ -294,7 +307,7 @@ Json Document::describe() const {
 Json Document::inspect(const std::string& path) const {
   require_stage();
   auto prim = stage_->GetPrimAtPath(SdfPath(path));
-  if (!prim) throw std::runtime_error("Prim no longer exists");
+  if (!prim || !prim.IsActive()) throw std::runtime_error("Prim no longer exists");
   Json properties = Json::array();
   for (auto attr : prim.GetAttributes()) {
     VtValue value;
@@ -315,6 +328,8 @@ Json Document::inspect(const std::string& path) const {
     auto rotation = components.GetRotation().Decompose(GfVec3d(1, 0, 0), GfVec3d(0, 1, 0), GfVec3d(0, 0, 1));
     result["scale"] = {scale[0], scale[1], scale[2]};
     result["rotation"] = {rotation[0], rotation[1], rotation[2]};
+    UsdGeomXformCache cache;
+    result["world_transform"] = matrix_json(cache.GetLocalToWorldTransform(prim));
   }
   try { result["anchor"] = anchor_for(path); } catch (const std::runtime_error&) { result["anchor"] = nullptr; }
   result["authoring"] = describe_authoring(prim, edit_layer_);
@@ -340,22 +355,28 @@ Json Document::inspect(const std::string& path) const {
       field["overridden"] = bool(spec && spec->HasDefaultValue());
     } catch (const std::runtime_error&) { field["overridden"] = false; }
   }
+  try {
+    const auto owner = display_path(authored_asset(path), path);
+    const auto parent = SdfPath(owner).GetParentPath().GetString();
+    result["attachment"] = {{"path", owner}, {"parent", parent == standalone_root ? "" : parent}};
+  } catch (const std::runtime_error&) {}
   return result;
 }
 
-void Document::edit(const std::string& label, const std::function<void()>& operation) {
+void Document::edit(const std::string& label, const std::function<void()>& operation, bool lights_only) {
   require_stage();
-  edit_layer(label, edit_layer_, operation);
+  edit_layer(label, edit_layer_, operation, lights_only);
 }
 
-void Document::edit_layer(const std::string& label, const SdfLayerHandle& layer, const std::function<void()>& operation) {
+void Document::edit_layer(const std::string& label, const SdfLayerHandle& layer, const std::function<void()>& operation, bool lights_only) {
   if (!layer || is_capture(layer) || !layer->PermissionToEdit()) throw std::runtime_error("Layer is read-only");
   const auto before = layer_text(layer);
   try { operation(); }
   catch (...) { layer->ImportFromString(before); throw; }
   const auto after = layer_text(layer);
   if (before == after) return;
-  undo_.push_back({label, layer, before, after});
+  undo_.push_back({label, layer, before, after, lights_only});
+  last_edit_lights_only_ = lights_only;
   redo_.clear();
   ++revision_;
 }
@@ -365,12 +386,14 @@ void Document::undo() {
   auto entry = undo_.back();
   if (!entry.layer->ImportFromString(entry.before)) throw std::runtime_error("Could not undo USD edit");
   undo_.pop_back(); redo_.push_back(entry); ++revision_;
+  last_edit_lights_only_ = entry.lights_only;
 }
 void Document::redo() {
   if (redo_.empty()) return;
   auto entry = redo_.back();
   if (!entry.layer->ImportFromString(entry.after)) throw std::runtime_error("Could not redo USD edit");
   redo_.pop_back(); undo_.push_back(entry); ++revision_;
+  last_edit_lights_only_ = entry.lights_only;
 }
 
 void Document::select_layer(const std::string& identifier) {
@@ -399,10 +422,17 @@ void Document::set_transform(const Json& request) {
   if (!xform) throw std::runtime_error("Selection cannot be transformed");
   GfMatrix4d matrix; bool reset;
   xform.GetLocalTransformation(&matrix, &reset);
-  if (request.contains("matrix")) {
-    const auto& elements = request.at("matrix");
+  if (request.contains("matrix") || request.contains("world_matrix")) {
+    const auto& elements = request.at(request.contains("world_matrix") ? "world_matrix" : "matrix");
     if (elements.size() != 16) throw std::runtime_error("Expected a 4x4 matrix");
-    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) matrix[r][c] = elements[r * 4 + c].get<double>();
+    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
+      matrix[r][c] = elements[r * 4 + c].get<double>();
+      if (!std::isfinite(matrix[r][c])) throw std::runtime_error("Non-finite transform");
+    }
+    if (request.contains("world_matrix") && !reset) {
+      UsdGeomXformCache cache;
+      matrix *= invertible_inverse(cache.GetParentToWorldTransform(stage_->GetPrimAtPath(SdfPath(selected_path))));
+    }
   } else {
     if (request.contains("rotation") || request.contains("scale")) {
       GfTransform original(matrix);
@@ -422,10 +452,11 @@ void Document::set_transform(const Json& request) {
       UsdGeomXformCache cache;
       auto selected = stage_->GetPrimAtPath(SdfPath(selected_path));
       auto parent = cache.GetParentToWorldTransform(selected);
-      matrix.SetTranslateOnly(matrix.ExtractTranslation() + parent.GetInverse().TransformDir(vector3(request.at("world_delta"))));
+      matrix.SetTranslateOnly(matrix.ExtractTranslation() + (reset ? GfMatrix4d(1) : invertible_inverse(parent)).TransformDir(vector3(request.at("world_delta"))));
     }
   }
   if (!xform.MakeMatrixXform().Set(matrix)) throw std::runtime_error("Could not author transform");
+  xform.SetResetXformStack(reset);
 }
 
 std::string Document::authored_path(const std::string& path) const {
@@ -461,8 +492,87 @@ std::string Document::anchor_for(const std::string& path) const {
   throw std::runtime_error("Select a captured mesh or light to attach this asset");
 }
 
+std::string Document::parent_path(const std::string& path) const {
+  auto prim = stage_->GetPrimAtPath(SdfPath(path));
+  if (!prim || !UsdGeomXformable(prim)) throw std::runtime_error("Choose a transformable parent prim");
+  if (prim.GetParent().GetPath() == SdfPath("/RootNode/instances")) return anchor_for(path);
+  return authored_path(path);
+}
+
+std::string Document::authored_asset(const std::string& path) const {
+  auto prim = stage_->GetPrimAtPath(SdfPath(authored_path(path)));
+  for (; prim && !prim.IsPseudoRoot(); prim = prim.GetParent()) {
+    auto spec = edit_layer_->GetPrimAtPath(prim.GetPath());
+    bool reference = false;
+    auto flag = prim.GetAttribute(TfToken("IsRemixRef"));
+    if (flag) flag.Get(&reference);
+    if (spec && spec->GetSpecifier() == SdfSpecifierDef && (reference || UsdLuxLightAPI(prim) || prim.IsA<UsdGeomMesh>()))
+      return prim.GetPath().GetString();
+  }
+  throw std::runtime_error("Choose a light or mesh authored in the active layer");
+}
+
+std::string Document::display_path(const std::string& path, const std::string& context) const {
+  const SdfPath instances("/RootNode/instances");
+  auto instance = SdfPath(context);
+  if (!instance.HasPrefix(instances)) return path;
+  while (instance.GetParentPath() != instances && !instance.IsAbsoluteRootPath()) instance = instance.GetParentPath();
+  const SdfPath anchor(anchor_for(context));
+  return SdfPath(path).HasPrefix(anchor) ? SdfPath(path).ReplacePrefix(anchor, instance).GetString() : path;
+}
+
+Json Document::parent_candidates(const std::string& path) const {
+  require_stage();
+  const SdfPath asset(authored_asset(path));
+  Json candidates = Json::array();
+  for (auto prim : stage_->Traverse()) {
+    if (!UsdGeomXformable(prim) || prim.GetPath() == SdfPath(standalone_root)) continue;
+    try {
+      if (SdfPath(parent_path(prim.GetPath().GetString())).HasPrefix(asset)) continue;
+      if (UsdGeomImageable(prim).ComputeVisibility() == UsdGeomTokens->invisible) continue;
+      candidates.push_back({{"path", prim.GetPath().GetString()}, {"type", prim.GetTypeName().GetString()}});
+    } catch (const std::runtime_error&) {}
+  }
+  return {{"parents", candidates}};
+}
+
+std::string Document::set_parent(const Json& request) {
+  const auto context = required(request, "path");
+  const SdfPath old(authored_asset(context));
+  const auto selected = stage_->GetPrimAtPath(SdfPath(display_path(old.GetString(), context)));
+  UsdGeomXformCache cache;
+  const auto world = cache.GetLocalToWorldTransform(selected);
+  const auto target = request.value("parent", std::string());
+  const SdfPath parent(target.empty() ? standalone_root : parent_path(target));
+  if (parent.HasPrefix(old)) throw std::runtime_error("An object cannot be parented to itself or its descendants");
+  if (target.empty()) UsdGeomXform::Define(stage_, parent);
+  const auto parent_world = cache.GetLocalToWorldTransform(stage_->GetPrimAtPath(target.empty() ? parent : SdfPath(target)));
+  const auto local = world * invertible_inverse(parent_world);
+  const auto next = old.GetParentPath() == parent ? old : SdfPath(unique_child(stage_, parent.GetString(), old.GetName()));
+  if (next != old) {
+    SdfCreatePrimInLayer(edit_layer_, parent);
+    if (!SdfCopySpec(edit_layer_, old, edit_layer_, next)) throw std::runtime_error("Could not attach object");
+    SdfBatchNamespaceEdit removal; removal.Add(SdfNamespaceEdit::Remove(old));
+    if (!edit_layer_->Apply(removal)) throw std::runtime_error("Could not remove the previous attachment");
+  }
+  auto xform = UsdGeomXformable(stage_->GetPrimAtPath(next));
+  xform.MakeMatrixXform().Set(local); xform.SetResetXformStack(false);
+  if (!target.empty()) {
+    std::string anchor;
+    try { anchor = anchor_for(target); } catch (const std::runtime_error&) {}
+    if (!anchor.empty()) {
+      auto preserve = stage_->OverridePrim(SdfPath(anchor)).CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true);
+      int previous = 1; preserve.Get(&previous); preserve.Set(previous);
+    }
+  }
+  return target.empty() ? next.GetString() : SdfPath(target).AppendChild(next.GetNameToken()).GetString();
+}
+
 std::string Document::add_reference(const Json& request) {
-  auto anchor = anchor_for(required(request, "path"));
+  const auto selected = request.value("path", std::string());
+  if (request.value("replace", false) && selected.empty()) throw std::runtime_error("Select a captured mesh to replace");
+  const auto anchor = selected.empty() ? std::string(standalone_root) : anchor_for(selected);
+  if (selected.empty()) UsdGeomXform::Define(stage_, SdfPath(anchor));
   fs::path asset = fs::absolute(required(request, "asset"));
   auto source = UsdStage::Open(asset.string());
   if (!source || !source->GetDefaultPrim()) throw std::runtime_error("Asset requires a valid USD default prim; ingest it first");
@@ -477,9 +587,10 @@ std::string Document::add_reference(const Json& request) {
     }
     root.GetReferences().SetReferences({});
   }
-  auto preserve = root.CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true);
-  int previous = 1; preserve.Get(&previous);
-  preserve.Set(replace ? 0 : previous);
+  if (!selected.empty()) {
+    auto preserve = root.CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true);
+    int previous = 1; preserve.Get(&previous); preserve.Set(replace ? 0 : previous);
+  }
   auto path = unique_child(stage_, anchor, "ref_" + asset.stem().string());
   auto prim = UsdGeomXform::Define(stage_, SdfPath(path)).GetPrim();
   prim.GetReferences().AddReference(relative_asset(asset, edit_layer_));
@@ -490,12 +601,44 @@ std::string Document::add_reference(const Json& request) {
     normalization *= GfMatrix4d(GfRotation(GfVec3d(1, 0, 0), UsdGeomGetStageUpAxis(source) == UsdGeomTokens->y ? 90.0 : -90.0), GfVec3d(0));
   }
   UsdGeomXformable(prim).MakeMatrixXform().Set(normalization);
-  if (request.contains("translation")) set_transform({{"path", path}, {"translation", request.at("translation")}});
+  if (request.contains("translation")) {
+    if (selected.empty()) {
+      UsdGeomXformCache cache;
+      auto delta = vector3(request.at("translation")) - cache.GetLocalToWorldTransform(prim).ExtractTranslation();
+      set_transform({{"path", path}, {"world_delta", {delta[0], delta[1], delta[2]}}});
+    } else set_transform({{"path", path}, {"translation", request.at("translation")}});
+  }
   return path;
 }
 
+Json Document::light_defaults(const std::string& type) const {
+  require_stage();
+  // Match Toolkit's omni.flux.light_creator.widget/setup_ui.py. Dimensions are
+  // physical sizes, converted into this stage's units rather than USD fallbacks.
+  const auto radius = 5.0 / UsdGeomGetStageMetersPerUnit(stage_);
+  Json properties{{"inputs:color", {1, 1, 1}}, {"inputs:exposure", 0.0}, {"inputs:enableColorTemperature", false}};
+  if (type == "SphereLight" || type == "SpotLight") {
+    properties["inputs:radius"] = radius; properties["inputs:intensity"] = 100.0;
+    if (type == "SpotLight") properties["inputs:shaping:cone:angle"] = 35.0;
+  } else if (type == "RectLight") {
+    properties["inputs:width"] = radius * 2; properties["inputs:height"] = radius * 2; properties["inputs:intensity"] = 400.0;
+  } else if (type == "DiskLight") {
+    properties["inputs:radius"] = radius; properties["inputs:intensity"] = 500.0;
+  } else if (type == "CylinderLight") {
+    properties["inputs:radius"] = radius; properties["inputs:length"] = radius * 2; properties["inputs:intensity"] = 140.0;
+  } else if (type == "DistantLight") {
+    properties["inputs:angle"] = 1.0; properties["inputs:intensity"] = 25.0;
+  } else if (type == "DomeLight") {
+    // Toolkit's creator does not offer dome lights; use the USD schema default.
+    properties["inputs:intensity"] = 1.0;
+  } else throw std::runtime_error("Unsupported light type");
+  return {{"type", type}, {"properties", properties}};
+}
+
 std::string Document::add_light(const Json& request) {
-  auto anchor = anchor_for(required(request, "path"));
+  const auto selected = request.value("path", std::string());
+  const auto anchor = selected.empty() ? std::string(standalone_root) : anchor_for(selected);
+  if (selected.empty()) UsdGeomXform::Define(stage_, SdfPath(anchor));
   auto type = request.value("type", std::string("SphereLight"));
   auto path = unique_child(stage_, anchor, request.value("name", type));
   auto sdf = SdfPath(path);
@@ -507,12 +650,22 @@ std::string Document::add_light(const Json& request) {
   else if (type == "DistantLight") light = UsdLuxDistantLight::Define(stage_, sdf).GetPrim();
   else if (type == "DomeLight") light = UsdLuxDomeLight::Define(stage_, sdf).GetPrim();
   else throw std::runtime_error("Unsupported light type");
-  UsdLuxLightAPI(light).CreateIntensityAttr().Set(request.value("intensity", type == "DistantLight" ? 50000.0f : 1000.0f));
-  UsdLuxLightAPI(light).CreateColorAttr().Set(GfVec3f(1.0f));
-  if (type == "SpotLight") UsdLuxShapingAPI::Apply(light).CreateShapingConeAngleAttr().Set(35.0f);
-  auto preserve = stage_->OverridePrim(SdfPath(anchor)).CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true);
-  int previous = 1; preserve.Get(&previous); preserve.Set(previous);
-  set_transform({{"path", path}, {"translation", request.value("translation", Json::array({0, 0, 0}))}});
+  if (type == "SpotLight") UsdLuxShapingAPI::Apply(light);
+  const auto defaults = light_defaults(type).at("properties");
+  for (auto it = defaults.begin(); it != defaults.end(); ++it) set_value(light.GetAttribute(TfToken(it.key())), it.value());
+  if (request.contains("intensity")) UsdLuxLightAPI(light).CreateIntensityAttr().Set(request.at("intensity").get<float>());
+  if (!selected.empty()) {
+    auto preserve = stage_->OverridePrim(SdfPath(anchor)).CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true);
+    int previous = 1; preserve.Get(&previous); preserve.Set(previous);
+  }
+  auto position = vector3(request.value("translation", Json::array({0, 0, 0})));
+  if (request.contains("world_matrix")) {
+    set_transform({{"path", path}, {"world_matrix", request.at("world_matrix")}});
+  } else if (selected.empty()) {
+    UsdGeomXformCache cache;
+    auto delta = position - cache.GetLocalToWorldTransform(light).ExtractTranslation();
+    set_transform({{"path", path}, {"world_delta", {delta[0], delta[1], delta[2]}}});
+  } else set_transform({{"path", path}, {"translation", {position[0], position[1], position[2]}}});
   return path;
 }
 
@@ -644,6 +797,30 @@ void Document::package(const fs::path& directory) {
 Json Document::scene() const { require_stage(); return compose_scene(stage_, revision_); }
 Json Document::ingest(const Json& request) { require_stage(); return ingest_asset(request, project_path_.parent_path()); }
 
+bool Document::is_light_edit(const Json& request) const {
+  if (!stage_) return false;
+  const auto op = request.value("op", std::string());
+  if (op == "add_light") return true;
+  if (op == "batch") {
+    for (const auto& command : request.at("commands")) if (!is_light_edit(command)) return false;
+    return true;
+  }
+  const std::set<std::string> edits{"transform", "visibility", "set_property", "set_authoring_property",
+    "reset_authoring_property", "set_light_type", "set_parent", "duplicate", "delete"};
+  if (!edits.count(op)) return false;
+  try {
+    const auto selected = request.at("path").get<std::string>();
+    const auto path = (op == "set_parent" || op == "duplicate") ? authored_asset(selected) : authored_path(selected);
+    const auto prim = stage_->GetPrimAtPath(SdfPath(path));
+    if (!prim || !prim.IsActive() || !UsdLuxLightAPI(prim) || prim.IsA<UsdGeomMesh>()) return false;
+    // Transforming/reparenting a light can also affect geometry parented to it.
+    // Use the full scene path whenever its subtree contains anything but lights.
+    for (auto child : UsdPrimRange(prim, UsdTraverseInstanceProxies()))
+      if (child != prim && (!UsdLuxLightAPI(child) || child.IsA<UsdGeomMesh>())) return false;
+    return true;
+  } catch (const std::exception&) { return false; }
+}
+
 void Document::mutate(const Json& request, Json& result) {
   const auto op = required(request, "op");
   if (op == "set_property") set_property(request);
@@ -651,6 +828,7 @@ void Document::mutate(const Json& request, Json& result) {
   else if (op == "reset_authoring_property") set_authoring_property(request, true);
   else if (op == "set_light_type") set_light_type(request);
   else if (op == "transform") set_transform(request);
+  else if (op == "set_parent") result["selection"] = set_parent(request);
   else if (op == "add_mesh" || op == "replace_mesh") {
     auto data = request; data["replace"] = op == "replace_mesh";
     result["selection"] = add_reference(data);
@@ -666,13 +844,15 @@ void Document::mutate(const Json& request, Json& result) {
     auto spec = edit_layer_->GetPrimAtPath(path);
     if (!spec || spec->GetSpecifier() != SdfSpecifierDef) throw std::runtime_error("Delete an authored asset; use visibility to hide a captured mesh");
     stage_->GetPrimAtPath(path).SetActive(false);
+    result["selection"] = "";
   } else if (op == "duplicate") {
-    auto path = SdfPath(authored_path(required(request, "path")));
+    const auto context = required(request, "path");
+    auto path = SdfPath(authored_asset(context));
     auto spec = edit_layer_->GetPrimAtPath(path);
     if (!spec || spec->GetSpecifier() != SdfSpecifierDef) throw std::runtime_error("Duplicate an authored asset rather than a capture instance");
     auto next = unique_child(stage_, path.GetParentPath().GetString(), path.GetName() + "_copy");
     if (!SdfCopySpec(edit_layer_, path, edit_layer_, SdfPath(next))) throw std::runtime_error("Could not duplicate asset");
-    result["selection"] = next;
+    result["selection"] = display_path(next, context);
   } else if (op == "remap") {
     const auto from = required(request, "from"), to = required(request, "to");
     UsdUtilsModifyAssetPaths(edit_layer_, [&](const std::string& path) {
@@ -685,6 +865,8 @@ void Document::mutate(const Json& request, Json& result) {
 
 Json Document::dispatch(const Json& request) {
   const auto op = required(request, "op");
+  const auto before = revision_;
+  if (op == "open" || op == "create") last_edit_lights_only_ = false;
   Json result = Json::object();
   if (op == "open") open(required(request, "path"));
   else if (op == "create") create(required(request, "capture"), required(request, "path"));
@@ -696,10 +878,14 @@ Json Document::dispatch(const Json& request) {
   else if (op == "redo") redo();
   else if (op == "select_layer") select_layer(required(request, "layer"));
   else if (op == "inspect") return inspect(required(request, "path"));
+  else if (op == "parent_candidates") return parent_candidates(required(request, "path"));
+  else if (op == "light_defaults") return light_defaults(required(request, "type"));
   else if (op == "scene") return scene();
+  else if (op == "lights") { require_stage(); return compose_lights(stage_, revision_); }
   else if (op == "ingest") return ingest(request);
-  else if (op != "describe") edit(request.value("label", op), [&] { mutate(request, result); });
+  else if (op != "describe") edit(request.value("label", op), [&] { mutate(request, result); }, is_light_edit(request));
   result["document"] = describe();
+  result["scene_update"] = revision_ == before ? "none" : last_edit_lights_only_ ? "lights" : "full";
   return result;
 }
 }

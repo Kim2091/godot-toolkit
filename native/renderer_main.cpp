@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <vector>
 #ifdef _WIN32
@@ -32,6 +33,14 @@ remixapi_Transform transform(const Json& values) {
   if (values.size() != 16) throw std::runtime_error("Expected 16 transform elements");
   remixapi_Transform result{};
   for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) result.matrix[r][c] = values.at(c * 4 + r).get<float>();
+  return result;
+}
+remixapi_Transform transformed(const remixapi_Transform& delta, const remixapi_Transform& original) {
+  remixapi_Transform result{};
+  for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) {
+    for (int k = 0; k < 3; ++k) result.matrix[r][c] += delta.matrix[r][k] * original.matrix[k][c];
+    if (c == 3) result.matrix[r][c] += delta.matrix[r][3];
+  }
   return result;
 }
 #ifdef _WIN32
@@ -119,7 +128,7 @@ public:
     for (auto light : lights_) api_.DestroyLight(light);
     for (const auto& material : materials_) api_.DestroyMaterial(material.second);
     meshes_.clear(); lights_.clear(); materials_.clear(); instances_.clear();
-    mesh_cache_.clear();
+    mesh_cache_.clear(); instance_origins_.clear(); light_origins_.clear(); previewed_lights_.clear();
   }
   void scene(const Json& scene) {
     require_running();
@@ -135,9 +144,68 @@ public:
       for (auto& m : scene.at("meshes")) mesh(m);
       for (auto& light : scene.at("lights")) add_light(light);
       revision_ = scene.at("revision").get<uint64_t>();
+      geometry_revision_ = scene.value("geometry_revision", revision_);
     } catch (...) { clear(); throw; }
   }
   void camera(const Json& data) { camera_ = data; }
+  Json update_lights(const Json& request) {
+    require_running();
+    const auto revision = request.at("revision").get<uint64_t>();
+    if (request.at("geometry_revision").get<uint64_t>() != geometry_revision_ || revision < revision_)
+      return {{"revision", revision_}, {"updated", 0}};
+    std::map<std::string, size_t> previous;
+    for (size_t i = 0; i < light_origins_.size(); ++i) previous.emplace(light_origins_[i].at("id").get<std::string>(), i);
+    std::vector<remixapi_LightHandle> next;
+    std::vector<Json> origins;
+    size_t updated = 0, removed = 0;
+    for (const auto& data : request.at("lights")) {
+      const auto id = data.at("id").get<std::string>();
+      const auto found = previous.find(id);
+      remixapi_LightHandle handle{};
+      if (found != previous.end()) {
+        const auto index = found->second;
+        handle = lights_[index];
+        if (data.at("type") != light_origins_[index].at("type")) {
+          checked(api_.DestroyLight(handle), "DestroyLight"); handle = {};
+        }
+        if (data != light_origins_[index] || previewed_lights_.count(id)) {
+          handle = create_light(data, transform(data.at("transform"))); ++updated;
+        }
+        previous.erase(found);
+      } else {
+        handle = create_light(data, transform(data.at("transform"))); ++updated;
+      }
+      if (handle) { next.push_back(handle); origins.push_back(data); }
+    }
+    for (const auto& item : previous) { checked(api_.DestroyLight(lights_[item.second]), "DestroyLight"); ++removed; }
+    lights_ = std::move(next); light_origins_ = std::move(origins); previewed_lights_.clear();
+    revision_ = revision;
+    return {{"revision", revision_}, {"updated", updated}, {"removed", removed}};
+  }
+  Json preview_transform(const Json& request) {
+    require_running();
+    // A queued drag from the previous scene must never affect a newer snapshot.
+    if (request.at("revision").get<uint64_t>() != revision_) return {{"updated", 0}};
+    const auto path = request.at("path").get<std::string>();
+    if (path.empty() || path.front() != '/') throw std::runtime_error("Invalid preview path");
+    const auto delta = transform(request.at("delta"));
+    for (const auto& row : delta.matrix) for (float value : row)
+      if (!std::isfinite(value)) throw std::runtime_error("Non-finite preview transform");
+    auto matches = [&](const std::string& id) { return id == path || id.rfind(path + "/", 0) == 0; };
+    size_t updated = 0;
+    for (size_t i = 0; i < instances_.size(); ++i) if (matches(instance_origins_[i].first)) {
+      instances_[i].transform = transformed(delta, instance_origins_[i].second);
+      ++updated;
+    }
+    for (size_t i = 0; i < lights_.size(); ++i) if (matches(light_origins_[i].at("id").get<std::string>())) {
+      // Remix keys lights by hash: creating the same ID updates its definition.
+      // Always transform the baseline, so preview deltas never accumulate.
+      lights_[i] = create_light(light_origins_[i], transformed(delta, transform(light_origins_[i].at("transform"))));
+      previewed_lights_.insert(light_origins_[i].at("id").get<std::string>());
+      ++updated;
+    }
+    return {{"updated", updated}};
+  }
   void settings(const Json& data) {
     require_running();
     for (auto it = data.begin(); it != data.end(); ++it) checked(api_.SetConfigVariable(it.key().c_str(), it.value().get<std::string>().c_str()), "Set render setting");
@@ -249,15 +317,24 @@ private:
     remixapi_InstanceInfo instance{}; instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
     instance.mesh = handle; instance.transform = transform(data.at("transform")); instance.doubleSided = data.value("double_sided", false);
     instances_.push_back(instance);
+    instance_origins_.emplace_back(data.at("id").get<std::string>(), instance.transform);
   }
   void add_light(const Json& data) {
-    remixapi_LightInfo info{}; info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO; info.hash = hash64(data.at("id").get<std::string>());
+    if (auto light = create_light(data, transform(data.at("transform")))) {
+      lights_.push_back(light); light_origins_.push_back(data);
+    }
+  }
+  remixapi_LightHandle create_light(const Json& data, const remixapi_Transform& matrix) {
+    remixapi_LightInfo info{}; info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+    info.hash = hash64(data.at("id").get<std::string>() + ":" + data.at("type").get<std::string>());
+    // The fork deliberately ignores updates to sleeping static lights. Editor
+    // lights must remain movable after any number of preview/inspector edits.
+    info.isDynamic = true;
     remixapi_LightInfoUSDEXT usd{}; usd.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_USD_EXT;
     const std::map<std::string, remixapi_StructType> types{{"SphereLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT},
       {"RectLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_RECT_EXT}, {"DiskLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISK_EXT},
       {"CylinderLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_CYLINDER_EXT}, {"DistantLight", REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT}};
     const auto type = data.at("type").get<std::string>();
-    auto matrix = transform(data.at("transform"));
     auto color = vector3(data.at("color"));
     float intensity = data.value("intensity", 1.f), radius = data.value("radius", 0.5f), width = data.value("width", 1.f);
     float height = data.value("height", 1.f), length = data.value("length", 1.f);
@@ -271,27 +348,30 @@ private:
       info.radiance = {color.x * intensity, color.y * intensity, color.z * intensity};
     } else {
       auto found = types.find(type);
-      if (found == types.end()) return;
+      if (found == types.end()) return {};
       usd.lightType = found->second; usd.transform = matrix; usd.pColor = &color; usd.pIntensity = &intensity;
       usd.pRadius = &radius; usd.pWidth = &width; usd.pHeight = &height; usd.pLength = &length;
       usd.pAngleRadians = &angle; usd.pConeAngleRadians = &cone; info.pNext = &usd;
       usd.pConeSoftness = &softness; usd.pFocus = &focus;
     }
     remixapi_LightHandle light{};
-    checked(api_.CreateLight(&info, &light), "CreateLight"); lights_.push_back(light);
+    checked(api_.CreateLight(&info, &light), "CreateLight"); return light;
   }
   remixapi_Interface api_{};
   remixapi_HMODULE library_{};
   bool running_ = false;
   bool shared_ = false;
   uint32_t width_ = 1280, height_ = 720;
-  uint64_t revision_ = 0, frame_ = 0;
+  uint64_t revision_ = 0, geometry_revision_ = 0, frame_ = 0;
   Json camera_;
   std::map<std::string, remixapi_MaterialHandle> materials_;
   std::vector<remixapi_MeshHandle> meshes_;
   std::map<uint64_t, remixapi_MeshHandle> mesh_cache_;
   std::vector<remixapi_InstanceInfo> instances_;
+  std::vector<std::pair<std::string, remixapi_Transform>> instance_origins_;
   std::vector<remixapi_LightHandle> lights_;
+  std::vector<Json> light_origins_;
+  std::set<std::string> previewed_lights_;
 #ifdef _WIN32
   HWND window_ = nullptr;
 #endif
@@ -318,7 +398,9 @@ int main() {
         if (op == "hello") response["result"] = {{"protocol", editor::protocol_version}, {"renderer", "dxvk-remix"}, {"shared_frames", shared_frames}};
         else if (op == "start") response["result"] = renderer.start(request);
         else if (op == "scene") renderer.scene(request.at("scene"));
+        else if (op == "lights") response["result"] = renderer.update_lights(request);
         else if (op == "camera") renderer.camera(request.at("camera"));
+        else if (op == "preview_transform") response["result"] = renderer.preview_transform(request);
         else if (op == "settings") renderer.settings(request.at("settings"));
         else if (op == "frame") response["result"] = renderer.frame();
         else if (op == "shutdown") shutdown = true;

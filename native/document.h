@@ -17,6 +17,7 @@ struct Edit {
   pxr::SdfLayerHandle layer;
   std::string before;
   std::string after;
+  bool lights_only = false;
 };
 
 class Document {
@@ -29,7 +30,7 @@ public:
   void create(const fs::path& capture, const fs::path& project);
   void save();
   void package(const fs::path& directory);
-  void edit(const std::string& label, const std::function<void()>& operation);
+  void edit(const std::string& label, const std::function<void()>& operation, bool lights_only = false);
   void undo();
   void redo();
   Json ingest(const Json& request);
@@ -41,15 +42,22 @@ private:
   void select_layer(const std::string& identifier);
   Json captures() const;
   void select_capture(const fs::path& path, bool add);
-  void edit_layer(const std::string& label, const pxr::SdfLayerHandle& layer, const std::function<void()>& operation);
+  void edit_layer(const std::string& label, const pxr::SdfLayerHandle& layer, const std::function<void()>& operation, bool lights_only = false);
+  bool is_light_edit(const Json& request) const;
   void set_property(const Json& request);
   void set_authoring_property(const Json& request, bool reset = false);
   void set_light_type(const Json& request);
   void set_transform(const Json& request);
   std::string anchor_for(const std::string& path) const;
   std::string authored_path(const std::string& path) const;
+  std::string authored_asset(const std::string& path) const;
+  std::string display_path(const std::string& path, const std::string& context) const;
+  std::string parent_path(const std::string& path) const;
+  Json parent_candidates(const std::string& path) const;
+  std::string set_parent(const Json& request);
   std::string add_reference(const Json& request);
   std::string add_light(const Json& request);
+  Json light_defaults(const std::string& type) const;
   void replace_material(const Json& request);
   void mutate(const Json& request, Json& result);
   bool dirty() const;
@@ -60,9 +68,11 @@ private:
   std::vector<Edit> redo_;
   std::map<std::string, std::string> saved_layers_;
   uint64_t revision_ = 0;
+  bool last_edit_lights_only_ = false;
 };
 
 Json compose_scene(const pxr::UsdStageRefPtr& stage, uint64_t revision);
+Json compose_lights(const pxr::UsdStageRefPtr& stage, uint64_t revision);
 Json describe_authoring(const pxr::UsdPrim& prim, const pxr::SdfLayerHandle& edit_layer);
 Json compose_material(const pxr::UsdPrim& prim);
 Json preview_asset(const fs::path& path);

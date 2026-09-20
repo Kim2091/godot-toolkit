@@ -12,6 +12,7 @@ var values: Dictionary = {}
 var pending_spins: Dictionary = {}
 var updating := false
 var library_image: TextureRect
+var parent_button: Button
 
 func _label(text: String, parent: Node) -> Label:
 	var label := Label.new(); label.text = text
@@ -23,6 +24,7 @@ func _clear() -> void:
 	updating = true
 	controls.clear(); values.clear(); pending_spins.clear()
 	library_image = null
+	parent_button = null
 	for child in get_children():
 		remove_child(child); child.queue_free()
 	updating = false
@@ -53,7 +55,7 @@ func show_selection(details: Dictionary) -> void:
 		for field in material_details.authoring.fields:
 			field["editable"] = material_details.authoring.get("editable", false)
 			fields.append(field)
-	var key := JSON.stringify([details.path, authoring.kind, authoring.get("light_type"), authoring.get("references", []), selected_material,
+	var key := JSON.stringify([details.path, details.get("attachment"), authoring.kind, authoring.get("light_type"), authoring.get("references", []), selected_material,
 		fields.map(func(field: Dictionary): return [field.path, field.property, field.type])])
 	if schema_key != key:
 		_finish_editing(); _clear(); schema_key = key
@@ -64,6 +66,13 @@ func show_selection(details: Dictionary) -> void:
 			_label("Asset: " + str(reference), self).add_theme_font_size_override("font_size", 12)
 		if details.get("anchor") != null:
 			_label("Edits apply to this captured asset's instances.", self).add_theme_font_size_override("font_size", 12)
+		if details.has("attachment"):
+			_label("Parent", self)
+			var parent: String = details.attachment.parent
+			_label("World (unattached)" if parent.is_empty() else parent, self).tooltip_text = parent
+			parent_button = Button.new(); parent_button.text = "Choose parent…"
+			parent_button.pressed.connect(func(): _choose_parent(details.attachment))
+			add_child(parent_button)
 		if details.has("translation") and authoring.get("editable", false):
 			var body := _group("Transform", authoring.kind != "light")
 			for property in ["translation", "rotation", "scale"]:
@@ -111,6 +120,40 @@ func show_selection(details: Dictionary) -> void:
 	for field in fields:
 		_update_field(field, field_values)
 	updating = false
+
+func _choose_parent(attachment: Dictionary) -> void:
+	_finish_editing()
+	var data: Dictionary = request.call({"op": "parent_candidates", "path": attachment.path})
+	if not data.has("parents"):
+		return
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Attach to parent"; dialog.ok_button_text = "Attach"
+	var column := VBoxContainer.new(); dialog.add_child(column)
+	var search := LineEdit.new(); search.placeholder_text = "Search prim names or paths"; column.add_child(search)
+	var list := ItemList.new(); list.custom_minimum_size = Vector2(560, 320); list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	column.add_child(list)
+	_label("Changing parent keeps the object in place. Captured parents share attachments across their instances.", column)
+	var refresh := func(query: String):
+		list.clear()
+		list.add_item("World (unattached)"); list.set_item_metadata(0, "")
+		if attachment.parent.is_empty(): list.select(0)
+		for parent: Dictionary in data.parents:
+			if not query.is_empty() and not parent.path.to_lower().contains(query.to_lower()): continue
+			var index := list.add_item(parent.path + "  [" + parent.type + "]")
+			list.set_item_metadata(index, parent.path)
+			if parent.path == attachment.parent: list.select(index)
+		dialog.get_ok_button().disabled = list.get_selected_items().is_empty()
+	search.text_changed.connect(refresh)
+	list.item_selected.connect(func(_index: int): dialog.get_ok_button().disabled = false)
+	var apply := func():
+		if list.get_selected_items().is_empty(): return
+		command_requested.emit({"op": "set_parent", "path": attachment.path, "parent": list.get_item_metadata(list.get_selected_items()[0])})
+		dialog.queue_free()
+	dialog.confirmed.connect(apply)
+	list.item_activated.connect(func(_index: int): apply.call())
+	dialog.canceled.connect(dialog.queue_free)
+	add_child(dialog); refresh.call("")
+	dialog.popup_centered(Vector2i(600, 440)); search.grab_focus()
 
 func _vector(path: String, property: String, value: Array, parent: Node) -> void:
 	_label(property.capitalize() + (" (degrees)" if property == "rotation" else ""), parent)
@@ -209,6 +252,8 @@ func _field(field: Dictionary, parent: Node) -> void:
 	if widget.get_parent() == null:
 		parent.add_child(widget)
 	widget.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	if field.property == "inputs:radius":
+		widget.tooltip_text = "Physical emitter radius in scene units, not illumination range. Keep the emitter outside surrounding geometry."
 	controls[id] = {"widget": widget, "reset": reset, "request": command}
 
 func _update_field(field: Dictionary, field_values: Dictionary) -> void:

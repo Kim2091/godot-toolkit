@@ -4,6 +4,8 @@
 #include <chrono>
 #include <pxr/base/tf/errorMark.h>
 #include <pxr/usd/usdGeom/subset.h>
+#include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usd/editContext.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
 
@@ -86,6 +88,22 @@ int main() {
     auto imported = doc.ingest({{"source", (fs::path(FIXTURE_DIR) / "replacement.usda").string()}});
     auto preview = editor::preview_asset(imported["asset"].get<std::string>());
     check(preview["kind"] == "mesh" && !preview["scene"]["meshes"].empty() && !preview["dependencies"].empty(), "Preview extraction must include geometry and dependencies");
+    editor::Document defaults;
+    defaults.create(capture, root / "defaults/project.usda");
+    for (double units : {1.0, 0.01}) {
+      { UsdEditContext context(defaults.stage(), defaults.stage()->GetRootLayer()); UsdGeomSetStageMetersPerUnit(defaults.stage(), units); }
+      for (const auto& entry : std::map<std::string, double>{{"SphereLight", 100}, {"SpotLight", 100}, {"RectLight", 400},
+             {"DiskLight", 500}, {"CylinderLight", 140}, {"DistantLight", 25}, {"DomeLight", 1}}) {
+        const auto created = defaults.dispatch({{"op", "add_light"}, {"type", entry.first}})["selection"].get<std::string>();
+        check(field(defaults, created, "inputs:intensity")["value"] == entry.second, "New light intensity must match Toolkit's creator");
+        if (entry.first == "SphereLight" || entry.first == "SpotLight" || entry.first == "DiskLight" || entry.first == "CylinderLight")
+          check(field(defaults, created, "inputs:radius")["value"] == 5.0 / units, "Toolkit emitter radius must use the capture's units");
+        if (entry.first == "RectLight") check(field(defaults, created, "inputs:width")["value"] == 10.0 / units &&
+          field(defaults, created, "inputs:height")["value"] == 10.0 / units, "Toolkit rectangle dimensions");
+        if (entry.first == "CylinderLight") check(field(defaults, created, "inputs:length")["value"] == 10.0 / units, "Toolkit cylinder length");
+        if (entry.first == "DistantLight") check(field(defaults, created, "inputs:angle")["value"] == 1, "Toolkit distant light angle");
+      }
+    }
     check(errors.IsClean(), "Authoring emitted USD errors");
     fs::remove_all(root);
     std::cout << "Authoring tests passed\n";

@@ -171,6 +171,22 @@ std::vector<std::array<int, 3>> triangulate(const VtVec3fArray& points, const Vt
   triangles.push_back({start + corners[0], start + corners[1], start + corners[2]});
   return triangles;
 }
+Json light_json(const UsdPrim& prim, const GfMatrix4d& world, Json& warnings) {
+  const auto path = prim.GetPath().GetString();
+  auto color = attribute(prim, "inputs:color", GfVec3f(1));
+  if (attribute(prim, "inputs:enableColorTemperature", false))
+    color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(attribute(prim, "inputs:colorTemperature", 6500.f)));
+  return {{"id", path}, {"source_path", source_path(prim)}, {"type", prim.GetTypeName().GetString()},
+    {"transform", matrix_json(world)}, {"color", {color[0], color[1], color[2]}},
+    {"intensity", attribute(prim, "inputs:intensity", 1.f) * std::pow(2.f, attribute(prim, "inputs:exposure", 0.f))},
+    {"radius", attribute(prim, "inputs:radius", 0.5f)}, {"width", attribute(prim, "inputs:width", 1.f)},
+    {"height", attribute(prim, "inputs:height", 1.f)}, {"length", attribute(prim, "inputs:length", 1.f)},
+    {"angle", attribute(prim, "inputs:angle", 0.53f)}, {"cone_angle", attribute(prim, "inputs:shaping:cone:angle", 180.f)},
+    {"cone_softness", attribute(prim, "inputs:shaping:cone:softness", 0.f)},
+    {"focus", attribute(prim, "inputs:shaping:focus", 0.f)},
+    {"texture", texture(prim, "inputs:texture:file", warnings)}};
+}
+
 }
 
 std::string resolved_texture_path(const UsdPrim& prim, const char* name) {
@@ -184,6 +200,16 @@ Json compose_material(const UsdPrim& prim) {
   if (!material) throw std::runtime_error("Expected a USD material");
   auto result = material_json(material, warnings);
   result["warnings"] = warnings;
+  return result;
+}
+Json compose_lights(const UsdStageRefPtr& stage, uint64_t revision) {
+  Json result{{"revision", revision}, {"lights", Json::array()}, {"warnings", Json::array()}};
+  UsdGeomXformCache transforms;
+  for (auto prim : UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies())) {
+    // Mesh emitters take the geometry branch in compose_scene as well.
+    if (!UsdLuxLightAPI(prim) || prim.IsA<UsdGeomMesh>() || UsdGeomImageable(prim).ComputeVisibility() == UsdGeomTokens->invisible) continue;
+    result["lights"].push_back(light_json(prim, transforms.GetLocalToWorldTransform(prim), result["warnings"]));
+  }
   return result;
 }
 Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
@@ -249,18 +275,7 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
           {"double_sided", attribute(prim, "doubleSided", false)}});
       } catch (const std::exception& error) { result["warnings"].push_back(path + ": " + error.what()); }
     } else if (auto light = UsdLuxLightAPI(prim)) {
-      auto color = attribute(prim, "inputs:color", GfVec3f(1));
-      if (attribute(prim, "inputs:enableColorTemperature", false))
-        color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(attribute(prim, "inputs:colorTemperature", 6500.f)));
-      result["lights"].push_back({{"id", path}, {"source_path", source_path(prim)}, {"type", prim.GetTypeName().GetString()},
-        {"transform", matrix_json(world)}, {"color", {color[0], color[1], color[2]}},
-        {"intensity", attribute(prim, "inputs:intensity", 1.f) * std::pow(2.f, attribute(prim, "inputs:exposure", 0.f))},
-        {"radius", attribute(prim, "inputs:radius", 0.5f)}, {"width", attribute(prim, "inputs:width", 1.f)},
-        {"height", attribute(prim, "inputs:height", 1.f)}, {"length", attribute(prim, "inputs:length", 1.f)},
-        {"angle", attribute(prim, "inputs:angle", 0.53f)}, {"cone_angle", attribute(prim, "inputs:shaping:cone:angle", 180.f)},
-        {"cone_softness", attribute(prim, "inputs:shaping:cone:softness", 0.f)},
-        {"focus", attribute(prim, "inputs:shaping:focus", 0.f)},
-        {"texture", texture(prim, "inputs:texture:file", result["warnings"])}});
+      result["lights"].push_back(light_json(prim, world, result["warnings"]));
     } else if (auto camera = UsdGeomCamera(prim)) {
       result["cameras"].push_back({{"id", path}, {"transform", matrix_json(world)},
         {"focal_length", attribute(prim, "focalLength", 50.f)}, {"horizontal_aperture", attribute(prim, "horizontalAperture", 20.955f)}});
