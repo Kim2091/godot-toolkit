@@ -4,6 +4,20 @@ const LayoutView = preload("res://scripts/layout_view.gd")
 const RendererClient = preload("res://scripts/renderer_client.gd")
 const AssetBrowser = preload("res://scripts/asset_browser.gd")
 const AuthoringInspector = preload("res://scripts/authoring_inspector.gd")
+const ProjectSessions = preload("res://scripts/project_sessions.gd")
+const WelcomeScreen = preload("res://scripts/welcome_screen.gd")
+const StudioTheme = preload("res://scripts/studio_theme.gd")
+var sessions := ProjectSessions.new()
+var welcome: Control
+var editor_page: Control
+var camera_mode: OptionButton
+var render_toggle: CheckButton
+var dpi_timer: Timer
+var restoring_view := false
+var save_pending := false
+var close_pending := false
+var preview_jobs := 0
+var save_serials: Dictionary = {}
 var document: Object
 var state: Dictionary = {}
 var selection := ""
@@ -21,6 +35,7 @@ var refreshing := false
 var import_running := false
 var last_scene: Dictionary = {}
 var runtime_path := ""
+var runtime_dialog: FileDialog
 var root_directory := ""
 var library_selection := ""
 var import_folder := ""
@@ -30,15 +45,25 @@ func _ready() -> void:
 	root_directory = ProjectSettings.globalize_path("res://").get_base_dir().get_base_dir()
 	if ClassDB.class_exists("RemixDocument"):
 		document = ClassDB.instantiate("RemixDocument")
-	_setup_theme()
+	theme = StudioTheme.create()
+	_update_dpi()
 	_build_ui()
+	sessions.warning.connect(_log)
+	sessions.load_history()
+	dpi_timer = Timer.new(); dpi_timer.wait_time = 1.0
+	dpi_timer.timeout.connect(_update_dpi); add_child(dpi_timer); dpi_timer.start()
+	get_window().dpi_changed.connect(_update_dpi)
 	renderer = RendererClient.new()
 	add_child(renderer)
 	renderer.status_changed.connect(_log)
 	renderer.response_received.connect(_renderer_response)
 	renderer.texture_ready.connect(func(texture: Texture2D):
-		viewport.rendered_texture = texture
-		viewport.queue_redraw())
+		if texture == null:
+			viewport.rendered_texture = null)
+	renderer.frame_presented.connect(func(context: Dictionary):
+		if context.get("revision", -1) == state.get("revision", -2):
+			viewport.rendered_texture = renderer.frame_texture)
+	_show_welcome()
 	get_tree().auto_accept_quit = false
 	if document == null:
 		_log("Native USD extension is unavailable. Build the project with scripts/bootstrap.py first.")
@@ -48,28 +73,18 @@ func _ready() -> void:
 		if argument.begins_with("--project="):
 			_open_project(argument.trim_prefix("--project="))
 
-func _setup_theme() -> void:
-	var skin := Theme.new()
-	skin.default_font_size = 14
-	var panel := StyleBoxFlat.new()
-	panel.bg_color = Color("1b2530")
-	panel.set_corner_radius_all(4)
-	panel.content_margin_left = 10
-	panel.content_margin_right = 10
-	panel.content_margin_top = 7
-	panel.content_margin_bottom = 7
-	skin.set_stylebox("normal", "Button", panel)
-	var hover := panel.duplicate()
-	hover.bg_color = Color("2c414e")
-	skin.set_stylebox("hover", "Button", hover)
-	var active := panel.duplicate()
-	active.bg_color = Color("236354")
-	skin.set_stylebox("pressed", "Button", active)
-	skin.set_color("font_color", "Label", Color("c3d1df"))
-	skin.set_color("font_color", "Button", Color("deebf0"))
-	skin.set_constant("separation", "HBoxContainer", 6)
-	skin.set_constant("separation", "VBoxContainer", 7)
-	theme = skin
+func _update_dpi() -> void:
+	var factor := DisplayServer.screen_get_scale()
+	if not is_finite(factor) or factor <= 0:
+		factor = 1
+	if dpi_timer == null and factor != 1.0 and DisplayServer.get_name() != "headless" and get_window().mode == Window.MODE_WINDOWED:
+		var available := DisplayServer.screen_get_usable_rect()
+		get_window().size = Vector2i(Vector2(get_window().size) * factor).min(available.size)
+		get_window().position = available.position + (available.size - get_window().size) / 2
+	if get_window().content_scale_mode != Window.CONTENT_SCALE_MODE_DISABLED or not is_equal_approx(get_window().content_scale_factor, factor):
+		StudioTheme.apply_scale(get_window(), factor)
+		if viewport != null:
+			viewport._sync_view()
 
 func _button(text: String, action: Callable, parent: Node) -> Button:
 	var button := Button.new()
@@ -78,7 +93,7 @@ func _button(text: String, action: Callable, parent: Node) -> Button:
 	parent.add_child(button)
 	return button
 
-func _label(text: String, parent: Node, font_size := 14) -> Label:
+func _label(text: String, parent: Node, font_size := 13) -> Label:
 	var label := Label.new()
 	label.text = text
 	label.add_theme_font_size_override("font_size", font_size)
@@ -87,22 +102,26 @@ func _label(text: String, parent: Node, font_size := 14) -> Label:
 
 func _build_ui() -> void:
 	var margin := MarginContainer.new()
+	editor_page = margin
 	margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	for side in ["left", "right", "top", "bottom"]:
-		margin.add_theme_constant_override("margin_" + side, 12)
+		margin.add_theme_constant_override("margin_" + side, 8)
 	add_child(margin)
 	var column := VBoxContainer.new()
 	margin.add_child(column)
 	var header := HBoxContainer.new()
 	column.add_child(header)
-	_label("REMIX STUDIO", header, 20).modulate = Color("70d9c0")
+	_label("REMIX STUDIO", header, 16).modulate = Color("70d9c0")
 	project_label = _label("No project", header)
+	project_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	project_label.custom_minimum_size.x = 80
 	project_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_button("Recent projects", _show_welcome, header)
 	_button("New from capture", _new_capture, header)
 	_button("Open", _choose_open, header)
-	_button("Save", func(): _command({"op": "save"}), header)
+	_button("Save", _save_from_ui, header)
 	_button("Package mod", _choose_package, header)
-	var toolbar := HBoxContainer.new()
+	var toolbar := HFlowContainer.new()
 	column.add_child(toolbar)
 	_button("Undo", func(): _command({"op": "undo"}), toolbar)
 	_button("Redo", func(): _command({"op": "redo"}), toolbar)
@@ -122,10 +141,6 @@ func _build_ui() -> void:
 	lights.get_popup().id_pressed.connect(func(id: int): _command({"op": "add_light", "path": selection, "type": types[id]}))
 	_button("Duplicate", func(): _command({"op": "duplicate", "path": selection}), toolbar)
 	_button("Delete", func(): _command({"op": "delete", "path": selection}), toolbar)
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	toolbar.add_child(spacer)
-	_button("Start / restart Remix", _start_renderer, toolbar)
 	var authoring_area := VSplitContainer.new()
 	authoring_area.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	authoring_area.split_offset = 110
@@ -134,7 +149,7 @@ func _build_ui() -> void:
 	workspace.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	authoring_area.add_child(workspace)
 	var left := VBoxContainer.new()
-	left.custom_minimum_size.x = 240
+	left.custom_minimum_size.x = 210
 	workspace.add_child(left)
 	_label("SCENE", left)
 	tree = Tree.new()
@@ -154,17 +169,17 @@ func _build_ui() -> void:
 	var center_panel := VBoxContainer.new()
 	center_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	center_right.add_child(center_panel)
-	var view_tools := HBoxContainer.new()
+	var view_tools := HFlowContainer.new()
 	center_panel.add_child(view_tools)
 	_label("Viewport", view_tools).size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var render_toggle := CheckButton.new()
+	render_toggle = CheckButton.new()
 	render_toggle.text = "Remix"
 	render_toggle.button_pressed = true
 	render_toggle.toggled.connect(func(value: bool):
 		viewport.show_render = value
-		viewport.queue_redraw())
+		_sync_renderer())
 	view_tools.add_child(render_toggle)
-	var camera_mode := OptionButton.new()
+	camera_mode = OptionButton.new()
 	camera_mode.add_item("Drone", LayoutView.CameraMode.DRONE)
 	camera_mode.add_item("Orbit", LayoutView.CameraMode.ORBIT)
 	camera_mode.tooltip_text = "Drone: press Z over the viewport for WASD movement and mouse look. Press Z or Escape to release."
@@ -181,13 +196,13 @@ func _build_ui() -> void:
 	viewport.custom_minimum_size = Vector2(400, 300)
 	viewport.selected.connect(_select)
 	viewport.camera_changed.connect(func(camera: Dictionary):
-		if renderer != null and renderer.is_ready:
+		if renderer != null and renderer.is_ready and not restoring_view:
 			renderer.send({"op": "camera", "camera": camera}))
 	viewport.translation_requested.connect(_translate)
 	center_panel.add_child(viewport)
-	_label("Shift + drag moves the selection. Changes to captured assets affect every instance.", center_panel, 12)
+	_label("Shift + drag moves the selection. Changes to captured assets affect every instance.", center_panel, 11).autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	var right := VBoxContainer.new()
-	right.custom_minimum_size.x = 300
+	right.custom_minimum_size.x = 260
 	center_right.add_child(right)
 	_label("PROPERTIES", right)
 	var scroll := ScrollContainer.new()
@@ -212,15 +227,35 @@ func _build_ui() -> void:
 		if library_selection == id and inspector.library_image != null:
 			inspector.library_image.texture = texture)
 	assets.asset_activated.connect(func(kind: String): _use_asset("replace_material" if kind == "material" else "add_mesh"))
+	var output_toggle := Button.new()
+	output_toggle.text = "Show output"
+	output_toggle.toggle_mode = true
+	output_toggle.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	column.add_child(output_toggle)
+	var output_panel := VBoxContainer.new()
+	output_panel.visible = false
+	column.add_child(output_panel)
+	output_toggle.toggled.connect(func(expanded: bool):
+		output_panel.visible = expanded
+		output_toggle.text = "Hide output" if expanded else "Show output")
 	output = RichTextLabel.new()
-	output.custom_minimum_size.y = 85
+	output.custom_minimum_size.y = 56
 	output.scroll_following = true
-	column.add_child(output)
-	status = _label("", column, 12)
+	output_panel.add_child(output)
+	status = _label("", output_panel, 11)
+	status.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	welcome = WelcomeScreen.new(); add_child(welcome)
+	welcome.browse.connect(_choose_open)
+	welcome.create_project.connect(_new_capture)
+	welcome.return_to_editor.connect(_show_editor)
+	welcome.open_project.connect(func(path: String): _guard_unsaved(func(): _open_project(path)))
+	welcome.remove_recent.connect(func(path: String): sessions.forget(path); welcome.refresh(sessions, state.get("open", false)))
 
 func _log(message: String) -> void:
 	status.text = message
 	output.append_text(message + "\n")
+	if welcome != null:
+		welcome.notice.text = message
 
 func _request(data: Dictionary) -> Dictionary:
 	if document == null:
@@ -233,6 +268,11 @@ func _request(data: Dictionary) -> Dictionary:
 	return response.get("result", {})
 
 func _command(data: Dictionary) -> void:
+	if data.op == "open" and not FileAccess.file_exists(data.path):
+		_log("Project file is missing: " + data.path)
+		return
+	if data.op in ["open", "create"]:
+		_persist_camera()
 	var previous_revision: int = state.get("revision", -1)
 	var result := _request(data)
 	if result.is_empty():
@@ -244,10 +284,16 @@ func _command(data: Dictionary) -> void:
 	if result.has("document"):
 		if data.op in ["open", "create"]:
 			inspector._clear(); inspector.schema_key = ""
+			library_selection = ""; selection = ""; last_scene = {}
+			viewport.set_mouse_capture(false); viewport.rendered_texture = null
 		state = result.document
 		_refresh(state.get("revision", -1) != previous_revision)
+	if data.op in ["open", "create"]:
+		sessions.opened(state.path)
+		_show_editor()
 	if data.op == "save":
 		_log("Project saved.")
+		_save_view_and_preview()
 	elif data.op == "package":
 		_log("Mod packaged at " + data.path)
 
@@ -283,9 +329,17 @@ func _refresh(scene_changed := true) -> void:
 	if scene_changed and state.get("open", false):
 		var first := last_scene.is_empty()
 		last_scene = _request({"op": "scene"})
-		viewport.set_scene(last_scene, first)
+		restoring_view = first
+		viewport.set_scene(last_scene, false)
+		if first:
+			var saved := sessions.read_view(state.path)
+			if not viewport.restore_view_state(saved.get("camera"), false):
+				viewport.reset_view()
+			camera_mode.select(viewport.camera_mode)
+		restoring_view = false
 		if renderer.is_ready:
 			renderer.send({"op": "scene", "scene": last_scene})
+			renderer.send({"op": "camera", "camera": viewport.camera()})
 		for warning in state.get("warnings", []) + last_scene.get("warnings", []):
 			_log(warning)
 
@@ -307,7 +361,7 @@ func _select(path: String) -> void:
 func _translate(delta: Vector3) -> void:
 	_command({"op": "transform", "path": selection, "world_delta": [delta.x, delta.y, delta.z]})
 
-func _dialog(mode: FileDialog.FileMode, title: String, filters: PackedStringArray, callback: Callable) -> void:
+func _dialog(mode: FileDialog.FileMode, title: String, filters: PackedStringArray, callback: Callable) -> FileDialog:
 	var dialog := FileDialog.new()
 	dialog.access = FileDialog.ACCESS_FILESYSTEM
 	dialog.file_mode = mode
@@ -321,8 +375,11 @@ func _dialog(mode: FileDialog.FileMode, title: String, filters: PackedStringArra
 		dialog.file_selected.connect(func(path: String): dialog.queue_free(); callback.call_deferred(path))
 	dialog.canceled.connect(dialog.queue_free)
 	dialog.popup_centered_ratio(0.65)
+	return dialog
 
-func _guard_unsaved(action: Callable) -> void:
+func _guard_unsaved(action: Callable, canceled := Callable()) -> void:
+	inspector._finish_editing()
+	await get_tree().process_frame
 	if not state.get("dirty", false):
 		action.call()
 		return
@@ -331,24 +388,21 @@ func _guard_unsaved(action: Callable) -> void:
 	dialog.ok_button_text = "Discard edits"
 	add_child(dialog)
 	dialog.confirmed.connect(func(): dialog.queue_free(); action.call())
-	dialog.canceled.connect(dialog.queue_free)
+	dialog.canceled.connect(func():
+		dialog.queue_free()
+		if canceled.is_valid(): canceled.call())
 	dialog.popup_centered()
 
 func _choose_open() -> void:
 	_guard_unsaved(func(): _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Open Toolkit project", ["*.usd,*.usda,*.usdc ; USD projects"], _open_project))
 
 func _open_project(path: String) -> void:
-	library_selection = ""
-	last_scene = {}
-	selection = ""
 	_command({"op": "open", "path": path})
 
 func _new_capture() -> void:
 	_guard_unsaved(func(): _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select Remix capture", ["*.usd,*.usda,*.usdc ; Remix captures"], func(path: String):
 		pending_capture = path
 		_dialog(FileDialog.FILE_MODE_SAVE_FILE, "Create project in a new directory", ["*.usda ; USD project"], func(project: String):
-			library_selection = ""
-			last_scene = {}; selection = ""
 			_command({"op": "create", "capture": pending_capture, "path": project}))))
 
 func _choose_package() -> void:
@@ -448,7 +502,17 @@ func _use_asset(op: String) -> void:
 	library_selection = ""
 	_command({"op": op, "path": target, "asset": assets.catalog.absolute_path(id)})
 
+func _sync_renderer() -> void:
+	if renderer == null:
+		return
+	var active: bool = editor_page.visible and viewport.show_render and state.get("open", false)
+	renderer.set_process(active)
+	if active and DisplayServer.get_name() != "headless":
+		_start_renderer()
+
 func _start_renderer() -> void:
+	if renderer.is_ready or renderer.is_starting or is_instance_valid(runtime_dialog):
+		return
 	if not state.get("open", false):
 		_log("Open a scene before starting the renderer.")
 		return
@@ -460,10 +524,12 @@ func _start_renderer() -> void:
 	elif FileAccess.file_exists(root_directory.path_join(".work/build/remix/src/linux/libremix.so")):
 		_launch_renderer(root_directory.path_join(".work/build/remix/src/linux/libremix.so"))
 	else:
-		_dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select Remix runtime library", [], _launch_renderer)
+		runtime_dialog = _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select Remix runtime library", [], _launch_renderer)
 
 func _launch_renderer(library: String) -> void:
 	runtime_path = library
+	if not state.get("open", false) or not viewport.show_render or not editor_page.visible:
+		return
 	var worker := OS.get_environment("REMIX_RENDERER_WORKER")
 	if worker.is_empty():
 		worker = root_directory.path_join("build/remix-renderer" + (".exe" if OS.get_name() == "Windows" else ""))
@@ -490,18 +556,94 @@ func _process(_delta: float) -> void:
 				_log(result.get("error", "Ingestion failed"))
 
 func _unhandled_key_input(event: InputEvent) -> void:
+	if welcome.visible:
+		return
 	if not event.is_pressed() or event.is_echo() or get_viewport().gui_get_focus_owner() is LineEdit:
 		return
 	if event is InputEventKey:
 		if event.is_command_or_control_pressed():
 			if event.keycode == KEY_S:
-				_command({"op": "save"})
+				_save_from_ui()
 			elif event.keycode == KEY_Z:
 				_command({"op": "redo" if event.shift_pressed else "undo"})
 		elif event.keycode == KEY_F:
 			viewport.frame_selection()
 
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST and not close_pending:
+		close_pending = true
 		viewport.set_mouse_capture(false)
-		_guard_unsaved(func(): get_tree().quit())
+		_guard_unsaved(_finish_close, func(): close_pending = false)
+
+func _show_welcome() -> void:
+	viewport.set_mouse_capture(false)
+	editor_page.hide(); welcome.show()
+	welcome.refresh(sessions, state.get("open", false))
+	if renderer != null:
+		renderer.set_process(false)
+
+func _show_editor() -> void:
+	welcome.hide(); editor_page.show()
+	viewport._sync_view()
+	_sync_renderer()
+
+func _save_from_ui() -> void:
+	if save_pending:
+		return
+	save_pending = true
+	inspector._finish_editing()
+	await get_tree().process_frame
+	_command({"op": "save"})
+	save_pending = false
+
+func _persist_camera(saved_at := 0.0) -> bool:
+	if state.get("open", false):
+		return sessions.save_view(state.path, viewport.view_state(), saved_at)
+	return true
+
+func _save_view_and_preview() -> void:
+	var saved_at := Time.get_unix_time_from_system()
+	if not _persist_camera(saved_at):
+		return
+	if DisplayServer.get_name() == "headless":
+		return
+	var path: String = state.path
+	var serial: int = save_serials.get(path, 0) + 1
+	save_serials[path] = serial
+	var image: Image
+	if viewport.show_render and renderer.is_ready and renderer.presented_context.get("revision", -1) == state.revision and renderer.presented_context.get("camera", {}) == viewport.camera() and viewport.rendered_texture != null:
+		image = viewport.rendered_texture.get_image()
+	var thumbnail_view: SubViewport
+	if image == null or image.is_empty():
+		thumbnail_view = viewport.create_thumbnail_view()
+		add_child(thumbnail_view)
+	preview_jobs += 1
+	_complete_preview(path, saved_at, serial, image, thumbnail_view)
+
+func _complete_preview(path: String, saved_at: float, serial: int, image: Image, thumbnail_view: SubViewport) -> void:
+	if thumbnail_view != null:
+		for i in range(2):
+			await RenderingServer.frame_post_draw
+		image = thumbnail_view.get_texture().get_image()
+		thumbnail_view.queue_free()
+	if save_serials.get(path) == serial and image != null and not image.is_empty():
+		var factor := minf(384.0 / image.get_width(), 216.0 / image.get_height())
+		image.convert(Image.FORMAT_RGBA8)
+		image.resize(maxi(1, int(image.get_width() * factor)), maxi(1, int(image.get_height() * factor)))
+		var fitted := Image.create(384, 216, false, Image.FORMAT_RGBA8)
+		fitted.fill(Color("111820"))
+		fitted.blend_rect(image, Rect2i(Vector2i.ZERO, image.get_size()), (fitted.get_size() - image.get_size()) / 2)
+		sessions.save_thumbnail(path, fitted, saved_at)
+	preview_jobs -= 1
+	if welcome.visible:
+		welcome.refresh(sessions, state.get("open", false))
+
+func _prepare_close() -> void:
+	_persist_camera()
+	var deadline := Time.get_ticks_msec() + 2000
+	while preview_jobs > 0 and Time.get_ticks_msec() < deadline:
+		await get_tree().process_frame
+
+func _finish_close() -> void:
+	await _prepare_close()
+	get_tree().quit()

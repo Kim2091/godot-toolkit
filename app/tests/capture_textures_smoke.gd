@@ -83,7 +83,6 @@ def Xform "RootNode" {
 	app.viewport.yaw = 0; app.viewport.pitch = 0; app.viewport.distance = 4
 	app.viewport.queue_redraw()
 	app.renderer.response_received.connect(response)
-	app._start_renderer()
 	deadline = Time.get_ticks_msec() + 180000
 
 func response(data: Dictionary) -> void:
@@ -119,7 +118,7 @@ func capture() -> void:
 					"position": Vector3(point.x, point.y, 0), "color": quadrant.color})
 	var errors := PackedStringArray()
 	for sample in samples:
-		var pixel: Vector2 = app.viewport.global_position + app.viewport._project(sample.position)
+		var pixel: Vector2 = root.get_final_transform() * app.viewport.get_global_transform_with_canvas() * app.viewport._project(sample.position)
 		var actual := image.get_pixelv(Vector2i(pixel))
 		var expected: Color = sample.color
 		for channel in range(3):
@@ -128,7 +127,44 @@ func capture() -> void:
 				break
 	if not errors.is_empty():
 		fail("Capture texture or UV sampling failed: " + "; ".join(errors)); return
-	print("Capture texture rendering passed: " + directory)
+	# Saving must read the presented Remix image, not a wireframe or stale-project frame.
+	if app.renderer.presented_context.get("revision", -1) != app.state.revision:
+		fail("Presented frame has no matching scene revision"); return
+	app._command({"op": "save"})
+	while app.preview_jobs > 0:
+		await process_frame
+	var thumbnail := Image.load_from_file(String(app.state.path) + ".studio.png")
+	if thumbnail == null:
+		fail("Missing Remix project thumbnail"); return
+	var rectangle: Rect2 = app.viewport._view_rect()
+	for sample in samples:
+		var location: Vector2 = (app.viewport._project(sample.position) - rectangle.position) / rectangle.size * Vector2(384, 216)
+		var actual := thumbnail.get_pixelv(Vector2i(location))
+		if Vector3(actual.r - sample.color.r, actual.g - sample.color.g, actual.b - sample.color.b).length() > 0.25:
+			fail("Remix save thumbnail disagrees with displayed texture: " + sample.name); return
+	var saved_project: String = app.state.path
+	var saved_camera: Dictionary = app.viewport.view_state()
+	var saved_png := FileAccess.get_file_as_bytes(saved_project + ".studio.png")
+	# Switch while the worker still presents the previous project's frame, then Save.
+	app._command({"op": "create", "capture": app.root_directory.path_join("tests/fixtures/capture.usda"), "path": directory.path_join("second/project.usda")})
+	app._command({"op": "save"})
+	while app.preview_jobs > 0:
+		await process_frame
+	var second := Image.load_from_file(String(app.state.path) + ".studio.png")
+	if second == null:
+		fail("Missing fallback thumbnail after switching projects"); return
+	var saturated := 0
+	for y in range(second.get_height()):
+		for x in range(second.get_width()):
+			var pixel := second.get_pixel(x, y)
+			if maxf(pixel.r, maxf(pixel.g, pixel.b)) - minf(pixel.r, minf(pixel.g, pixel.b)) > 0.4:
+				saturated += 1
+	if saturated > 30 or FileAccess.get_file_as_bytes(saved_project + ".studio.png") != saved_png:
+		fail("Project switch reused a stale Remix frame or changed the old preview"); return
+	app._open_project(saved_project)
+	if app.viewport.view_state() != saved_camera:
+		fail("Saved Remix camera did not restore"); return
+	print("Capture textures, Remix thumbnails, and project-switch isolation passed: " + directory)
 	app.renderer.stop_worker()
 	quit()
 

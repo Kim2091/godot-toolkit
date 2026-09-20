@@ -59,9 +59,9 @@ func run() -> void:
 	var overlay_pixels := pixels(view.wire_viewport.get_texture().get_image())
 	check(overlay_pixels > 100 and overlay_pixels < layout_pixels * 0.75, "Remix overlay must draw only selected geometry")
 	var projected: Vector2 = view._project(Vector3(-1.1, 0, 0))
-	var gpu_projected: Vector2 = view.wire_camera.unproject_position(Vector3(-1.1, 0, 0)) + view._view_rect().position
+	var gpu_projected: Vector2 = view.wire_camera.unproject_position(Vector3(-1.1, 0, 0)) / root.get_stretch_transform().get_scale() + view._view_rect().position
 	check(projected.distance_to(gpu_projected) < 1, "Overlay must remain aligned after letterboxing")
-	var point := Vector2i(view.position + view._view_rect().get_center())
+	var point := Vector2i(root.get_final_transform() * view.get_global_transform_with_canvas() * view._view_rect().get_center())
 	check(root.get_texture().get_image().get_pixelv(point).b > 0.8, "Transparent overlay must preserve the Remix background")
 	background.fill(Color.GREEN)
 	texture.update(background)
@@ -72,7 +72,7 @@ func run() -> void:
 	check(pixels(view.wire_viewport.get_texture().get_image()) >= layout_pixels * 0.9, "Switching back to layout must restore all geometry")
 	view.size = Vector2(600, 400)
 	await settle()
-	check(view.wire_viewport.size == Vector2i(600, 400), "Resizing must update the GPU viewport")
+	check(view.wire_viewport.size == Vector2i(Vector2(600, 400) * root.get_stretch_transform().get_scale()), "Resizing must update the GPU viewport")
 	view.set_scene({"meshes": [], "lights": []})
 	await settle()
 	check(pixels(view.wire_viewport.get_texture().get_image()) == 0, "Replacing the scene must clear stale geometry")

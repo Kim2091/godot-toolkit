@@ -146,7 +146,10 @@ private:
       Ref<RDTextureFormat> format; format.instantiate();
       format->set_format(RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
       format->set_width(descriptor.width); format->set_height(descriptor.height);
-      format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT);
+      // Viewport presentation stays on the GPU; explicit project saves may read
+      // the finished frame once to generate a recent-project thumbnail.
+      format->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_TO_BIT |
+        RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
       Ref<RDTextureView> view; view.instantiate();
       target_ = rd->texture_create(format, view);
       if (!target_.is_valid()) throw std::runtime_error("Could not create viewport texture");

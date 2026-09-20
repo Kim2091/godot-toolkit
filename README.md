@@ -25,11 +25,17 @@ To launch the already built app directly:
 
 ## Workflow
 
-1. Choose **New from capture**, select a Remix capture, and create the project in a new directory. Or choose **Open** for an existing Toolkit workfile.
-2. Start Remix with **Start / restart Remix**. Initial shader compilation can take tens of seconds. The camera defaults to **Drone**: press **Z** over the viewport to capture the mouse, look around with the mouse, and fly with **WASD**. **Q/E** moves down/up, **Shift** moves faster, and the wheel adjusts flight speed. Press **Z** or **Escape** to release the cursor. While released, middle/right drag looks around and the wheel zooms. Choose **Orbit** for orbit controls; **F** frames the selection in either mode. Controls work in both Layout and Remix views.
+1. The welcome screen offers your recent projects with previews from their last successful Save. Choose **New from capture**, select a Remix capture, and create the project in a new directory. Or choose **Open** for an existing Toolkit workfile.
+2. Remix starts automatically when you open or create a project with the **Remix** toggle enabled. Turning it off pauses rendering and shows the Layout view; turning it on starts or resumes Remix. Toggle it off and on to retry after a renderer failure. Initial shader compilation can take tens of seconds. The camera defaults to **Drone**: press **Z** over the viewport to capture the mouse, look around with the mouse, and fly with **WASD**. **Q/E** moves down/up, **Shift** moves faster, and the wheel adjusts flight speed. Press **Z** or **Escape** to release the cursor. While released, middle/right drag looks around and the wheel zooms. Choose **Orbit** for orbit controls; **F** frames the selection in either mode. Controls work in both Layout and Remix views.
 3. Ingest an asset, select it in the asset library, then select a captured mesh and choose **Add mesh**, **Replace mesh**, or **Replace material**. Lights also attach to the selected captured asset.
 4. Select a scene object to use its grouped authoring controls: transforms and bound materials for meshes; radiance, color, temperature, shape, and cone controls for lights; texture channels and surface settings for materials. Commit numeric edits with Enter, focus loss, or release of a drag; use ↺ to reset an active-layer property override. Shift-drag translates the selection; **Snap** snaps movement to whole scene units. Edits to a captured asset's replacement affect every captured instance of that hash.
 5. Save the project, or choose **Package mod** to create a new, self-contained replacement mod directory containing `mod.usda` and its dependencies.
+
+The editor remembers each project's camera on Save, when switching projects, and on a confirmed close—even when unsaved scene edits are discarded. It restores the camera position, orientation, Drone/Orbit mode, orbit pivot, and flight speed when you reopen the project, with the mouse unlocked. Missing or invalid view data falls back to Frame all.
+
+Camera metadata and previews live beside the workfile as `<project>.studio.json` and `<project>.studio.png`. Copy these with the project to keep its view. Only a successful Save updates the preview; closing preserves the last-save image. Previews use the current Remix frame when available, or a separate Layout view without starting Remix. The sidecars are excluded from mod packages. Recent-project history is local to the application user directory and retains up to 20 projects; **Remove** only forgets an entry. **Recent projects** returns to the welcome screen, and `--project=/path/to/project.usda` opens directly into a project.
+
+The compact interface uses system DPI scaling. Resizing the window changes workspace space without enlarging text and controls; display-scale changes update automatically. Toolbars wrap when needed, and dock splits remain resizable.
 
 The capture stays unchanged. Undo/redo operates on the authoring layer, including rollback of failed compound edits. Packaging includes unsaved authored changes, preserves nested replacement layers, excludes the capture sublayer, and refuses to overwrite an existing destination.
 
@@ -88,6 +94,8 @@ Authoring tests cover supported fields, missing shader inputs, active-layer rese
 Camera tests cover drone movement and mouse look in Y-up and Z-up scenes, diagonal speed, speed adjustment, cursor release, focus loss, text-entry shortcuts, and switching back to Orbit.
 
 Texture tests cover referenced layers, Windows-style paths, authoring-layer overrides, missing and cleared assets, material sampling settings, and a four-color DDS texture verifying both UV axes across nine tiles (including negative UVs and UVs above one) in the Remix viewport.
+
+Project-session tests cover camera round trips, saved-view sidecars, close/cancel and failed-save behavior, command-line startup, recent history, and write failures. GPU tests check Layout and Remix save previews and compact layout at 100%, 150%, and 200% scale, including resize behavior, dialogs, and picking. Session screenshots are retained under `.work/session_ui`. Test runs use isolated recent-project settings.
 
 The pinned upstream Remix test suite has independent failures: two referenced Python test files are absent, and its SDL `offscreen` smoke test cannot find a present-capable queue on the tested driver. Its desktop smoke test runs successfully. Our GPU test exercises the patched runtime through the application.
 

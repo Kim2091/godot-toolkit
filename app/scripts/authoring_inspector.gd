@@ -57,7 +57,7 @@ func show_selection(details: Dictionary) -> void:
 		fields.map(func(field: Dictionary): return [field.path, field.property, field.type])])
 	if schema_key != key:
 		_finish_editing(); _clear(); schema_key = key
-		_label(String(details.path).get_file(), self).add_theme_font_size_override("font_size", 18)
+		_label(String(details.path).get_file(), self).add_theme_font_size_override("font_size", 16)
 		var identity := _label(authoring.get("type", "Object"), self)
 		identity.tooltip_text = details.path
 		for reference in authoring.get("references", []):
@@ -120,7 +120,7 @@ func _vector(path: String, property: String, value: Array, parent: Node) -> void
 	for i in range(3):
 		var spin := SpinBox.new(); spin.allow_greater = true; spin.allow_lesser = true
 		spin.step = 0.01; spin.value = value[i]; spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		spin.custom_minimum_size.x = 70; spin.tooltip_text = ["X", "Y", "Z"][i]
+		spin.custom_minimum_size.x = 60; spin.tooltip_text = ["X", "Y", "Z"][i]
 		row.add_child(spin); spins.append(spin)
 		_wire_spin(spin, id)
 	controls[id] = {"fields": spins, "request": {"op": "transform", "path": path}, "property": property}
@@ -189,7 +189,7 @@ func _field(field: Dictionary, parent: Node) -> void:
 				choose.add_item(label)
 			choose.item_selected.connect(func(index: int): commit.call(field.choices[index])); widget = choose
 		"color":
-			var color := ColorPickerButton.new(); color.edit_alpha = false; color.custom_minimum_size.y = 28
+			var color := ColorPickerButton.new(); color.edit_alpha = false; color.custom_minimum_size.y = 22
 			color.popup_closed.connect(func(): commit.call([color.color.r, color.color.g, color.color.b])); widget = color
 		"texture":
 			var row := HBoxContainer.new(); parent.add_child(row)
@@ -252,10 +252,10 @@ func _choose_texture(commit: Callable) -> void:
 
 func show_asset(id: String, details: Dictionary) -> void:
 	_finish_editing(); _clear(); schema_key = "library:" + id
-	_label(details.name, self).add_theme_font_size_override("font_size", 18)
+	_label(details.name, self).add_theme_font_size_override("font_size", 16)
 	_label(String(details.get("kind", "Asset")).capitalize() + " · Library asset", self)
 	library_image = TextureRect.new(); library_image.texture = details.get("texture")
-	library_image.custom_minimum_size = Vector2(220, 220)
+	library_image.custom_minimum_size = Vector2(160, 160)
 	library_image.expand_mode = TextureRect.EXPAND_IGNORE_SIZE; library_image.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	add_child(library_image)
 	_label(details.get("folder_path", "Assets"), self)

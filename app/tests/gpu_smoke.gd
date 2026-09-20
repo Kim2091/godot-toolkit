@@ -14,10 +14,25 @@ func _initialize() -> void:
 func _run() -> void:
 	app = load("res://main.tscn").instantiate()
 	root.add_child(app)
+	if not app.renderer.process.is_empty():
+		push_error("Welcome screen started a renderer without a project")
+		quit(1)
+		return
 	if "--lighting-only" in OS.get_cmdline_user_args() or "--diagnostics" in OS.get_cmdline_user_args():
 		restarting = true
 	test_directory = app.root_directory.path_join(".work/integration/" + str(Time.get_ticks_usec()))
 	app._command({"op": "create", "capture": app.root_directory.path_join("tests/fixtures/capture.usda"), "path": test_directory.path_join("project.usda")})
+	if app.renderer.process.is_empty() or not app.renderer.is_starting:
+		push_error("Loading a project did not automatically start Remix")
+		quit(1)
+		return
+	var worker_pid: int = app.renderer.process.pid
+	app.render_toggle.button_pressed = false
+	app.render_toggle.button_pressed = true
+	if app.renderer.process.pid != worker_pid:
+		push_error("Toggling Remix during startup launched a duplicate worker")
+		quit(1)
+		return
 	app._command({"op": "add_light", "path": "/RootNode/instances/inst_0123456789ABCDEF_0", "type": "SphereLight", "intensity": 50})
 	app._command({"op": "transform", "path": app.selection, "translation": [0, 3, 0], "rotation": [-90, 0, 0]})
 	app._command({"op": "set_light_type", "path": app.selection, "type": "SpotLight"})
@@ -36,7 +51,6 @@ func _run() -> void:
 				surface.material = "smoke_emission"
 	app.renderer.response_received.connect(_response)
 	app.renderer.status_changed.connect(func(message: String): print(message))
-	app._start_renderer()
 	deadline = Time.get_ticks_msec() + 180000
 
 func _response(response: Dictionary) -> void:
@@ -72,7 +86,7 @@ func _capture() -> void:
 			quit(0)
 		return
 	var area: Rect2 = app.viewport._view_rect()
-	area.position += app.viewport.global_position
+	area = root.get_final_transform() * app.viewport.get_global_transform_with_canvas() * area
 	var lit_pixels := 0
 	for y in range(int(area.position.y), int(area.end.y), 2):
 		for x in range(int(area.position.x), int(area.end.x), 2):
@@ -85,6 +99,24 @@ func _capture() -> void:
 		quit(1)
 		return
 	if not restarting:
+		var worker_pid: int = app.renderer.process.pid
+		app.render_toggle.button_pressed = false
+		if app.renderer.is_processing() or app.viewport.show_render:
+			push_error("Disabling Remix did not pause rendering")
+			quit(1)
+			return
+		app._open_project(app.state.path)
+		if app.renderer.is_processing() or app.renderer.process.pid != worker_pid:
+			push_error("Opening with Remix disabled resumed or restarted the worker")
+			quit(1)
+			return
+		app.render_toggle.button_pressed = true
+		app._open_project(app.state.path)
+		if not app.renderer.is_processing() or app.renderer.process.pid != worker_pid:
+			push_error("Enabling Remix or opening a project failed to reuse the worker")
+			quit(1)
+			return
+		app._command({"op": "add_light", "path": "/RootNode/instances/inst_0123456789ABCDEF_0", "type": "SphereLight"})
 		# A killed worker must not lose the document or leave an unsignaled GPU wait.
 		app.renderer.stop_worker()
 		if not app.state.get("dirty", false):
@@ -97,7 +129,8 @@ func _capture() -> void:
 		for mesh in app.last_scene.meshes:
 			for surface in mesh.surfaces:
 				surface.material = "default"
-		app._start_renderer()
+		app.render_toggle.button_pressed = false
+		app.render_toggle.button_pressed = true
 	else:
 		print("GPU viewport passed" + ("" if "--lighting-only" in OS.get_cmdline_user_args() else " with worker restart") + ": " + test_directory)
 		app.renderer.stop_worker()

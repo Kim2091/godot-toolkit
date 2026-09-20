@@ -51,8 +51,8 @@ var folder_target := true
 var placeholder: Texture2D
 
 func _ready() -> void:
-	custom_minimum_size.y = 205
-	var bar := HBoxContainer.new()
+	custom_minimum_size.y = 170
+	var bar := HFlowContainer.new()
 	add_child(bar)
 	var title := Label.new(); title.text = "ASSET LIBRARY"; bar.add_child(title)
 	_button("New folder", func(): _name_dialog("New folder", "", func(value: String): catalog.create_folder(value, current_folder)), bar)
@@ -63,7 +63,7 @@ func _ready() -> void:
 		for id in selected_ids():
 			errors.erase(id); previews.request(id, true), bar)
 	_button("Refresh", refresh, bar)
-	search = LineEdit.new(); search.placeholder_text = "Search all assets…"; search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	search = LineEdit.new(); search.custom_minimum_size.x = 160; search.placeholder_text = "Search all assets…"; search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	search.text_changed.connect(func(_text: String): _schedule_refresh())
 	bar.add_child(search)
 	filter = OptionButton.new()
@@ -72,14 +72,14 @@ func _ready() -> void:
 	filter.item_selected.connect(func(_index: int): _schedule_refresh())
 	bar.add_child(filter)
 	var split := HSplitContainer.new(); split.size_flags_vertical = Control.SIZE_EXPAND_FILL; add_child(split)
-	folders = FolderTree.new(); folders.browser = self; folders.custom_minimum_size.x = 180
+	folders = FolderTree.new(); folders.browser = self; folders.custom_minimum_size.x = 160
 	folders.item_selected.connect(_folder_selected)
 	split.add_child(folders)
 	var contents := VBoxContainer.new(); contents.size_flags_horizontal = Control.SIZE_EXPAND_FILL; split.add_child(contents)
 	breadcrumbs = HBoxContainer.new(); contents.add_child(breadcrumbs)
 	cards = AssetList.new(); cards.browser = self; cards.select_mode = ItemList.SELECT_MULTI
-	cards.icon_mode = ItemList.ICON_MODE_TOP; cards.fixed_icon_size = Vector2i(96, 96)
-	cards.fixed_column_width = 145; cards.max_columns = 0; cards.max_text_lines = 2
+	cards.icon_mode = ItemList.ICON_MODE_TOP; cards.fixed_icon_size = Vector2i(72, 72)
+	cards.fixed_column_width = 112; cards.max_columns = 0; cards.max_text_lines = 2
 	cards.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	cards.multi_selected.connect(_asset_selected)
 	cards.item_activated.connect(func(index: int):

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 import venv
 
@@ -176,6 +177,8 @@ def main():
     if platform.machine().lower() not in ["x86_64", "amd64"]:
         parser.error("The Remix editor currently requires x86_64")
     tools()
+    if args.target in ["all", "test", "gpu-test"]:
+        ENV["REMIX_STUDIO_SETTINGS_DIR"] = tempfile.mkdtemp(prefix="studio-test-settings-", dir=WORK)
     if args.target in ["all", "deps"]: dependencies(args.jobs)
     if args.target in ["all", "godot"]: godot(args.jobs)
     if args.target in ["all", "remix"]: remix(args.jobs)
@@ -186,7 +189,9 @@ def main():
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/layout_geometry_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/camera_controls_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/asset_catalog_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/project_sessions_test.gd"])
     if args.target == "gpu-test":
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/project_session_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/authoring_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/layout_view_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/gpu_smoke.gd"])

@@ -57,6 +57,7 @@ func run() -> void:
 	root.size = Vector2i(1600, 1000)
 	app = load("res://main.tscn").instantiate()
 	root.add_child(app)
+	app.render_toggle.button_pressed = false
 	directory = app.root_directory.path_join(".work/authoring/" + str(Time.get_ticks_usec()))
 	var capture: String = app.root_directory.path_join("tests/fixtures/capture.usda")
 	var original := FileAccess.get_file_as_string(capture)

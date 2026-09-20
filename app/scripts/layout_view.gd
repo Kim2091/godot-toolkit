@@ -218,11 +218,12 @@ func _sync_view() -> void:
 		return
 	var rectangle := _view_rect()
 	var rendering := rendered_texture != null and show_render
-	var state := [rectangle, center, distance, yaw, pitch, world_up, rendering]
+	var pixel_scale := get_viewport().get_stretch_transform().get_scale()
+	var state := [rectangle, center, distance, yaw, pitch, world_up, rendering, pixel_scale]
 	if state == _view_state:
 		return
 	_view_state = state
-	wire_viewport.size = Vector2i(maxi(1, int(rectangle.size.x)), maxi(1, int(rectangle.size.y)))
+	wire_viewport.size = Vector2i(maxi(1, int(rectangle.size.x * pixel_scale.x)), maxi(1, int(rectangle.size.y * pixel_scale.y)))
 	var basis := _basis()
 	wire_camera.transform = Transform3D(basis, center + basis.z * distance)
 	wire_camera.near = maxf(distance * 0.00001, 0.0001)
@@ -249,6 +250,62 @@ func camera() -> Dictionary:
 	var basis := _basis()
 	var position := center + basis.z * distance
 	return {"position": _array(position), "forward": _array(-basis.z), "up": _array(basis.y), "right": _array(basis.x), "fov": 60.0}
+
+func view_state() -> Dictionary:
+	return {"center": _array(center), "distance": distance, "yaw": yaw, "pitch": pitch,
+		"mode": "drone" if camera_mode == CameraMode.DRONE else "orbit", "move_speed": move_speed,
+		"up_axis": "Z" if world_up.z == 1 else "Y"}
+
+func restore_view_state(data: Variant, notify := true) -> bool:
+	if not data is Dictionary or not data.get("center") is Array or data.center.size() != 3:
+		return false
+	for value in data.center:
+		if not (value is float or value is int) or not is_finite(value):
+			return false
+	for key in ["distance", "yaw", "pitch", "move_speed"]:
+		var value = data.get(key)
+		if not (value is float or value is int) or not is_finite(value):
+			return false
+	if data.distance <= 0 or data.move_speed <= 0 or absf(data.pitch) > 1.5 or data.get("mode") not in ["drone", "orbit"]:
+		return false
+	if data.get("up_axis") != ("Z" if world_up.z == 1 else "Y"):
+		return false
+	center = Vector3(data.center[0], data.center[1], data.center[2])
+	distance = data.distance; yaw = data.yaw; pitch = data.pitch; move_speed = data.move_speed
+	camera_mode = CameraMode.DRONE if data.mode == "drone" else CameraMode.ORBIT
+	_flight_keys.clear(); set_mouse_capture(false, false)
+	_sync_view()
+	if notify:
+		_camera_updated()
+	else:
+		queue_redraw()
+	return true
+
+func reset_view() -> void:
+	center = Vector3.ZERO; distance = 8; yaw = 0.6; pitch = 0.3; move_speed = 2
+	camera_mode = CameraMode.DRONE
+	frame_selection(true)
+
+func create_thumbnail_view() -> SubViewport:
+	# Share immutable GPU geometry, but freeze transforms and the camera at Save.
+	# A dedicated view also works while the editor is hidden by the welcome screen.
+	var result := SubViewport.new()
+	var extent := _view_rect().size
+	var ratio := minf(384.0 / maxf(extent.x, 1), 216.0 / maxf(extent.y, 1))
+	result.size = Vector2i(maxi(1, int(extent.x * ratio)), maxi(1, int(extent.y * ratio)))
+	result.own_world_3d = true
+	result.msaa_3d = Viewport.MSAA_2X
+	result.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	var view_camera := Camera3D.new(); result.add_child(view_camera)
+	var basis := _basis()
+	view_camera.transform = Transform3D(basis, center + basis.z * distance)
+	view_camera.fov = 60; view_camera.near = maxf(distance * 0.00001, 0.0001); view_camera.far = maxf(distance * 100, 1000)
+	for entry in geometry.entries:
+		var instance := MeshInstance3D.new()
+		instance.mesh = entry.geometry.mesh; instance.transform = entry.transform
+		instance.material_override = wire_material
+		result.add_child(instance)
+	return result
 
 func _array(v: Vector3) -> Array:
 	return [v.x, v.y, v.z]
