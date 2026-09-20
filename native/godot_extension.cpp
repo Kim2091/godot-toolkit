@@ -70,7 +70,7 @@ void convert_texture(const fs::path& source, const fs::path& target, const std::
 class RemixDocument : public godot::RefCounted {
   GDCLASS(RemixDocument, godot::RefCounted)
 public:
-  ~RemixDocument() { cancel_ingestion(); if (job_.valid()) job_.wait(); }
+  ~RemixDocument() { cancel_ingestion(); cancel_asset_preview(); if (job_.valid()) job_.wait(); if (preview_job_.valid()) preview_job_.wait(); }
   godot::String execute(const godot::String& json) {
     try {
       auto result = document_.dispatch(Json::parse(json.utf8().get_data()));
@@ -99,17 +99,52 @@ public:
     return job_.get().dump().c_str();
   }
   void cancel_ingestion() { if (canceled_) canceled_->store(true); }
+  godot::String start_asset_preview(const godot::String& path) {
+    try {
+      if (preview_job_.valid()) throw std::runtime_error("A preview job is already running");
+      preview_canceled_ = std::make_shared<std::atomic_bool>(false);
+      const std::string file(path.utf8().get_data());
+      preview_job_ = std::async(std::launch::async, [file, canceled = preview_canceled_] {
+        try {
+          if (canceled->load()) return Json{{"ok", false}, {"error", "Preview canceled"}};
+          auto result = preview_asset(file);
+          if (canceled->load()) return Json{{"ok", false}, {"error", "Preview canceled"}};
+          return Json{{"ok", true}, {"result", result}};
+        } catch (const std::exception& error) { return Json{{"ok", false}, {"error", error.what()}}; }
+      });
+      return "{\"ok\":true}";
+    } catch (const std::exception& error) { return Json{{"ok", false}, {"error", error.what()}}.dump().c_str(); }
+  }
+  godot::String poll_asset_preview() {
+    if (!preview_job_.valid() || preview_job_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return "";
+    return preview_job_.get().dump().c_str();
+  }
+  void cancel_asset_preview() { if (preview_canceled_) preview_canceled_->store(true); }
+  godot::String asset_file_stamp(const godot::String& path) {
+    try {
+      const fs::path file(path.utf8().get_data());
+      if (!fs::is_regular_file(file)) return "";
+      return (std::to_string(fs::file_size(file)) + ":" +
+        std::to_string(fs::last_write_time(file).time_since_epoch().count())).c_str();
+    } catch (const fs::filesystem_error&) { return ""; }
+  }
 protected:
   static void _bind_methods() {
     godot::ClassDB::bind_method(godot::D_METHOD("execute", "request"), &RemixDocument::execute);
     godot::ClassDB::bind_method(godot::D_METHOD("start_ingestion", "request"), &RemixDocument::start_ingestion);
     godot::ClassDB::bind_method(godot::D_METHOD("poll_ingestion"), &RemixDocument::poll_ingestion);
     godot::ClassDB::bind_method(godot::D_METHOD("cancel_ingestion"), &RemixDocument::cancel_ingestion);
+    godot::ClassDB::bind_method(godot::D_METHOD("start_asset_preview", "path"), &RemixDocument::start_asset_preview);
+    godot::ClassDB::bind_method(godot::D_METHOD("poll_asset_preview"), &RemixDocument::poll_asset_preview);
+    godot::ClassDB::bind_method(godot::D_METHOD("cancel_asset_preview"), &RemixDocument::cancel_asset_preview);
+    godot::ClassDB::bind_method(godot::D_METHOD("asset_file_stamp", "path"), &RemixDocument::asset_file_stamp);
   }
 private:
   Document document_;
   std::future<Json> job_;
   std::shared_ptr<std::atomic_bool> canceled_;
+  std::future<Json> preview_job_;
+  std::shared_ptr<std::atomic_bool> preview_canceled_;
 };
 
 void initialize(godot::ModuleInitializationLevel level) {

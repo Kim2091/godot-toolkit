@@ -64,6 +64,7 @@ std::string unique_child(const UsdStageRefPtr& stage, const std::string& parent,
 Json value_json(const VtValue& v) {
   if (v.IsHolding<bool>()) return v.Get<bool>();
   if (v.IsHolding<int>()) return v.Get<int>();
+  if (v.IsHolding<unsigned int>()) return v.Get<unsigned int>();
   if (v.IsHolding<float>()) return v.Get<float>();
   if (v.IsHolding<double>()) return v.Get<double>();
   if (v.IsHolding<std::string>()) return v.Get<std::string>();
@@ -78,6 +79,7 @@ void set_value(const UsdAttribute& attr, const Json& value) {
   bool ok = false;
   if (type == SdfValueTypeNames->Bool) ok = attr.Set(value.get<bool>());
   else if (type == SdfValueTypeNames->Int) ok = attr.Set(value.get<int>());
+  else if (type == SdfValueTypeNames->UInt) ok = attr.Set(value.get<unsigned int>());
   else if (type == SdfValueTypeNames->Float) ok = attr.Set(value.get<float>());
   else if (type == SdfValueTypeNames->Double) ok = attr.Set(value.get<double>());
   else if (type == SdfValueTypeNames->String) ok = attr.Set(value.get<std::string>());
@@ -223,6 +225,29 @@ Json Document::inspect(const std::string& path) const {
     result["rotation"] = {rotation[0], rotation[1], rotation[2]};
   }
   try { result["anchor"] = anchor_for(path); } catch (const std::runtime_error&) { result["anchor"] = nullptr; }
+  result["authoring"] = describe_authoring(prim, edit_layer_);
+  result["authoring"]["references"] = Json::array();
+  for (auto owner = prim; owner && !owner.IsPseudoRoot(); owner = owner.GetParent()) {
+    for (auto spec : owner.GetPrimStack()) for (const auto& reference : spec->GetReferenceList().GetAppliedItems()) {
+      if (!reference.GetAssetPath().empty())
+        result["authoring"]["references"].push_back(reference.GetAssetPath());
+    }
+    if (!result["authoring"]["references"].empty()) break;
+  }
+  try {
+    const auto target = authored_path(path);
+    result["authoring"]["edit_path"] = target;
+    result["authoring"]["editable"] = true;
+  } catch (const std::runtime_error&) {
+    result["authoring"]["editable"] = false;
+  }
+  for (auto& field : result["authoring"]["fields"]) {
+    try {
+      auto owner = SdfPath(authored_path(field["path"].get<std::string>()));
+      auto spec = edit_layer_->GetAttributeAtPath(owner.AppendProperty(TfToken(field["property"].get<std::string>())));
+      field["overridden"] = bool(spec && spec->HasDefaultValue());
+    } catch (const std::runtime_error&) { field["overridden"] = false; }
+  }
   return result;
 }
 
@@ -400,6 +425,7 @@ void Document::replace_material(const Json& request) {
   auto selected = stage_->GetPrimAtPath(path);
   if (!selected) throw std::runtime_error("Select a material or mesh");
   auto material = UsdShadeMaterial(selected);
+  if (!material && selected.IsA<UsdShadeShader>()) material = UsdShadeMaterial(selected.GetParent());
   if (!material) material = UsdShadeMaterialBindingAPI(selected).ComputeBoundMaterial();
   if (!material) throw std::runtime_error("Selection has no bound material");
   auto asset = fs::absolute(required(request, "asset"));
@@ -524,6 +550,9 @@ Json Document::ingest(const Json& request) { require_stage(); return ingest_asse
 void Document::mutate(const Json& request, Json& result) {
   const auto op = required(request, "op");
   if (op == "set_property") set_property(request);
+  else if (op == "set_authoring_property") set_authoring_property(request);
+  else if (op == "reset_authoring_property") set_authoring_property(request, true);
+  else if (op == "set_light_type") set_light_type(request);
   else if (op == "transform") set_transform(request);
   else if (op == "add_mesh" || op == "replace_mesh") {
     auto data = request; data["replace"] = op == "replace_mesh";

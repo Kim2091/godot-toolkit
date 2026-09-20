@@ -2,11 +2,13 @@ extends Control
 
 const LayoutView = preload("res://scripts/layout_view.gd")
 const RendererClient = preload("res://scripts/renderer_client.gd")
+const AssetBrowser = preload("res://scripts/asset_browser.gd")
+const AuthoringInspector = preload("res://scripts/authoring_inspector.gd")
 var document: Object
 var state: Dictionary = {}
 var selection := ""
 var tree: Tree
-var assets: ItemList
+var assets: Control
 var inspector: VBoxContainer
 var layer_picker: OptionButton
 var status: Label
@@ -20,6 +22,9 @@ var import_running := false
 var last_scene: Dictionary = {}
 var runtime_path := ""
 var root_directory := ""
+var library_selection := ""
+var import_folder := ""
+var import_project := ""
 
 func _ready() -> void:
 	root_directory = ProjectSettings.globalize_path("res://").get_base_dir().get_base_dir()
@@ -121,9 +126,13 @@ func _build_ui() -> void:
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	toolbar.add_child(spacer)
 	_button("Start / restart Remix", _start_renderer, toolbar)
+	var authoring_area := VSplitContainer.new()
+	authoring_area.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	authoring_area.split_offset = 110
+	column.add_child(authoring_area)
 	var workspace := HSplitContainer.new()
 	workspace.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	column.add_child(workspace)
+	authoring_area.add_child(workspace)
 	var left := VBoxContainer.new()
 	left.custom_minimum_size.x = 240
 	workspace.add_child(left)
@@ -139,11 +148,6 @@ func _build_ui() -> void:
 	layer_picker.item_selected.connect(func(index: int):
 		if not refreshing:
 			_command({"op": "select_layer", "layer": layer_picker.get_item_metadata(index)}))
-	_label("ASSET LIBRARY", left)
-	assets = ItemList.new()
-	assets.custom_minimum_size.y = 180
-	left.add_child(assets)
-	assets.item_activated.connect(func(_index: int): _use_asset("add_mesh"))
 	var center_right := HSplitContainer.new()
 	center_right.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	workspace.add_child(center_right)
@@ -183,16 +187,31 @@ func _build_ui() -> void:
 	center_panel.add_child(viewport)
 	_label("Shift + drag moves the selection. Changes to captured assets affect every instance.", center_panel, 12)
 	var right := VBoxContainer.new()
-	right.custom_minimum_size.x = 270
+	right.custom_minimum_size.x = 300
 	center_right.add_child(right)
 	_label("PROPERTIES", right)
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	right.add_child(scroll)
-	inspector = VBoxContainer.new()
+	inspector = AuthoringInspector.new()
+	inspector.request = _request
+	inspector.command_requested.connect(func(command: Dictionary): _command.call_deferred(command))
 	inspector.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(inspector)
+	assets = AssetBrowser.new()
+	authoring_area.add_child(assets)
+	assets.message.connect(_log)
+	assets.asset_selected.connect(func(id: String, details: Dictionary):
+		library_selection = id
+		inspector.show_asset(id, details))
+	assets.asset_details_changed.connect(func(id: String, details: Dictionary):
+		if library_selection == id:
+			inspector.show_asset(id, details))
+	assets.thumbnail_changed.connect(func(id: String, texture: Texture2D):
+		if library_selection == id and inspector.library_image != null:
+			inspector.library_image.texture = texture)
+	assets.asset_activated.connect(func(kind: String): _use_asset("replace_material" if kind == "material" else "add_mesh"))
 	output = RichTextLabel.new()
 	output.custom_minimum_size.y = 85
 	output.scroll_following = true
@@ -217,10 +236,14 @@ func _command(data: Dictionary) -> void:
 	var previous_revision: int = state.get("revision", -1)
 	var result := _request(data)
 	if result.is_empty():
+		if data.op in ["set_authoring_property", "reset_authoring_property", "set_light_type", "transform"] and library_selection.is_empty():
+			_select(selection)
 		return
 	if result.has("selection"):
 		selection = result.selection
 	if result.has("document"):
+		if data.op in ["open", "create"]:
+			inspector._clear(); inspector.schema_key = ""
 		state = result.document
 		_refresh(state.get("revision", -1) != previous_revision)
 	if data.op == "save":
@@ -255,7 +278,8 @@ func _refresh(scene_changed := true) -> void:
 			layer_picker.select(i)
 	refreshing = false
 	_refresh_assets()
-	_select(selection)
+	if library_selection.is_empty():
+		_select(selection)
 	if scene_changed and state.get("open", false):
 		var first := last_scene.is_empty()
 		last_scene = _request({"op": "scene"})
@@ -274,70 +298,11 @@ func _tree_selected() -> void:
 
 func _select(path: String) -> void:
 	selection = path
+	library_selection = ""
 	viewport.selected_path = path
 	viewport.queue_redraw()
-	for child in inspector.get_children():
-		inspector.remove_child(child)
-		child.queue_free()
-	if path.is_empty():
-		_label("Select an object to edit.", inspector)
-		return
-	var details := _request({"op": "inspect", "path": path})
-	if details.is_empty():
-		return
-	var path_label := _label(path, inspector, 12)
-	path_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	if details.get("anchor") != null:
-		var anchor := _label("Replacement: " + String(details.anchor).get_file(), inspector, 12)
-		anchor.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	if details.has("translation"):
-		_vector_editor("Translation", details.translation, func(value: Array): _command({"op": "transform", "path": path, "translation": value}))
-		_vector_editor("Rotation (degrees)", details.rotation, func(value: Array): _command({"op": "transform", "path": path, "rotation": value}))
-		_vector_editor("Scale", details.scale, func(value: Array): _command({"op": "transform", "path": path, "scale": value}))
-	for property in details.get("properties", []):
-		if String(property.name).begins_with("xformOp") or String(property.name).begins_with("collection:"):
-			continue
-		_label(property.name, inspector, 12)
-		var value = property.value
-		var commit := func(next): _command({"op": "set_property", "path": path, "property": property.name, "value": next})
-		if value is bool:
-			var field := CheckButton.new()
-			field.button_pressed = value
-			field.toggled.connect(commit)
-			inspector.add_child(field)
-		elif value is float or value is int:
-			var row := HBoxContainer.new()
-			inspector.add_child(row)
-			var field := SpinBox.new()
-			field.allow_greater = true; field.allow_lesser = true
-			field.step = 1.0 if property.type == "int" else 0.01
-			field.value = value
-			field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			field.get_line_edit().text_submitted.connect(func(_text: String): commit.call(field.value))
-			row.add_child(field)
-			_button("Apply", func(): commit.call(field.value), row)
-		elif value is Array and value.size() == 3:
-			_vector_editor("", value, commit)
-		else:
-			var field := LineEdit.new()
-			field.text = str(value)
-			field.text_submitted.connect(commit)
-			inspector.add_child(field)
-
-func _vector_editor(label: String, values: Array, commit: Callable) -> void:
-	if not label.is_empty():
-		_label(label, inspector, 12)
-	var row := HBoxContainer.new()
-	inspector.add_child(row)
-	var fields: Array[SpinBox] = []
-	for value in values:
-		var field := SpinBox.new()
-		field.allow_greater = true; field.allow_lesser = true
-		field.step = 0.1; field.value = value
-		field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		field.custom_minimum_size.x = 65
-		fields.append(field); row.add_child(field)
-	_button("Apply", func(): commit.call([fields[0].value, fields[1].value, fields[2].value]), inspector)
+	inspector.project_directory = String(state.get("path", "")).get_base_dir()
+	inspector.show_selection(_request({"op": "inspect", "path": path}) if not path.is_empty() else {})
 
 func _translate(delta: Vector3) -> void:
 	_command({"op": "transform", "path": selection, "world_delta": [delta.x, delta.y, delta.z]})
@@ -373,6 +338,7 @@ func _choose_open() -> void:
 	_guard_unsaved(func(): _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Open Toolkit project", ["*.usd,*.usda,*.usdc ; USD projects"], _open_project))
 
 func _open_project(path: String) -> void:
+	library_selection = ""
 	last_scene = {}
 	selection = ""
 	_command({"op": "open", "path": path})
@@ -381,6 +347,7 @@ func _new_capture() -> void:
 	_guard_unsaved(func(): _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select Remix capture", ["*.usd,*.usda,*.usdc ; Remix captures"], func(path: String):
 		pending_capture = path
 		_dialog(FileDialog.FILE_MODE_SAVE_FILE, "Create project in a new directory", ["*.usda ; USD project"], func(project: String):
+			library_selection = ""
 			last_scene = {}; selection = ""
 			_command({"op": "create", "capture": pending_capture, "path": project}))))
 
@@ -435,6 +402,8 @@ func _import_options(path: String) -> void:
 			request["properties"] = {"kind": "translucent" if material_kind.selected == 2 else "opaque", "alpha_test": 6 if material_kind.selected == 1 else 7}
 		var response = JSON.parse_string(document.start_ingestion(JSON.stringify(request)))
 		if response.get("ok", false):
+			import_folder = assets.current_folder
+			import_project = String(state.path).get_base_dir()
 			import_running = true
 			_log("Ingesting " + path.get_file() + "…")
 		else:
@@ -451,25 +420,33 @@ func _import_options(path: String) -> void:
 	dialog.popup_centered(Vector2i(420, 340))
 
 func _refresh_assets() -> void:
-	assets.clear()
 	if not state.get("open", false):
 		return
-	var directory := String(state.path).get_base_dir().path_join("assets")
-	if not DirAccess.dir_exists_absolute(directory):
-		return
-	for name in DirAccess.get_directories_at(directory):
-		var path := directory.path_join(name).path_join("asset.usda")
-		if name.begins_with(".") or not FileAccess.file_exists(path):
-			continue
-		assets.add_item(name)
-		assets.set_item_metadata(assets.item_count - 1, path)
+	var directory := String(state.path).get_base_dir()
+	if assets.project_directory != directory:
+		assets.open_project(directory)
 
 func _use_asset(op: String) -> void:
-	var chosen := assets.get_selected_items()
-	if chosen.is_empty() or selection.is_empty():
-		_log("Select a captured object and an ingested asset first.")
+	var ids: Array = assets.selected_ids()
+	if ids.is_empty() or selection.is_empty():
+		_log("Select a scene object and an asset first.")
 		return
-	_command({"op": op, "path": selection, "asset": assets.get_item_metadata(chosen[0])})
+	var id: String = ids[0]
+	var kind: String = assets.catalog.entries[id].get("kind", "unknown")
+	if kind == "unknown":
+		_log("Wait for the asset preview to finish identifying this asset.")
+		return
+	if (op == "replace_material") != (kind == "material"):
+		_log("Choose a material for Replace material, or a mesh for Add / Replace mesh.")
+		return
+	if not assets.catalog.available(id):
+		_log("This asset's files are missing.")
+		return
+	var target := selection
+	if op == "replace_material" and not inspector.selected_material.is_empty():
+		target = inspector.selected_material
+	library_selection = ""
+	_command({"op": op, "path": target, "asset": assets.catalog.absolute_path(id)})
 
 func _start_renderer() -> void:
 	if not state.get("open", false):
@@ -507,7 +484,8 @@ func _process(_delta: float) -> void:
 				_log("Asset ingested: " + result.result.asset)
 				for warning in result.result.get("warnings", []):
 					_log(warning)
-				_refresh_assets()
+				if assets.project_directory == import_project:
+					assets.register_ingestion(result.result.asset, import_folder)
 			else:
 				_log(result.get("error", "Ingestion failed"))
 

@@ -17,6 +17,7 @@
 #include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdLux/lightAPI.h>
+#include <pxr/usd/usdLux/blackbody.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
 #include <pxr/usd/usdShade/shader.h>
@@ -120,6 +121,7 @@ Json material_json(const UsdShadeMaterial& material, Json& warnings) {
     {"wrap_mode_v", sampler_mode(shader, "inputs:wrap_mode_v", 3)},
     {"albedo_texture", texture(shader, translucent ? "inputs:transmittance_texture" : "inputs:diffuse_texture", warnings)},
     {"normal_texture", texture(shader, "inputs:normalmap_texture", warnings)},
+    {"normal_encoding", attribute(shader, "inputs:encoding", 0)},
     {"roughness_texture", texture(shader, "inputs:reflectionroughness_texture", warnings)},
     {"metallic_texture", texture(shader, "inputs:metallic_texture", warnings)},
     {"emissive_texture", texture(shader, "inputs:emissive_mask_texture", warnings)}
@@ -171,6 +173,19 @@ std::vector<std::array<int, 3>> triangulate(const VtVec3fArray& points, const Vt
 }
 }
 
+std::string resolved_texture_path(const UsdPrim& prim, const char* name) {
+  Json warnings = Json::array();
+  return texture(prim, name, warnings);
+}
+Json compose_material(const UsdPrim& prim) {
+  Json warnings = Json::array();
+  auto material = UsdShadeMaterial(prim);
+  if (!material && prim.IsA<UsdShadeShader>()) material = UsdShadeMaterial(prim.GetParent());
+  if (!material) throw std::runtime_error("Expected a USD material");
+  auto result = material_json(material, warnings);
+  result["warnings"] = warnings;
+  return result;
+}
 Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
   Json result{{"revision", revision}, {"meshes", Json::array()}, {"materials", Json::array()},
     {"lights", Json::array()}, {"cameras", Json::array()}, {"warnings", Json::array()},
@@ -235,12 +250,16 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
       } catch (const std::exception& error) { result["warnings"].push_back(path + ": " + error.what()); }
     } else if (auto light = UsdLuxLightAPI(prim)) {
       auto color = attribute(prim, "inputs:color", GfVec3f(1));
+      if (attribute(prim, "inputs:enableColorTemperature", false))
+        color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(attribute(prim, "inputs:colorTemperature", 6500.f)));
       result["lights"].push_back({{"id", path}, {"source_path", source_path(prim)}, {"type", prim.GetTypeName().GetString()},
         {"transform", matrix_json(world)}, {"color", {color[0], color[1], color[2]}},
         {"intensity", attribute(prim, "inputs:intensity", 1.f) * std::pow(2.f, attribute(prim, "inputs:exposure", 0.f))},
         {"radius", attribute(prim, "inputs:radius", 0.5f)}, {"width", attribute(prim, "inputs:width", 1.f)},
         {"height", attribute(prim, "inputs:height", 1.f)}, {"length", attribute(prim, "inputs:length", 1.f)},
         {"angle", attribute(prim, "inputs:angle", 0.53f)}, {"cone_angle", attribute(prim, "inputs:shaping:cone:angle", 180.f)},
+        {"cone_softness", attribute(prim, "inputs:shaping:cone:softness", 0.f)},
+        {"focus", attribute(prim, "inputs:shaping:focus", 0.f)},
         {"texture", texture(prim, "inputs:texture:file", result["warnings"])}});
     } else if (auto camera = UsdGeomCamera(prim)) {
       result["cameras"].push_back({{"id", path}, {"transform", matrix_json(world)},

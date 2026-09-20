@@ -185,7 +185,9 @@ def main():
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/ingestion_smoke.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/layout_geometry_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/camera_controls_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/asset_catalog_test.gd"])
     if args.target == "gpu-test":
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/authoring_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/layout_view_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/gpu_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/capture_textures_smoke.gd"])

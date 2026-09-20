@@ -19,7 +19,12 @@ func _run() -> void:
 	test_directory = app.root_directory.path_join(".work/integration/" + str(Time.get_ticks_usec()))
 	app._command({"op": "create", "capture": app.root_directory.path_join("tests/fixtures/capture.usda"), "path": test_directory.path_join("project.usda")})
 	app._command({"op": "add_light", "path": "/RootNode/instances/inst_0123456789ABCDEF_0", "type": "SphereLight", "intensity": 50})
-	app._command({"op": "transform", "path": app.selection, "translation": [0, 3, 0]})
+	app._command({"op": "transform", "path": app.selection, "translation": [0, 3, 0], "rotation": [-90, 0, 0]})
+	app._command({"op": "set_light_type", "path": app.selection, "type": "SpotLight"})
+	var values := {"inputs:enableColorTemperature": true, "inputs:colorTemperature": 3000,
+			"inputs:exposure": 1, "inputs:shaping:cone:angle": 60, "inputs:shaping:cone:softness": 0.25, "inputs:shaping:focus": 1}
+	for property in values:
+		app._command({"op": "set_authoring_property", "path": app.selection, "property": property, "value": values[property]})
 	if "--light-below" in OS.get_cmdline_user_args():
 		app._command({"op": "transform", "path": app.selection, "translation": [0, -3, 0]})
 	app.viewport.frame_selection(true)

@@ -257,6 +257,7 @@ private:
     float height = data.value("height", 1.f), length = data.value("length", 1.f);
     float angle = data.value("angle", 0.53f) * float(3.141592653589793 / 180.0);
     float cone = data.value("cone_angle", 180.f) * float(3.141592653589793 / 180.0);
+    float softness = data.value("cone_softness", 0.f), focus = data.value("focus", 0.f);
     remixapi_LightInfoDomeEXT dome{}; dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
     auto texture = native_path(data.value("texture", std::string()));
     if (type == "DomeLight") {
@@ -268,6 +269,7 @@ private:
       usd.lightType = found->second; usd.transform = matrix; usd.pColor = &color; usd.pIntensity = &intensity;
       usd.pRadius = &radius; usd.pWidth = &width; usd.pHeight = &height; usd.pLength = &length;
       usd.pAngleRadians = &angle; usd.pConeAngleRadians = &cone; info.pNext = &usd;
+      usd.pConeSoftness = &softness; usd.pFocus = &focus;
     }
     remixapi_LightHandle light{};
     checked(api_.CreateLight(&info, &light), "CreateLight"); lights_.push_back(light);

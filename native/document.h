@@ -40,6 +40,8 @@ private:
   void require_stage() const;
   void select_layer(const std::string& identifier);
   void set_property(const Json& request);
+  void set_authoring_property(const Json& request, bool reset = false);
+  void set_light_type(const Json& request);
   void set_transform(const Json& request);
   std::string anchor_for(const std::string& path) const;
   std::string authored_path(const std::string& path) const;
@@ -58,6 +60,10 @@ private:
 };
 
 Json compose_scene(const pxr::UsdStageRefPtr& stage, uint64_t revision);
+Json describe_authoring(const pxr::UsdPrim& prim, const pxr::SdfLayerHandle& edit_layer);
+Json compose_material(const pxr::UsdPrim& prim);
+Json preview_asset(const fs::path& path);
+std::string resolved_texture_path(const pxr::UsdPrim& prim, const char* name);
 using TextureConverter = std::function<void(const fs::path&, const fs::path&, const std::string&)>;
 Json ingest_asset(const Json& request, const fs::path& project_directory,
                   const TextureConverter& convert = {}, const std::function<bool()>& canceled = {});

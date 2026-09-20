@@ -1,0 +1,235 @@
+#include "document.h"
+
+#include <cmath>
+#include <algorithm>
+#include <set>
+#include <pxr/usd/sdf/schema.h>
+#include <pxr/usd/usd/primRange.h>
+#include <pxr/usd/usdGeom/imageable.h>
+#include <pxr/usd/usdGeom/mesh.h>
+#include <pxr/usd/usdGeom/subset.h>
+#include <pxr/usd/usdLux/lightAPI.h>
+#include <pxr/usd/usdLux/shapingAPI.h>
+#include <pxr/usd/usdShade/material.h>
+#include <pxr/usd/usdShade/materialBindingAPI.h>
+#include <pxr/usd/usdShade/shader.h>
+#include <pxr/usd/usdUtils/dependencies.h>
+
+PXR_NAMESPACE_USING_DIRECTIVE
+namespace editor {
+namespace {
+UsdPrim shader_for(const UsdPrim& prim) {
+  if (prim.IsA<UsdShadeShader>() && prim.GetParent().IsA<UsdShadeMaterial>()) return prim;
+  if (auto material = UsdShadeMaterial(prim)) {
+    auto connected = material.ComputeSurfaceSource(TfToken("mdl"));
+    if (connected) return connected.GetPrim();
+    for (auto child : prim.GetChildren()) if (child.IsA<UsdShadeShader>()) return child;
+  }
+  return {};
+}
+Json read_value(const UsdAttribute& attr, const Json& fallback) {
+  VtValue value;
+  if (!attr || !attr.Get(&value)) return fallback;
+  if (value.IsHolding<float>()) return value.Get<float>();
+  if (value.IsHolding<double>()) return value.Get<double>();
+  if (value.IsHolding<int>()) return value.Get<int>();
+  if (value.IsHolding<unsigned>()) return value.Get<unsigned>();
+  if (value.IsHolding<bool>()) return value.Get<bool>();
+  if (value.IsHolding<TfToken>()) return value.Get<TfToken>().GetString();
+  if (value.IsHolding<SdfAssetPath>()) return value.Get<SdfAssetPath>().GetAssetPath();
+  if (value.IsHolding<GfVec3f>()) { auto v = value.Get<GfVec3f>(); return {v[0], v[1], v[2]}; }
+  return fallback;
+}
+Json fields_for(const UsdPrim& selected) {
+  Json fields = Json::array();
+  auto owner = selected;
+  auto add = [&](const char* name, const char* label, const char* group, const char* type, Json fallback,
+                 double minimum = 0, double maximum = 1e12, const char* control = "number") -> Json& {
+    const auto attr = owner.GetAttribute(TfToken(name));
+    fields.push_back({{"property", name}, {"label", label}, {"group", group}, {"type", type},
+      {"path", owner.GetPath().GetString()}, {"control", control}, {"default", fallback},
+      {"value", read_value(attr, fallback)}, {"min", minimum}, {"max", maximum}});
+    if (std::string(type) == "asset") fields.back()["resolved"] = resolved_texture_path(owner, name);
+    return fields.back();
+  };
+  auto choices = [](Json& field, const Json& values, const Json& labels) {
+    field["control"] = "choice"; field["choices"] = values; field["labels"] = labels;
+  };
+  if (UsdGeomImageable(selected)) {
+    auto& visibility = add("visibility", "Visibility", "Object", "token", "inherited");
+    choices(visibility, {"inherited", "invisible"}, {"Visible", "Hidden"});
+  }
+  if (UsdGeomMesh(selected)) add("doubleSided", "Double-sided", "Object", "bool", false, 0, 1, "bool");
+  if (UsdLuxLightAPI(selected)) {
+    add("inputs:color", "Color", "Light", "color3f", {1, 1, 1}, 0, 1, "color");
+    add("inputs:intensity", "Radiance", "Light", "float", 1.f);
+    add("inputs:exposure", "Exposure (stops)", "Light", "float", 0.f, -100, 100);
+    add("inputs:enableColorTemperature", "Use color temperature", "Light", "bool", false, 0, 1, "bool");
+    auto& temperature = add("inputs:colorTemperature", "Temperature (K)", "Light", "float", 6500.f, 1000, 10000);
+    temperature["enabled_by"] = "inputs:enableColorTemperature";
+    const auto type = selected.GetTypeName().GetString();
+    if (type == "SphereLight" || type == "DiskLight" || type == "CylinderLight") add("inputs:radius", "Radius", "Shape", "float", 0.5f, 0.0001);
+    if (type == "RectLight") {
+      add("inputs:width", "Width", "Shape", "float", 1.f, 0.0001);
+      add("inputs:height", "Height", "Shape", "float", 1.f, 0.0001);
+    }
+    if (type == "CylinderLight") add("inputs:length", "Length", "Shape", "float", 1.f, 0.0001);
+    if (type == "DistantLight") add("inputs:angle", "Angular size (degrees)", "Shape", "float", 0.53f, 0, 180);
+    if (type == "DomeLight") add("inputs:texture:file", "Environment texture", "Light", "asset", "", 0, 1, "texture");
+    if (type == "SphereLight" || type == "RectLight" || type == "DiskLight") {
+      add("inputs:shaping:cone:angle", "Cone angle (degrees)", "Cone", "float", 180.f, 0, 180);
+      add("inputs:shaping:cone:softness", "Cone softness", "Cone", "float", 0.f, 0, 1);
+      add("inputs:shaping:focus", "Focus", "Cone", "float", 0.f, 0, 100);
+    }
+  }
+  auto shader = shader_for(selected);
+  if (!shader) return fields;
+  owner = shader;
+  const auto source = read_value(shader.GetAttribute(TfToken("info:mdl:sourceAsset")), "").get<std::string>();
+  const bool glass = source.find("Translucent") != std::string::npos;
+  if (glass) {
+    add("inputs:transmittance_color", "Transmission color", "Transmission", "color3f", {1, 1, 1}, 0, 1, "color");
+    add("inputs:transmittance_texture", "Transmission texture", "Transmission", "asset", "", 0, 1, "texture");
+    add("inputs:ior_constant", "Index of refraction", "Transmission", "float", 1.3f, 1, 3);
+  } else {
+    add("inputs:diffuse_color_constant", "Base color", "Base color", "color3f", {0.7, 0.7, 0.7}, 0, 1, "color");
+    add("inputs:diffuse_texture", "Base color texture", "Base color", "asset", "", 0, 1, "texture");
+    add("inputs:reflection_roughness_constant", "Roughness", "Surface", "float", 0.5f, 0, 1);
+    add("inputs:reflectionroughness_texture", "Roughness texture", "Surface", "asset", "", 0, 1, "texture");
+    add("inputs:metallic_constant", "Metallic", "Surface", "float", 0.f, 0, 1);
+    add("inputs:metallic_texture", "Metallic texture", "Surface", "asset", "", 0, 1, "texture");
+    add("inputs:opacity_constant", "Opacity", "Opacity", "float", 1.f, 0, 1);
+    auto& cutout = add("inputs:alpha_test_type", "Alpha test", "Opacity", "int", 7);
+    choices(cutout, {0, 1, 2, 3, 4, 5, 6, 7}, {"Never", "Less", "Equal", "Less or equal", "Greater", "Not equal", "Greater or equal (cutout)", "Always (opaque)"});
+    add("inputs:alpha_test_reference_value", "Cutout threshold", "Opacity", "float", 0.f, 0, 255);
+  }
+  add("inputs:normalmap_texture", "Normal texture", "Normal", "asset", "", 0, 1, "texture");
+  add("inputs:enable_emission", "Enable emission", "Emission", "bool", false, 0, 1, "bool");
+  add("inputs:emissive_color_constant", "Emission color", "Emission", "color3f", {0, 0, 0}, 0, 1, "color")["enabled_by"] = "inputs:enable_emission";
+  add("inputs:emissive_intensity", "Emission intensity", "Emission", "float", 40.f)["enabled_by"] = "inputs:enable_emission";
+  add("inputs:emissive_mask_texture", "Emission texture", "Emission", "asset", "", 0, 1, "texture")["enabled_by"] = "inputs:enable_emission";
+  auto& filter = add("inputs:filter_mode", "Filtering", "Sampling", "uint", 1);
+  choices(filter, {0, 1}, {"Nearest", "Linear"});
+  for (auto axis : {"u", "v"}) {
+    const auto name = std::string("inputs:wrap_mode_") + axis;
+    auto& wrap = add(name.c_str(), axis[0] == 'u' ? "Wrap U" : "Wrap V", "Sampling", "uint", 1);
+    choices(wrap, {0, 1, 2, 3}, {"Clamp", "Repeat", "Mirror", "Clip"});
+  }
+  return fields;
+}
+}
+
+Json describe_authoring(const UsdPrim& prim, const SdfLayerHandle& edit_layer) {
+  auto shader = shader_for(prim);
+  std::string kind = shader ? "material" : UsdLuxLightAPI(prim) ? "light" : UsdGeomMesh(prim) ? "mesh" : "object";
+  Json result{{"kind", kind}, {"type", prim.GetTypeName().GetString()}, {"fields", fields_for(prim)}, {"materials", Json::array()}};
+  if (kind == "light") {
+    auto cone = read_value(prim.GetAttribute(TfToken("inputs:shaping:cone:angle")), 180.f).get<double>();
+    result["light_type"] = prim.GetTypeName() == TfToken("SphereLight") && cone < 180 ? "SpotLight" : prim.GetTypeName().GetString();
+  }
+  if (shader) result["surface_model"] = compose_material(prim)["kind"];
+  auto add_material = [&](const UsdPrim& mesh, const std::string& slot) {
+    auto material = UsdShadeMaterialBindingAPI(mesh).ComputeBoundMaterial();
+    if (!material) return;
+    auto path = material.GetPath().GetString();
+    result["materials"].push_back({{"path", path}, {"name", material.GetPrim().GetName().GetString()}, {"slot", slot}});
+  };
+  if (auto mesh = UsdGeomMesh(prim)) {
+    add_material(prim, "Mesh");
+    for (auto subset : UsdGeomSubset::GetGeomSubsets(mesh, UsdGeomTokens->face, TfToken("materialBind")))
+      add_material(subset.GetPrim(), subset.GetPrim().GetName().GetString());
+  } else if (!shader && !UsdLuxLightAPI(prim)) {
+    for (auto child : prim.GetChildren()) if (child.IsA<UsdGeomMesh>()) add_material(child, child.GetName().GetString());
+  }
+  for (auto& field : result["fields"]) {
+    auto spec = edit_layer->GetAttributeAtPath(SdfPath(field["path"].get<std::string>()).AppendProperty(TfToken(field["property"].get<std::string>())));
+    field["overridden"] = bool(spec && spec->HasDefaultValue());
+  }
+  return result;
+}
+
+void Document::set_authoring_property(const Json& request, bool reset) {
+  const auto path = authored_path(request.at("path").get<std::string>());
+  auto prim = stage_->GetPrimAtPath(SdfPath(path));
+  if (!prim) throw std::runtime_error("Selection no longer exists");
+  const auto name = request.at("property").get<std::string>();
+  auto fields = fields_for(prim);
+  auto found = std::find_if(fields.begin(), fields.end(), [&](const Json& f) { return f["property"] == name; });
+  if (found == fields.end()) throw std::runtime_error("This property is not an authoring control for the selection");
+  const auto& field = *found;
+  prim = stage_->GetPrimAtPath(SdfPath(field["path"].get<std::string>()));
+  if (reset) {
+    auto attr = prim.GetAttribute(TfToken(name));
+    if (attr) attr.Clear();
+    return;
+  }
+  auto value = request.at("value");
+  const auto control = field["control"].get<std::string>();
+  if (control == "number") {
+    if (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() < field["min"].get<double>() || value.get<double>() > field["max"].get<double>())
+      throw std::runtime_error("Value is outside the supported range");
+  } else if (control == "choice") {
+    const auto& choices = field.at("choices");
+    if (std::find(choices.begin(), choices.end(), value) == choices.end()) throw std::runtime_error("Invalid choice");
+  } else if (control == "color") {
+    if (!value.is_array() || value.size() != 3) throw std::runtime_error("Expected RGB color");
+    for (auto& component : value) if (!component.is_number() || !std::isfinite(component.get<double>()) || component.get<double>() < 0 || component.get<double>() > 1)
+      throw std::runtime_error("Color components must be between zero and one");
+  } else if (control == "bool" && !value.is_boolean()) throw std::runtime_error("Expected a checkbox value");
+  else if (control == "texture") {
+    auto file = value.get<std::string>();
+    if (!file.empty()) {
+      auto absolute = fs::path(file);
+      if (!absolute.is_absolute()) absolute = project_path_.parent_path() / absolute;
+      if (!fs::is_regular_file(absolute)) throw std::runtime_error("Texture file does not exist");
+      value = fs::relative(absolute, fs::path(edit_layer_->GetRealPath()).parent_path()).generic_string();
+    }
+  }
+  if (name.rfind("inputs:shaping:", 0) == 0) UsdLuxShapingAPI::Apply(prim);
+  if (!prim.GetAttribute(TfToken(name))) {
+    const auto type = SdfSchema::GetInstance().FindType(TfToken(field["type"].get<std::string>()));
+    if (!type || !prim.CreateAttribute(TfToken(name), type, false)) throw std::runtime_error("Could not create authoring attribute");
+  }
+  set_property({{"path", prim.GetPath().GetString()}, {"property", name}, {"value", value}});
+}
+
+void Document::set_light_type(const Json& request) {
+  auto prim = stage_->GetPrimAtPath(SdfPath(authored_path(request.at("path").get<std::string>())));
+  if (!UsdLuxLightAPI(prim)) throw std::runtime_error("Select a light");
+  const auto type = request.at("type").get<std::string>();
+  const std::set<std::string> types{"SphereLight", "SpotLight", "RectLight", "DiskLight", "CylinderLight", "DistantLight", "DomeLight"};
+  if (!types.count(type)) throw std::runtime_error("Unsupported light type");
+  if (!prim.SetTypeName(TfToken(type == "SpotLight" ? "SphereLight" : type))) throw std::runtime_error("Could not change light type");
+  // Clear a previous spotlight's shaping effect while keeping unrelated data.
+  if (type == "SpotLight" || prim.HasAPI<UsdLuxShapingAPI>() || prim.GetAttribute(TfToken("inputs:shaping:cone:angle"))) {
+    auto shaping = UsdLuxShapingAPI::Apply(prim);
+    shaping.CreateShapingConeAngleAttr().Set(type == "SpotLight" ? 35.f : 180.f);
+    shaping.CreateShapingConeSoftnessAttr().Set(0.f);
+    shaping.CreateShapingFocusAttr().Set(0.f);
+  }
+}
+
+Json preview_asset(const fs::path& path) {
+  auto stage = UsdStage::Open(fs::absolute(path).string());
+  if (!stage || !stage->GetDefaultPrim()) throw std::runtime_error("Asset has no USD default prim");
+  const auto root = stage->GetDefaultPrim();
+  Json result{{"asset", fs::absolute(path).generic_string()}, {"kind", root.IsA<UsdShadeMaterial>() ? "material" : "mesh"}};
+  if (root.IsA<UsdShadeMaterial>()) result["material"] = compose_material(root);
+  else result["scene"] = compose_scene(stage, 0);
+  std::vector<SdfLayerRefPtr> layers;
+  std::vector<std::string> assets, missing;
+  UsdUtilsComputeAllDependencies(SdfAssetPath(stage->GetRootLayer()->GetRealPath()), &layers, &assets, &missing);
+  std::set<std::string> files;
+  files.insert(fs::absolute(path).generic_string());
+  for (const auto& layer : layers) files.insert(layer->GetRealPath());
+  for (const auto& asset : assets) files.insert(asset);
+  const auto materials = root.IsA<UsdShadeMaterial>() ? Json::array({result["material"]}) : result["scene"]["materials"];
+  for (const auto& material : materials) for (auto it = material.begin(); it != material.end(); ++it)
+    if (it.key().find("_texture") != std::string::npos && it.value().is_string()) files.insert(it.value().get<std::string>());
+  result["dependencies"] = Json::array();
+  for (const auto& file : files) if (!file.empty() && fs::is_regular_file(file))
+    result["dependencies"].push_back({{"path", fs::absolute(file).generic_string()}, {"size", fs::file_size(file)},
+      {"modified", fs::last_write_time(file).time_since_epoch().count()}});
+  return result;
+}
+}
