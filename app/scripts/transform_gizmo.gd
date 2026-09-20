@@ -1,5 +1,6 @@
 extends RefCounted
 
+const LightGuide = preload("res://scripts/light_guide.gd")
 const AXES := [Vector3.RIGHT, Vector3.UP, Vector3.BACK]
 const COLORS := [Color("f16c65"), Color("83d979"), Color("6da7ff")]
 var view: Control
@@ -8,6 +9,7 @@ var world := Transform3D.IDENTITY
 var original := Transform3D.IDENTITY
 var radius := 0.0
 var light := false
+var light_guide := LightGuide.new()
 var mode := 0
 var active := false
 var axis := -2
@@ -30,8 +32,8 @@ func set_target(details: Dictionary) -> void:
 		world = from_array(details.world_transform)
 		light = details.authoring.kind == "light"
 		if light:
-			for property: Dictionary in details.get("properties", []):
-				if property.name == "inputs:radius": radius = maxf(float(property.value), 0)
+			light_guide.configure(details)
+			radius = light_guide.radius
 	view.queue_redraw()
 
 func set_mode(value: int) -> void:
@@ -53,7 +55,7 @@ func circle(index: int, size: float) -> PackedVector3Array:
 	return points
 
 func hit(position: Vector2) -> int:
-	if path.is_empty() or not view._view_rect().has_point(position): return -2
+	if path.is_empty() or view.mouse_captured or not view._view_rect().has_point(position): return -2
 	var origin: Vector2 = view._project(world.origin)
 	if not origin.is_finite(): return -2
 	if mode == 0 and origin.distance_to(position) <= 8: return -1
@@ -72,7 +74,7 @@ func hit(position: Vector2) -> int:
 	return result
 
 func begin(position: Vector2, handle: int) -> bool:
-	if handle == -2 or absf(world.basis.determinant()) < 1e-12: return false
+	if view.mouse_captured or handle == -2 or absf(world.basis.determinant()) < 1e-12: return false
 	original = world
 	var normal: Vector3 = view._basis().z
 	if mode == 1:
@@ -136,16 +138,13 @@ func handle_input(event: InputEvent) -> bool:
 	return false
 
 func draw() -> void:
-	if path.is_empty() or view.mouse_captured: return
+	if path.is_empty(): return
+	if light: light_guide.draw(view, world, extent())
 	var pivot: Vector2 = view._project(world.origin)
 	if not pivot.is_finite(): return
-	if light:
-		for i in range(3):
-			var points := circle(i, radius)
-			for j in range(points.size() - 1): view._line(world * points[j], world * points[j + 1], Color("d5b665"))
-		view._line(world.origin, world.origin - world.basis.z.normalized() * extent() * 0.6, Color("f3cf70"))
 	for i in range(3):
-		var color: Color = Color.WHITE if (axis == i if active else hover == i) else COLORS[i]
+		var highlighted: bool = not view.mouse_captured and (axis == i if active else hover == i)
+		var color: Color = Color.WHITE if highlighted else COLORS[i]
 		if mode == 1:
 			var points := circle(i, extent())
 			for j in range(points.size() - 1): view._line(world.origin + points[j], world.origin + points[j + 1], color)

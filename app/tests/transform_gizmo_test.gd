@@ -82,11 +82,20 @@ func run() -> void:
 	check(not view.gizmo.active and commits.size() == count, "Losing focus must cancel the preview")
 	button(start, true); motion(endpoint); view.set_mouse_capture(true)
 	check(not view.gizmo.active and commits.size() == count, "Entering drone mode must cancel the preview")
+	check(view.gizmo.path == "/Light" and view.gizmo.hit(start) == -2 and not view.gizmo.begin(start, 0), "Drone flight must retain the selected gizmo without allowing pointer manipulation")
 	view.set_mouse_capture(false)
 	button(start, true); button(start, false)
 	check(commits.size() == count, "Clicking without dragging must not author a transform")
 	view.gizmo.set_target({"path": "/CaptureRoot", "world_transform": Gizmo.to_array(Transform3D.IDENTITY), "authoring": {"kind": "xform", "editable": false}})
 	check(view.gizmo.hit(start) == -2, "Read-only capture instance roots must not show transform handles")
+	# A large emitter can cross the eye plane while flying past the light.
+	var eye: Vector3 = view.center + view._basis().z * view.distance
+	var forward: Vector3 = -view._basis().z
+	var clipped: PackedVector2Array = view._project_segment(eye - forward, eye + forward * 3)
+	check(clipped.size() == 2 and clipped[0].is_finite() and clipped[1].is_finite(), "Guide lines crossing the eye plane must retain their visible portion")
+	clipped = view._project_segment(eye - forward * 1000000, eye + forward * 1000000)
+	check(clipped.size() == 2 and clipped[0].is_finite() and clipped[1].is_finite(), "Clipping very large guides must not round the depth to zero")
+	check(view._project_segment(eye - forward, eye - forward * 2).is_empty(), "Guides entirely behind the camera must be clipped")
 	view.queue_free(); await process_frame
 	print("Transform gizmo: %d failures" % failures)
 	quit(1 if failures else 0)

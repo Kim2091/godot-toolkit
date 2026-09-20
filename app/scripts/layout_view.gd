@@ -394,11 +394,28 @@ func _draw() -> void:
 	if scene.is_empty():
 		draw_string(ThemeDB.fallback_font, size * 0.5 - Vector2(150, 0), "Open a project or create one from a capture", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color("9bb0c0"))
 
-func _line(a: Vector3, b: Vector3, color: Color) -> void:
-	var x := _project(a)
-	var y := _project(b)
-	if x.is_finite() and y.is_finite():
-		draw_line(x, y, color, 1.0, true)
+func _project_segment(a: Vector3, b: Vector3) -> PackedVector2Array:
+	# Keep the visible portion of large emitter guides when flying through them.
+	var basis := _basis()
+	var eye := center + basis.z * distance
+	var start := basis.transposed() * (a - eye)
+	var end := basis.transposed() * (b - eye)
+	const NEAR := -0.001
+	if start.z > NEAR and end.z > NEAR: return PackedVector2Array()
+	if start.z > NEAR:
+		start = start.lerp(end, (NEAR - start.z) / (end.z - start.z))
+		start.z = NEAR
+	if end.z > NEAR:
+		end = end.lerp(start, (NEAR - end.z) / (start.z - end.z))
+		end.z = NEAR
+	var rectangle := _view_rect()
+	var focal := rectangle.size.y / (2.0 * tan(deg_to_rad(30)))
+	return PackedVector2Array([rectangle.get_center() + Vector2(start.x, -start.y) * focal / -start.z,
+		rectangle.get_center() + Vector2(end.x, -end.y) * focal / -end.z])
+
+func _line(a: Vector3, b: Vector3, color: Color, width := 1.0) -> void:
+	var points := _project_segment(a, b)
+	if points.size() == 2: draw_line(points[0], points[1], color, width, true)
 
 func _pick(position: Vector2) -> String:
 	for light in scene.get("lights", []):
