@@ -1,6 +1,7 @@
 extends RefCounted
 
 const LightGuide = preload("res://scripts/light_guide.gd")
+const KeyboardTransform = preload("res://scripts/keyboard_transform.gd")
 const AXES := [Vector3.RIGHT, Vector3.UP, Vector3.BACK]
 const COLORS := [Color("f16c65"), Color("83d979"), Color("6da7ff")]
 var view: Control
@@ -16,6 +17,7 @@ var axis := -2
 var hover := -2
 var plane := Plane()
 var start := Vector3.ZERO
+var modal: RefCounted
 
 static func from_array(a: Array) -> Transform3D:
 	return Transform3D(Basis(Vector3(a[0], a[1], a[2]), Vector3(a[4], a[5], a[6]), Vector3(a[8], a[9], a[10])), Vector3(a[12], a[13], a[14]))
@@ -41,6 +43,16 @@ func set_mode(value: int) -> void:
 
 func cancel() -> void:
 	if active: _finish(false)
+
+func begin_modal(operation: int, position: Vector2) -> bool:
+	if active or view.mouse_captured or path.is_empty() or not view._view_rect().has_point(position): return false
+	if operation == KeyboardTransform.Kind.AIM and not light: return false
+	if absf(world.basis.determinant()) < 1e-12 or not view._project(world.origin).is_finite(): return false
+	original = world; axis = -1; active = true; hover = -2
+	modal = KeyboardTransform.new()
+	modal.begin(view, operation, original, position)
+	drag(position)
+	return true
 
 func extent() -> float:
 	var eye: Vector3 = view.center + view._basis().z * view.distance
@@ -91,6 +103,11 @@ func begin(position: Vector2, handle: int) -> bool:
 	return true
 
 func drag(position: Vector2) -> void:
+	if modal != null:
+		world = modal.update(view, position, path, world)
+		view._gizmo_preview(path, world * original.affine_inverse())
+		view.queue_redraw()
+		return
 	var ray: Dictionary = view._ray(position)
 	var point = plane.intersects_ray(ray.origin, ray.direction)
 	if point == null: return
@@ -114,6 +131,7 @@ func drag(position: Vector2) -> void:
 
 func _finish(commit: bool) -> void:
 	active = false
+	modal = null
 	var changed := not world.is_equal_approx(original)
 	view._gizmo_preview(path, Transform3D.IDENTITY)
 	if not commit: world = original
@@ -122,6 +140,27 @@ func _finish(commit: bool) -> void:
 
 func handle_input(event: InputEvent) -> bool:
 	if active:
+		if modal != null:
+			if event is InputEventKey:
+				if event.pressed and modal.input_number(event):
+					drag(modal.pointer)
+				elif event.pressed and not event.echo:
+					if event.keycode == KEY_ESCAPE: cancel()
+					elif event.keycode in [KEY_ENTER, KEY_KP_ENTER]:
+						if modal.can_confirm(): _finish(true)
+					elif not (event.ctrl_pressed or event.alt_pressed or event.meta_pressed) and event.keycode in [KEY_X, KEY_Y, KEY_Z] and modal.kind != KeyboardTransform.Kind.AIM:
+						var next := [KEY_X, KEY_Y, KEY_Z].find(event.keycode)
+						axis = -1 if axis == next else next
+						modal.axis = axis
+						drag(modal.pointer)
+				return true
+			if event is InputEventMouseButton:
+				if event.pressed:
+					if event.button_index == MOUSE_BUTTON_LEFT:
+						drag(event.position)
+						if modal.can_confirm(): _finish(true)
+					elif event.button_index == MOUSE_BUTTON_RIGHT: cancel()
+				return true
 		if event is InputEventMouseMotion:
 			drag(event.position); return true
 		if event is InputEventMouseButton:
@@ -142,10 +181,20 @@ func draw() -> void:
 	if light: light_guide.draw(view, world, extent())
 	var pivot: Vector2 = view._project(world.origin)
 	if not pivot.is_finite(): return
+	var display_mode: int = mode if modal == null else modal.kind
+	if modal != null:
+		if axis >= 0:
+			view._line(original.origin - AXES[axis] * extent() * 100, original.origin + AXES[axis] * extent() * 100, COLORS[axis])
+		if modal.kind == KeyboardTransform.Kind.AIM and modal.has_target:
+			view._line(world.origin, modal.target, LightGuide.DIRECTION, 1.5)
+			var point: Vector2 = view._project(modal.target)
+			if point.is_finite(): view.draw_circle(point, 6, LightGuide.DIRECTION, false, 1.5, true)
+		elif modal.kind in [KeyboardTransform.Kind.ROTATE, KeyboardTransform.Kind.SCALE]:
+			view.draw_dashed_line(pivot, modal.pointer, Color("b2bcc4"), 1, 5, true)
 	for i in range(3):
 		var highlighted: bool = not view.mouse_captured and (axis == i if active else hover == i)
 		var color: Color = Color.WHITE if highlighted else COLORS[i]
-		if mode == 1:
+		if display_mode == 1:
 			var points := circle(i, extent())
 			for j in range(points.size() - 1): view._line(world.origin + points[j], world.origin + points[j + 1], color)
 		else:
@@ -154,6 +203,9 @@ func draw() -> void:
 			view.draw_line(pivot, end, color, 2.5, true)
 			var direction := (end - pivot).normalized()
 			var side := Vector2(-direction.y, direction.x)
-			view.draw_colored_polygon(PackedVector2Array([end, end - direction * 11 + side * 4, end - direction * 11 - side * 4]), color)
+			if display_mode == KeyboardTransform.Kind.SCALE:
+				view.draw_rect(Rect2(end - Vector2(4, 4), Vector2(8, 8)), color)
+			else:
+				view.draw_colored_polygon(PackedVector2Array([end, end - direction * 11 + side * 4, end - direction * 11 - side * 4]), color)
 			view.draw_string(ThemeDB.fallback_font, end + Vector2(5, -4), ["X", "Y", "Z"][i], HORIZONTAL_ALIGNMENT_LEFT, -1, 12, color)
-	if mode == 0: view.draw_rect(Rect2(pivot - Vector2(4, 4), Vector2(8, 8)), Color.WHITE, false, 1.5)
+	if display_mode == 0: view.draw_rect(Rect2(pivot - Vector2(4, 4), Vector2(8, 8)), Color.WHITE, false, 1.5)

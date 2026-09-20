@@ -121,6 +121,23 @@ def materials(source):
     shutil.copytree(source / "src/mdl/PACKAGE-LICENSES", destination / "PACKAGE-LICENSES", dirs_exist_ok=True)
 
 
+def stage_remix_features():
+    # NGX discovers its feature libraries beside libremix.so, not through its
+    # linker's RUNPATH. Keep the development runtime usable like the upstream
+    # packaged runtime. Atomic replacement is safe for an already-running app.
+    directory = WORK / "build/remix/src/linux"
+    if not directory.exists():
+        return
+    for feature in ["dlss", "dlssd", "dlssg"]:
+        for library in (DEPS / "remix-sdk/prefix/lib").glob(f"libnvidia-ngx-{feature}.so.*"):
+            target = directory / library.name
+            if target.exists() and target.stat().st_size == library.stat().st_size and target.stat().st_mtime_ns == library.stat().st_mtime_ns:
+                continue
+            temporary = target.with_name(target.name + ".staging")
+            shutil.copy2(library, temporary)
+            os.replace(temporary, target)
+
+
 def remix(jobs):
     source = checkout("remix")
     materials(source)
@@ -144,6 +161,7 @@ def remix(jobs):
         run([*args, build, source, "-Dbuildtype=release", "-Denable_d3d9=false", "-Dwerror=true",
              "-Dlinux_native_bootstrap=false", f"-Dlinux_deps_root={sdk / 'prefix'}"])
         run(["meson", "compile", "-C", build, "-j", jobs])
+        stage_remix_features()
     finally:
         ENV.clear()
         ENV.update(saved)
@@ -189,11 +207,16 @@ def main():
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/layout_geometry_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/camera_controls_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/transform_gizmo_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/keyboard_transform_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/surface_placement_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/asset_catalog_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/project_sessions_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/renderer_transport_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/render_settings_test.gd"])
     if args.target == "gpu-test":
+        stage_remix_features()
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/render_settings_ui_smoke.gd"])
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/keyboard_transform_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/light_guides_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/light_updates_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/light_placement_smoke.gd"])
@@ -205,6 +228,7 @@ def main():
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/gpu_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/capture_textures_smoke.gd"])
     if args.target == "run":
+        stage_remix_features()
         run([godot_binary(), "--path", ROOT / "app"])
 
 

@@ -7,7 +7,11 @@ const AuthoringInspector = preload("res://scripts/authoring_inspector.gd")
 const ProjectSessions = preload("res://scripts/project_sessions.gd")
 const WelcomeScreen = preload("res://scripts/welcome_screen.gd")
 const StudioTheme = preload("res://scripts/studio_theme.gd")
+const RenderSettings = preload("res://scripts/render_settings.gd")
+const RenderSettingsDialog = preload("res://scripts/render_settings_dialog.gd")
 var sessions := ProjectSessions.new()
+var render_settings := RenderSettings.new()
+var render_settings_dialog: ConfirmationDialog
 var welcome: Control
 var editor_page: Control
 var camera_mode: OptionButton
@@ -52,6 +56,8 @@ func _ready() -> void:
 	_build_ui()
 	sessions.warning.connect(_log)
 	sessions.load_history()
+	render_settings.warning.connect(_log)
+	render_settings.load_settings()
 	dpi_timer = Timer.new(); dpi_timer.wait_time = 1.0
 	dpi_timer.timeout.connect(_update_dpi); add_child(dpi_timer); dpi_timer.start()
 	get_window().dpi_changed.connect(_update_dpi)
@@ -194,6 +200,7 @@ func _build_ui() -> void:
 		viewport.show_render = value
 		_sync_renderer())
 	view_tools.add_child(render_toggle)
+	_button("Render settings", _show_render_settings, view_tools)
 	camera_mode = OptionButton.new()
 	camera_mode.add_item("Drone", LayoutView.CameraMode.DRONE)
 	camera_mode.add_item("Orbit", LayoutView.CameraMode.ORBIT)
@@ -224,7 +231,7 @@ func _build_ui() -> void:
 		if renderer != null and renderer.is_ready:
 			renderer.send({"op": "preview_transform", "path": path, "delta": delta, "revision": state.revision}))
 	center_panel.add_child(viewport)
-	_label("Drag axes to move or rings to rotate. Ctrl+T: place at cursor. Escape cancels. Captured attachments affect every instance.", center_panel, 11).autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_label("G: move · R: rotate · S: scale · X/Y/Z: lock axis · Shift+T: aim light · Ctrl+T: place at cursor. Left click confirms; Esc cancels.", center_panel, 11).autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	var right := VBoxContainer.new()
 	right.custom_minimum_size.x = 260
 	center_right.add_child(right)
@@ -638,10 +645,36 @@ func _launch_renderer(library: String) -> void:
 	var worker := OS.get_environment("REMIX_RENDERER_WORKER")
 	if worker.is_empty():
 		worker = root_directory.path_join("build/remix-renderer" + (".exe" if OS.get_name() == "Windows" else ""))
-	renderer.start_worker(worker, library)
+	renderer.start_worker(worker, library, render_settings.values)
+	if is_instance_valid(render_settings_dialog): render_settings_dialog.set_capabilities({})
+
+func _show_render_settings() -> void:
+	viewport.set_mouse_capture(false)
+	if not is_instance_valid(render_settings_dialog):
+		render_settings_dialog = RenderSettingsDialog.new()
+		add_child(render_settings_dialog)
+		render_settings_dialog.settings_applied.connect(_apply_render_settings)
+	render_settings_dialog.show_settings(render_settings.values, renderer.capabilities)
+
+func _apply_render_settings(values: Dictionary) -> void:
+	if not render_settings.save_settings(values):
+		if is_instance_valid(render_settings_dialog):
+			render_settings_dialog.notice.text = "Could not save render settings. Check that your settings folder is writable."
+		return
+	if is_instance_valid(render_settings_dialog): render_settings_dialog.hide()
+	var pixels := Vector2i(render_settings.values.width, render_settings.values.height)
+	if not renderer.process.is_empty():
+		if renderer.output_size != pixels:
+			# Shared Vulkan images have a fixed extent. Reconnect the worker and
+			# import a new image; the document and camera stay in the editor.
+			renderer.stop_worker()
+		else:
+			renderer.send({"op": "render_settings", "settings": render_settings.values.duplicate(true)})
+	_sync_renderer()
 
 func _renderer_response(response: Dictionary) -> void:
 	if response.get("ok", false) and response.get("request_op") == "start":
+		if is_instance_valid(render_settings_dialog): render_settings_dialog.set_capabilities(renderer.capabilities)
 		renderer.send({"op": "scene", "scene": last_scene})
 		renderer.send({"op": "camera", "camera": viewport.camera()})
 

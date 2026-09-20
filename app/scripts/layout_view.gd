@@ -137,8 +137,33 @@ func _unhandled_key_input(event: InputEvent) -> void:
 			set_mouse_capture(true)
 			get_viewport().set_input_as_handled()
 
+func _start_keyboard_transform(event: InputEvent) -> void:
+	if not is_visible_in_tree() or gizmo.active or not event is InputEventKey or not event.pressed or event.echo: return
+	if event.ctrl_pressed or event.alt_pressed or event.meta_pressed or not _view_rect().has_point(get_local_mouse_position()): return
+	var focused := get_viewport().gui_get_focus_owner()
+	if focused is LineEdit or focused is TextEdit: return
+	var operation := -1
+	if event.shift_pressed and event.keycode == KEY_T: operation = TransformGizmo.KeyboardTransform.Kind.AIM
+	elif not event.shift_pressed:
+		operation = {KEY_G: TransformGizmo.KeyboardTransform.Kind.MOVE, KEY_R: TransformGizmo.KeyboardTransform.Kind.ROTATE,
+			KEY_S: TransformGizmo.KeyboardTransform.Kind.SCALE}.get(event.keycode, -1)
+	if operation < 0: return
+	# Handle viewport shortcuts before a focused scene tree can use its type-to-
+	# search keys. Text fields retain their normal input even over the viewport.
+	grab_focus()
+	if gizmo.begin_modal(operation, get_local_mouse_position()):
+		orbiting = false; dragging = false
+		get_viewport().set_input_as_handled()
+
 func _input(event: InputEvent) -> void:
+	if gizmo.modal != null:
+		# Modal transforms own pointer events even when the cursor crosses into
+		# a panel. Confirmation clicks must not also activate editor controls.
+		if gizmo.handle_input(make_input_local(event)):
+			get_viewport().set_input_as_handled()
+		return
 	if not mouse_captured:
+		_start_keyboard_transform(event)
 		return
 	if event is InputEventMouseMotion:
 		_look(event.screen_relative, true)
@@ -390,6 +415,7 @@ func _draw() -> void:
 		var aim := _view_rect().get_center()
 		draw_line(aim - Vector2(5, 0), aim + Vector2(5, 0), Color("c3d1df"))
 		draw_line(aim - Vector2(0, 5), aim + Vector2(0, 5), Color("c3d1df"))
+	if gizmo.modal != null: help = gizmo.modal.hint()
 	draw_string(ThemeDB.fallback_font, Vector2(18, 28), ("REMIX" if rendering else "LAYOUT") + " · " + help, HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color("9bb0c0"))
 	if scene.is_empty():
 		draw_string(ThemeDB.fallback_font, size * 0.5 - Vector2(150, 0), "Open a project or create one from a capture", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color("9bb0c0"))

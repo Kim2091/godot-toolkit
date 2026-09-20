@@ -27,9 +27,15 @@ var generation := 0
 var presented_context: Dictionary = {}
 var copy_context: Dictionary = {}
 var frame_texture: Texture2D
+var capabilities: Dictionary = {}
+var effective_settings: Dictionary = {}
+var output_size := Vector2i(960, 540)
 
-func start_worker(executable: String, library: String) -> void:
+func start_worker(executable: String, library: String, render_settings: Dictionary = {}) -> void:
 	stop_worker()
+	capabilities = {}
+	effective_settings = {}
+	output_size = Vector2i(int(render_settings.get("width", 960)), int(render_settings.get("height", 540)))
 	is_starting = true
 	process = OS.execute_with_pipe(executable, [], true)
 	if process.is_empty():
@@ -56,7 +62,8 @@ func start_worker(executable: String, library: String) -> void:
 	writer.start(_exchange_loop.bind(generation))
 	log_reader = Thread.new()
 	log_reader.start(_read_log)
-	var start := {"op": "start", "library": library, "width": 960, "height": 540}
+	var start := {"op": "start", "library": library, "width": output_size.x, "height": output_size.y}
+	if not render_settings.is_empty(): start["render_settings"] = render_settings.duplicate(true)
 	if shared_frames:
 		start["frame_channel"] = endpoint
 	send(start)
@@ -69,7 +76,7 @@ func send(message: Dictionary) -> void:
 	next_id += 1
 	message["id"] = next_id
 	message["version"] = PROTOCOL_VERSION
-	if message.get("op") in ["scene", "lights", "camera", "preview_transform"]:
+	if message.get("op") in ["scene", "lights", "camera", "preview_transform", "render_settings"]:
 		for i in range(messages.size() - 1, -1, -1):
 			var same: bool = messages[i].get("op") == message.op
 			if message.op == "preview_transform": same = same and messages[i].get("path") == message.path
@@ -162,12 +169,16 @@ func _deliver(response: Dictionary, worker_generation: int) -> void:
 		frame_pending = false
 		status_changed.emit(response.get("error", "Renderer failed."))
 	elif response.get("request_op") == "start":
+		capabilities = response.get("result", {}).get("capabilities", {})
+		effective_settings = response.get("result", {}).get("render_settings", {})
 		if shared_frames:
 			gpu.import_frame()
 		else:
 			is_ready = true
 			is_starting = false
 			status_changed.emit("Remix preview running in its native window")
+	elif response.get("request_op") == "render_settings":
+		effective_settings = response.get("result", {})
 	elif response.get("request_op") == "frame":
 		if shared_frames and response.get("result", {}).get("status") == "presented":
 			copy_context = response.get("view_context", {}).duplicate(true)

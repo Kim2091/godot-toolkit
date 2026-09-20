@@ -1,5 +1,6 @@
 #include "channel.h"
 #include "shared_frame.h"
+#include "render_settings.h"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -69,6 +70,10 @@ public:
     remixapi_StartupInfo info{};
     info.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
     width_ = message.value("width", 1280u); height_ = message.value("height", 720u);
+    if (message.contains("render_settings")) {
+      const auto preferences = studio::RenderSettings::parse(message.at("render_settings"));
+      width_ = preferences.width; height_ = preferences.height;
+    }
     if (width_ < 16 || height_ < 16 || width_ > 8192 || height_ > 8192) throw std::runtime_error("Invalid viewport size");
 #ifdef _WIN32
     const wchar_t* class_name = L"GodotRemixRenderer";
@@ -86,6 +91,11 @@ public:
     info.combineGuiInFinalColor = false;
     checked(api_.Startup(&info), "Startup");
     running_ = true;
+    remixapi_FeatureAvailability features{};
+    if (api_.GetFeatureAvailability && api_.GetFeatureAvailability(&features) == REMIXAPI_ERROR_CODE_SUCCESS) {
+      dlss_ = (features.availableFeatures & REMIXAPI_FEATURE_DLSS_SUPER_RESOLUTION_BIT) != 0;
+      ray_reconstruction_ = dlss_ && (features.availableFeatures & REMIXAPI_FEATURE_DLSS_RAY_RECONSTRUCTION_BIT) != 0;
+    }
 #ifndef _WIN32
     if (message.contains("frame_channel")) {
       auto configure = reinterpret_cast<ConfigureSharedFrame>(dlsym(library_, "remixapi_EditorConfigureSharedFrame"));
@@ -121,7 +131,10 @@ public:
     checked(api_.SetConfigVariable("rtx.useRTXDI", "False"), "Select preview light sampling");
     api_.SetUIState(REMIXAPI_UI_STATE_NONE);
     camera_ = {{"position", {0, 2, 5}}, {"forward", {0, 0, -1}}, {"up", {0, 1, 0}}, {"right", {1, 0, 0}}, {"fov", 60.0}};
-    return {{"status", "ready"}, {"presentation", shared_ ? "shared_vulkan" : "native_window"}, {"width", width_}, {"height", height_}};
+    Json result{{"status", "ready"}, {"presentation", shared_ ? "shared_vulkan" : "native_window"}, {"width", width_}, {"height", height_},
+      {"capabilities", {{"dlss", dlss_}, {"ray_reconstruction", ray_reconstruction_}, {"nis", nis_}}}};
+    if (message.contains("render_settings")) result["render_settings"] = render_settings(message.at("render_settings"));
+    return result;
   }
   void clear() {
     for (auto mesh : meshes_) api_.DestroyMesh(mesh);
@@ -209,6 +222,13 @@ public:
   void settings(const Json& data) {
     require_running();
     for (auto it = data.begin(); it != data.end(); ++it) checked(api_.SetConfigVariable(it.key().c_str(), it.value().get<std::string>().c_str()), "Set render setting");
+  }
+  Json render_settings(const Json& data) {
+    require_running();
+    const auto effective = studio::RenderSettings::parse(data).effective(dlss_, ray_reconstruction_, nis_);
+    if (effective.width != width_ || effective.height != height_) throw std::runtime_error("Changing viewport resolution requires restarting the renderer");
+    settings(effective.variables());
+    return effective.json();
   }
   Json frame() {
     require_running();
@@ -361,6 +381,14 @@ private:
   remixapi_HMODULE library_{};
   bool running_ = false;
   bool shared_ = false;
+  bool dlss_ = false;
+  bool ray_reconstruction_ = false;
+  // The pinned Linux native renderer compiles out NIS with NO_VENDOR_APIS.
+#ifdef _WIN32
+  bool nis_ = true;
+#else
+  bool nis_ = false;
+#endif
   uint32_t width_ = 1280, height_ = 720;
   uint64_t revision_ = 0, geometry_revision_ = 0, frame_ = 0;
   Json camera_;
@@ -402,6 +430,7 @@ int main() {
         else if (op == "camera") renderer.camera(request.at("camera"));
         else if (op == "preview_transform") response["result"] = renderer.preview_transform(request);
         else if (op == "settings") renderer.settings(request.at("settings"));
+        else if (op == "render_settings") response["result"] = renderer.render_settings(request.at("settings"));
         else if (op == "frame") response["result"] = renderer.frame();
         else if (op == "shutdown") shutdown = true;
         else throw std::runtime_error("Unknown renderer operation: " + op);
