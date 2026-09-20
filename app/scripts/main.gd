@@ -492,8 +492,6 @@ func _renderer_response(response: Dictionary) -> void:
 		renderer.send({"op": "camera", "camera": viewport.camera()})
 
 func _process(_delta: float) -> void:
-	if renderer != null and renderer.is_ready:
-		viewport.queue_redraw()
 	if import_running and document != null:
 		var response: String = document.poll_ingestion()
 		if not response.is_empty():

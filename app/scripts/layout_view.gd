@@ -1,11 +1,19 @@
 extends Control
 
+const LayoutGeometry = preload("res://scripts/layout_geometry.gd")
+const WireframeShader = preload("res://shaders/layout_wireframe.gdshader")
+
 signal selected(path: String)
 signal camera_changed(camera: Dictionary)
 signal translation_requested(delta: Vector3)
 
 var scene: Dictionary = {}
-var selected_path := ""
+var selected_path := "":
+	set(value):
+		if selected_path == value:
+			return
+		selected_path = value
+		_update_selection()
 var center := Vector3.ZERO
 var distance := 8.0
 var yaw := 0.6
@@ -15,9 +23,21 @@ var orbiting := false
 var dragging := false
 var drag_start := Vector2.ZERO
 var snap := false
-var projected: Array[Dictionary] = []
-var rendered_texture: Texture2D
-var show_render := true
+var rendered_texture: Texture2D:
+	set(value):
+		rendered_texture = value
+		_sync_view()
+var show_render := true:
+	set(value):
+		show_render = value
+		_sync_view()
+var geometry := LayoutGeometry.new()
+var wire_viewport: SubViewport
+var wire_camera: Camera3D
+var wire_instances: Array[MeshInstance3D] = []
+var wire_material: ShaderMaterial
+var selection_material: ShaderMaterial
+var _view_state: Array = []
 
 func _view_rect() -> Rect2:
 	if rendered_texture == null or not show_render:
@@ -29,11 +49,72 @@ func _view_rect() -> Rect2:
 func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	clip_contents = true
-	resized.connect(queue_redraw)
+	wire_viewport = SubViewport.new()
+	wire_viewport.own_world_3d = true
+	wire_viewport.transparent_bg = true
+	wire_viewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	wire_viewport.msaa_3d = Viewport.MSAA_2X
+	add_child(wire_viewport)
+	wire_camera = Camera3D.new()
+	wire_camera.fov = 60.0
+	wire_viewport.add_child(wire_camera)
+	wire_material = ShaderMaterial.new()
+	wire_material.shader = WireframeShader
+	selection_material = ShaderMaterial.new()
+	selection_material.shader = WireframeShader
+	selection_material.set_shader_parameter("wire_color", Color("62dac2"))
+	resized.connect(_sync_view)
+	_rebuild_geometry()
+
+func _rebuild_geometry() -> void:
+	if wire_viewport == null:
+		return
+	for instance in wire_instances:
+		instance.free()
+	wire_instances.clear()
+	geometry.rebuild(scene)
+	for entry in geometry.entries:
+		var instance := MeshInstance3D.new()
+		instance.mesh = entry.geometry.mesh
+		instance.transform = entry.transform
+		instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		wire_viewport.add_child(instance)
+		wire_instances.append(instance)
+	_update_selection()
+
+func _update_selection() -> void:
+	for i in range(wire_instances.size()):
+		var highlight: bool = geometry.entries[i].matches(selected_path)
+		wire_instances[i].layers = 3 if highlight else 1
+		wire_instances[i].material_override = selection_material if highlight else wire_material
+	_invalidate_wireframe()
+
+func _invalidate_wireframe() -> void:
+	if wire_viewport != null:
+		wire_viewport.render_target_update_mode = SubViewport.UPDATE_ONCE
+	queue_redraw()
+
+func _sync_view() -> void:
+	if wire_viewport == null:
+		return
+	var rectangle := _view_rect()
+	var rendering := rendered_texture != null and show_render
+	var state := [rectangle, center, distance, yaw, pitch, world_up, rendering]
+	if state == _view_state:
+		return
+	_view_state = state
+	wire_viewport.size = Vector2i(maxi(1, int(rectangle.size.x)), maxi(1, int(rectangle.size.y)))
+	var basis := _basis()
+	wire_camera.transform = Transform3D(basis, center + basis.z * distance)
+	wire_camera.near = maxf(distance * 0.00001, 0.0001)
+	wire_camera.far = maxf(distance * 100.0, 1000.0)
+	wire_camera.cull_mask = 2 if rendering else 1
+	_invalidate_wireframe()
 
 func set_scene(data: Dictionary, frame_all := false) -> void:
 	scene = data
 	world_up = Vector3(0, 0, 1) if data.get("up_axis", "Y") == "Z" else Vector3.UP
+	_rebuild_geometry()
 	if frame_all:
 		frame_selection(true)
 	queue_redraw()
@@ -71,29 +152,19 @@ func _project(point: Vector3) -> Vector2:
 func frame_selection(all := false) -> void:
 	var minimum := Vector3(INF, INF, INF)
 	var maximum := -minimum
-	for mesh in scene.get("meshes", []):
-		if not all and not _is_selected(mesh):
+	for entry in geometry.entries:
+		if not all and not entry.matches(selected_path):
 			continue
-		for surface in mesh.surfaces:
-			for vertex in surface.vertices:
-				var p := _world(mesh.transform, vertex)
-				minimum = minimum.min(p)
-				maximum = maximum.max(p)
+		minimum = minimum.min(entry.bounds.position)
+		maximum = maximum.max(entry.bounds.end)
 	if minimum.is_finite():
 		center = (minimum + maximum) * 0.5
 		distance = maxf((maximum - minimum).length() * 1.25, 0.1)
 		camera_changed.emit(camera())
 	queue_redraw()
 
-func _is_selected(item: Dictionary) -> bool:
-	if selected_path.is_empty():
-		return false
-	for path in [String(item.id), String(item.get("source_path", item.id))]:
-		if path == selected_path or path.begins_with(selected_path + "/"):
-			return true
-	return false
-
 func _draw() -> void:
+	_sync_view()
 	draw_rect(Rect2(Vector2.ZERO, size), Color("111820"))
 	var rendering := rendered_texture != null and show_render
 	if rendering:
@@ -109,29 +180,12 @@ func _draw() -> void:
 			c = Vector3(c.x, c.z, 0); d = Vector3(d.x, d.z, 0)
 		if not rendering:
 			_line(a, b, Color("23303c")); _line(c, d, Color("23303c"))
-	projected.clear()
-	for mesh in scene.get("meshes", []):
-		var highlight := _is_selected(mesh)
-		if rendering and not highlight:
-			continue
-		var color := Color("62dac2") if highlight else Color("6a8397")
-		for surface in mesh.surfaces:
-			var vertices: Array = surface.vertices
-			var indices: Array = surface.indices
-			for i in range(0, indices.size() - 2, 3):
-				var points := PackedVector2Array()
-				for j in range(3):
-					points.append(_project(_world(mesh.transform, vertices[int(indices[i + j])])))
-				if not points[0].is_finite() or not points[1].is_finite() or not points[2].is_finite():
-					continue
-				projected.append({"points": points, "path": mesh.id})
-				if not rendering or highlight:
-					draw_polyline(PackedVector2Array([points[0], points[1], points[2], points[0]]), color, 1.0, true)
+	if wire_viewport != null:
+		draw_texture_rect(wire_viewport.get_texture(), _view_rect(), false)
 	for light in scene.get("lights", []):
 		var point := _project(_world(light.transform, [0, 0, 0]))
 		if point.is_finite():
 			draw_circle(point, 5, Color("f2d28b"), false, 1.5, true)
-			projected.append({"light": point, "path": light.id})
 	draw_string(ThemeDB.fallback_font, Vector2(18, 28), ("REMIX" if rendering else "LAYOUT") + "  ·  Middle/right drag: orbit  ·  Wheel: zoom  ·  F: frame", HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color("9bb0c0"))
 	if scene.is_empty():
 		draw_string(ThemeDB.fallback_font, size * 0.5 - Vector2(150, 0), "Open a project or create one from a capture", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color("9bb0c0"))
@@ -151,19 +205,7 @@ func _pick(position: Vector2) -> String:
 	var local := (position - rectangle.get_center()) * (2 * tan(deg_to_rad(30))) / rectangle.size.y
 	var direction := (basis.x * local.x - basis.y * local.y - basis.z).normalized()
 	var origin := center + basis.z * distance
-	var closest := INF
-	var path := ""
-	for mesh in scene.get("meshes", []):
-		for surface in mesh.surfaces:
-			for i in range(0, surface.indices.size() - 2, 3):
-				var a := _world(mesh.transform, surface.vertices[int(surface.indices[i])])
-				var b := _world(mesh.transform, surface.vertices[int(surface.indices[i + 1])])
-				var c := _world(mesh.transform, surface.vertices[int(surface.indices[i + 2])])
-				var hit = Geometry3D.ray_intersects_triangle(origin, direction, a, b, c)
-				if hit != null and origin.distance_squared_to(hit) < closest:
-					closest = origin.distance_squared_to(hit)
-					path = mesh.id
-	return path
+	return geometry.pick(origin, direction)
 
 func _gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:

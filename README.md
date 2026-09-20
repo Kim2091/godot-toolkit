@@ -53,6 +53,8 @@ Unsupported USD content is retained when opening and saving a project. The previ
 
 `native/scene.cpp` composes visible geometry and lighting into a renderer snapshot. `native/renderer_main.cpp` creates Remix SDK materials/meshes/lights and submits instances each frame. Repeated geometry within a snapshot shares a Remix mesh. Scene changes currently send complete JSON snapshots, capped at 64 MiB; incremental binary geometry streaming and large-capture performance work remain.
 
+The layout view uploads each unique mesh to Godot once per scene snapshot and draws wireframes on the GPU. It caches the resulting viewport image until the camera, selection, scene, or view size changes. Repeated instances share GPU geometry and a picking BVH, built lazily on first use. Selection first rejects mesh bounding boxes, then queries the native triangle BVH; framing uses cached world bounds. Large snapshots still take time to compose and upload when the scene changes, but orbiting does not walk their triangles in GDScript.
+
 The Linux runtime patch exports an offscreen Vulkan image and two binary semaphores. Handles travel over a private Unix socket using `SCM_RIGHTS`; ordinary control messages use length-prefixed stdio. Godot verifies the GPU UUID, imports the allocation, and copies it into an engine-owned texture with queue ownership transfers and semaphore waits/signals. No CPU image readback is used for viewport presentation. The worker completes its GPU submission before acknowledging a frame so a crashed producer cannot leave Godot waiting for an unsignaled future frame. The initial implementation serializes frame production and uses a fixed 960×540 image scaled to fit the viewport.
 
 The preview uses Remix's RIS light sampling. The pinned native fork produced black analytical lighting with RTXDI enabled in the embedded viewport; RTXDI is disabled until that integration issue is resolved.
@@ -67,6 +69,8 @@ python scripts/bootstrap.py gpu-test
 ```
 
 Native tests cover capture immutability, composition, shared instance edits, transaction rollback, undo/redo, material and mesh replacement, and packaging. Protocol tests cover normal sessions, invalid versions, truncation, oversized messages, and recoverable command errors. The Godot ingestion test checks DDS formats, mipmaps, channel values, glTF ingestion, and material dependency packaging. The GPU test checks visible rendered geometry and worker restart while retaining unsaved edits; it needs an active desktop session and supported GPU. Test screenshots and generated projects are retained under `.work/integration` and `.work/ingestion`.
+
+Layout tests cover nearest-hit picking with transformed instances, shared geometry, cache invalidation, GPU wireframe visibility, selection, resizing, and alignment of the transparent selection overlay with the Remix view.
 
 The pinned upstream Remix test suite has independent failures: two referenced Python test files are absent, and its SDL `offscreen` smoke test cannot find a present-capable queue on the tested driver. Its desktop smoke test runs successfully. Our GPU test exercises the patched runtime through the application.
 
