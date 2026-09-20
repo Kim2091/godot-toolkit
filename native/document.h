@@ -39,6 +39,9 @@ public:
 private:
   void require_stage() const;
   void select_layer(const std::string& identifier);
+  Json captures() const;
+  void select_capture(const fs::path& path, bool add);
+  void edit_layer(const std::string& label, const pxr::SdfLayerHandle& layer, const std::function<void()>& operation);
   void set_property(const Json& request);
   void set_authoring_property(const Json& request, bool reset = false);
   void set_light_type(const Json& request);

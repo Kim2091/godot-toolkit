@@ -4,6 +4,7 @@
 #include <chrono>
 #include <pxr/base/tf/errorMark.h>
 #include <pxr/usd/usdGeom/xformable.h>
+#include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/shader.h>
 
@@ -89,6 +90,81 @@ void texture_resolution(const fs::path& root) {
   document.save();
   check(text(material_file) == original_material && text(directory / "capture.usda") == original_capture, "Preview path resolution must not rewrite capture assets");
 }
+
+void multiple_captures(const fs::path& root) {
+  const auto directory = root / "captures";
+  fs::create_directories(directory);
+  const auto a = directory / "a.usda", b = directory / "b.usda";
+  fs::copy_file(fs::path(FIXTURE_DIR) / "capture.usda", a);
+  fs::copy_file(a, b);
+  {
+    auto source = UsdStage::Open(b.string());
+    source->RemovePrim(SdfPath("/RootNode/instances/inst_0123456789ABCDEF_1"));
+    UsdGeomSetStageUpAxis(source, TfToken("Z"));
+    UsdGeomSetStageMetersPerUnit(source, 0.5);
+    source->GetRootLayer()->Save();
+  }
+  const auto original_a = text(a), original_b = text(b);
+  editor::Document doc;
+  const auto project = directory / "project/project.usda";
+  doc.create(a, project);
+  // Legacy workfile with a nested replacement layer and unrelated root metadata.
+  auto work = doc.stage()->GetRootLayer();
+  auto metadata = work->GetCustomLayerData();
+  metadata.erase("remix_studio_captures");
+  metadata["custom_data"] = VtValue(std::string("preserve"));
+  work->SetCustomLayerData(metadata);
+  auto nested = SdfLayer::CreateNew((project.parent_path() / "nested.usda").string());
+  nested->SetSubLayerPaths({"mod.usda"}); nested->Save();
+  work->SetSubLayerPaths({"nested.usda", "../a.usda"});
+  work->SetSubLayerOffset(SdfLayerOffset(3, 2), 0);
+  doc.save();
+  check(doc.describe()["captures"].size() == 1 && !doc.describe()["dirty"].get<bool>(), "Legacy captures must be discovered without edits");
+  const auto first = doc.describe()["active_capture"];
+  const auto before_add = editor::layer_text(work);
+  const std::string instance = "/RootNode/instances/inst_0123456789ABCDEF_0";
+  doc.dispatch({{"op", "add_light"}, {"path", instance}, {"type", "SphereLight"}});
+  const auto authored = editor::layer_text(doc.stage()->GetEditTarget().GetLayer());
+  doc.dispatch({{"op", "add_capture"}, {"path", b.string()}});
+  const auto second = doc.describe()["active_capture"];
+  check(second != first && doc.describe()["captures"].size() == 2, "Add capture must activate it and retain the original");
+  check(doc.scene()["meshes"].size() == 1 && doc.scene()["lights"].size() == 1, "Only the active capture should compose, with shared replacements");
+  check(doc.describe()["up_axis"] == "Z" && doc.describe()["meters_per_unit"] == 0.5, "Capture units and up axis must switch");
+  check(editor::layer_text(doc.stage()->GetEditTarget().GetLayer()) == authored, "Switching must retain unsaved authoring and edit target");
+  check(work->GetSubLayerPaths()[0] == "nested.usda" && work->GetSubLayerOffsets()[0] == SdfLayerOffset(3, 2), "Switching must preserve replacement order and offsets");
+  const auto revision = doc.revision();
+  doc.dispatch({{"op", "add_capture"}, {"path", (directory / "./b.usda").string()}});
+  check(doc.revision() == revision && doc.describe()["captures"].size() == 2, "Adding the same capture must not duplicate it or create an undo entry");
+  const auto unchanged = editor::layer_text(work);
+  rejects([&] { doc.dispatch({{"op", "add_capture"}, {"path", (directory / "missing.usda").string()}}); }, "Missing captures must be rejected");
+  rejects([&] { doc.dispatch({{"op", "add_capture"}, {"path", (fs::path(FIXTURE_DIR) / "material.usda").string()}}); }, "Non-capture USD must be rejected");
+  check(editor::layer_text(work) == unchanged && doc.revision() == revision, "Failed capture loads must preserve the current project");
+  doc.undo();
+  check(editor::layer_text(work) == before_add && doc.describe()["active_capture"] == first, "Undo must restore the original workfile and capture");
+  check(doc.scene()["lights"].size() == 2, "Undoing capture addition must retain unsaved replacements");
+  doc.redo();
+  check(doc.describe()["active_capture"] == second, "Redo must restore the added capture");
+  doc.dispatch({{"op", "select_capture"}, {"path", first}});
+  check(doc.scene()["meshes"].size() == 2 && doc.scene()["lights"].size() == 2 && doc.describe()["up_axis"] == "Y", "Switching back must restore the first capture's geometry and units");
+  doc.undo();
+  check(doc.describe()["active_capture"] == second, "Capture switches must support undo");
+  doc.save();
+  check(!doc.describe()["dirty"].get<bool>(), "Saving a multi-capture project must succeed");
+  editor::Document reopened;
+  reopened.open(project);
+  check(reopened.describe()["captures"].size() == 2 && reopened.describe()["active_capture"] == second, "Save/reopen must retain the capture list and active capture");
+  check(reopened.scene()["meshes"].size() == 1 && reopened.scene()["lights"].size() == 1, "Shared replacements must survive reopening");
+  reopened.package(directory / "package");
+  auto packaged = UsdStage::Open((directory / "package/mod.usda").string());
+  check(!packaged->GetRootLayer()->GetCustomLayerData().count("remix_studio_captures"), "Packages must exclude the capture catalog");
+  check(packaged->GetRootLayer()->GetCustomLayerData().count("custom_data") && !packaged->GetPrimAtPath(SdfPath("/RootNode/instances")), "Packages must preserve unrelated metadata and exclude capture geometry");
+  fs::remove(a);
+  check(reopened.describe()["captures"][0]["missing"], "Missing inactive captures must stay listed");
+  rejects([&] { reopened.dispatch({{"op", "select_capture"}, {"path", first}}); }, "Switching to a missing capture must fail safely");
+  check(reopened.describe()["active_capture"] == second, "Missing capture must not displace the active one");
+  std::ofstream(a) << original_a;
+  check(text(a) == original_a && text(b) == original_b, "Capture assets must remain unchanged");
+}
 }
 int main() {
   auto root = fs::temp_directory_path() / ("godot-remix-tests-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -97,6 +173,7 @@ int main() {
     TfErrorMark usd_errors;
     material_sampling(root);
     texture_resolution(root);
+    multiple_captures(root);
     fs::copy_file(fs::path(FIXTURE_DIR) / "capture.usda", root / "capture.usda");
     fs::copy_file(fs::path(FIXTURE_DIR) / "replacement.usda", root / "replacement.usda");
     const auto original = text(root / "capture.usda");

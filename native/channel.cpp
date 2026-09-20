@@ -1,4 +1,5 @@
 #include "channel.h"
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <stdexcept>
@@ -46,12 +47,23 @@ void Channel::write_exact(const void* data, size_t size) {
   }
 }
 bool Channel::receive(nlohmann::json& message) {
-  std::array<uint8_t, 4> header{};
-  if (!read_exact(header.data(), header.size())) return false;
-  const auto length = uint32_t(header[0]) | uint32_t(header[1]) << 8 | uint32_t(header[2]) << 16 | uint32_t(header[3]) << 24;
-  if (!length || length > max_message_bytes) throw std::runtime_error("Renderer message exceeds protocol limit");
-  std::string payload(length, '\0');
-  if (!read_exact(payload.data(), payload.size())) throw std::runtime_error("Missing renderer message body");
+  message = nullptr;
+  std::string payload;
+  while (true) {
+    std::array<uint8_t, 4> header{};
+    if (!read_exact(header.data(), header.size())) {
+      if (payload.empty()) return false;
+      throw std::runtime_error("Missing renderer message continuation");
+    }
+    const auto flags = uint32_t(header[0]) | uint32_t(header[1]) << 8 | uint32_t(header[2]) << 16 | uint32_t(header[3]) << 24;
+    const auto length = flags & ~more_frames;
+    if (!length || length > max_frame_bytes) throw std::runtime_error("Renderer frame exceeds protocol limit");
+    const auto offset = payload.size();
+    if (length > payload.max_size() - offset) throw std::runtime_error("Renderer message exceeds available storage");
+    payload.resize(offset + length);
+    if (!read_exact(payload.data() + offset, length)) throw std::runtime_error("Missing renderer message body");
+    if (!(flags & more_frames)) break;
+  }
   message = nlohmann::json::parse(payload);
   if (message.value("version", 0u) != protocol_version) throw std::runtime_error("Incompatible renderer protocol version");
   return true;
@@ -60,9 +72,12 @@ void Channel::send(const nlohmann::json& message) {
   std::lock_guard lock(write_mutex_);
   auto envelope = message; envelope["version"] = protocol_version;
   auto payload = envelope.dump();
-  if (payload.size() > max_message_bytes) throw std::runtime_error("Renderer message exceeds protocol limit");
-  auto size = uint32_t(payload.size());
-  std::array<uint8_t, 4> header{uint8_t(size), uint8_t(size >> 8), uint8_t(size >> 16), uint8_t(size >> 24)};
-  write_exact(header.data(), header.size()); write_exact(payload.data(), payload.size());
+  for (size_t offset = 0; offset < payload.size();) {
+    const auto length = std::min(size_t(max_frame_bytes), payload.size() - offset);
+    const auto flags = uint32_t(length) | (offset + length < payload.size() ? more_frames : 0u);
+    std::array<uint8_t, 4> header{uint8_t(flags), uint8_t(flags >> 8), uint8_t(flags >> 16), uint8_t(flags >> 24)};
+    write_exact(header.data(), header.size()); write_exact(payload.data() + offset, length);
+    offset += length;
+  }
 }
 }

@@ -4,8 +4,11 @@
 #include <nlohmann/json.hpp>
 
 namespace editor {
-constexpr uint32_t protocol_version = 1;
-constexpr uint32_t max_message_bytes = 64 * 1024 * 1024;
+constexpr uint32_t protocol_version = 2;
+// Each frame has a little-endian uint32 header: length in the low 31 bits,
+// with the high bit set when another frame belongs to the same JSON message.
+constexpr uint32_t more_frames = 0x80000000u;
+constexpr uint32_t max_frame_bytes = 64 * 1024 * 1024;
 
 class Channel {
 public:

@@ -12,6 +12,7 @@
 #include <pxr/usd/sdf/copyUtils.h>
 #include <pxr/usd/sdf/layerUtils.h>
 #include <pxr/usd/usd/primRange.h>
+#include <pxr/usd/usd/editContext.h>
 #include <pxr/usd/usdGeom/imageable.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/xform.h>
@@ -48,6 +49,7 @@ bool is_capture(const SdfLayerHandle& layer) {
   auto it = data.find("lightspeed_layer_type");
   return it != data.end() && it->second.IsHolding<std::string>() && it->second.Get<std::string>() == "capture";
 }
+constexpr const char* capture_catalog = "remix_studio_captures";
 GfVec3d vector3(const Json& data) {
   if (!data.is_array() || data.size() != 3) throw std::runtime_error("Expected three numeric components");
   GfVec3d v(data[0].get<double>(), data[1].get<double>(), data[2].get<double>());
@@ -157,6 +159,7 @@ void Document::create(const fs::path& capture, const fs::path& project) {
   mod->SetCustomLayerData({{"lightspeed_layer_type", VtValue(std::string("replacement"))}});
   work->SetCustomLayerData({
     {"lightspeed_layer_type", VtValue(std::string("workfile"))},
+    {capture_catalog, VtValue(VtStringArray{fs::relative(fs::absolute(capture), root).generic_string()})},
     {"omni_layer", VtValue(VtDictionary{{"authoring_layer", VtValue(std::string("./mod.usda"))}})}
   });
   work->SetSubLayerPaths({"./mod.usda", fs::relative(fs::absolute(capture), root).generic_string()});
@@ -176,6 +179,91 @@ bool Document::dirty() const {
   return false;
 }
 
+Json Document::captures() const {
+  auto root = stage_->GetRootLayer();
+  Json result = Json::array();
+  std::set<std::string> seen;
+  const auto metadata = root->GetCustomLayerData();
+  auto append = [&](const std::string& asset) {
+    auto path = fs::weakly_canonical(fs::path(root->GetRealPath()).parent_path() / asset);
+    const auto id = relative_asset(path, root);
+    if (!seen.insert(id).second) return;
+    bool active = false;
+    for (const auto& sublayer : root->GetSubLayerPaths()) {
+      auto resolved = fs::weakly_canonical(fs::path(root->GetRealPath()).parent_path() / std::string(sublayer));
+      if (resolved == path) active = true;
+    }
+    result.push_back({{"id", id}, {"path", path.generic_string()}, {"name", path.filename().string()},
+      {"active", active}, {"missing", !fs::is_regular_file(path)}});
+  };
+  auto stored = metadata.find(capture_catalog);
+  if (stored != metadata.end() && stored->second.IsHolding<VtStringArray>())
+    for (const auto& path : stored->second.Get<VtStringArray>()) append(path);
+  // Discover captures in existing workfiles without changing their metadata.
+  for (const auto& asset : root->GetSubLayerPaths()) {
+    auto layer = SdfLayer::FindOrOpenRelativeToLayer(root, asset);
+    if (layer && is_capture(layer)) append(asset);
+  }
+  return result;
+}
+
+void Document::select_capture(const fs::path& path, bool add) {
+  require_stage();
+  auto root = stage_->GetRootLayer();
+  const auto absolute = fs::weakly_canonical(path.is_absolute() ? path : project_path_.parent_path() / path);
+  if (!fs::is_regular_file(absolute)) throw std::runtime_error("Capture file is missing: " + absolute.string());
+  auto source = UsdStage::Open(absolute.string());
+  if (!source || !is_capture(source->GetRootLayer()) || !source->GetPrimAtPath(SdfPath("/RootNode")))
+    throw std::runtime_error("Expected a Remix capture with /RootNode");
+  auto entries = captures();
+  const auto id = relative_asset(absolute, root);
+  std::set<std::string> paths;
+  VtStringArray catalog;
+  for (const auto& entry : entries) {
+    paths.insert(entry["path"].get<std::string>());
+    catalog.push_back(entry["id"].get<std::string>());
+  }
+  if (!paths.count(absolute.generic_string())) {
+    if (!add) throw std::runtime_error("Capture is not attached to this project");
+    catalog.push_back(id);
+  }
+  // Swap only capture sublayers. Replacement layers, ordering, and offsets stay intact.
+  std::vector<std::string> sublayers;
+  std::vector<SdfLayerOffset> offsets;
+  const auto old_offsets = root->GetSubLayerOffsets();
+  bool inserted = false;
+  size_t index = 0;
+  for (const auto& asset : root->GetSubLayerPaths()) {
+    auto resolved = fs::weakly_canonical(fs::path(root->GetRealPath()).parent_path() / std::string(asset));
+    if (paths.count(resolved.generic_string())) {
+      if (!inserted) { sublayers.push_back(id); offsets.emplace_back(); inserted = true; }
+    } else {
+      auto layer = SdfLayer::FindOrOpenRelativeToLayer(root, asset);
+      if (layer) {
+        auto nested = UsdStage::Open(layer);
+        if (nested) for (auto child : nested->GetLayerStack(false))
+          if (is_capture(child)) throw std::runtime_error("Move nested capture sublayers to the workfile before switching captures");
+      }
+      sublayers.push_back(asset); offsets.push_back(old_offsets[index]);
+    }
+    ++index;
+  }
+  if (!inserted) { sublayers.push_back(id); offsets.emplace_back(); }
+  edit_layer(add ? "Add capture" : "Switch capture", root, [&] {
+    auto metadata = root->GetCustomLayerData();
+    metadata[capture_catalog] = VtValue(catalog);
+    root->SetCustomLayerData(metadata);
+    root->SetSubLayerPaths(sublayers);
+    for (size_t i = 0; i < offsets.size(); ++i) root->SetSubLayerOffset(offsets[i], int(i));
+    UsdEditContext context(stage_, root);
+    UsdGeomSetStageUpAxis(stage_, UsdGeomGetStageUpAxis(source));
+    UsdGeomSetStageMetersPerUnit(stage_, UsdGeomGetStageMetersPerUnit(source));
+  });
+  // Newly composed capture layers are baselines, never new authoring to save.
+  for (auto layer : stage_->GetLayerStack(false))
+    if (!saved_layers_.count(layer->GetIdentifier())) saved_layers_[layer->GetIdentifier()] = layer_text(layer);
+}
+
 Json Document::describe() const {
   if (!stage_) return {{"open", false}, {"revision", revision_}};
   Json prims = Json::array(), layers = Json::array(), warnings = Json::array();
@@ -193,7 +281,11 @@ Json Document::describe() const {
       {"selected", layer == edit_layer_}});
   }
   for (const auto& error : stage_->GetCompositionErrors()) warnings.push_back(error->ToString());
+  auto capture_list = captures();
+  std::string active_capture;
+  for (const auto& capture : capture_list) if (capture["active"].get<bool>()) { active_capture = capture["id"]; break; }
   return {{"open", true}, {"path", project_path_.generic_string()}, {"dirty", dirty()},
+    {"captures", capture_list}, {"active_capture", active_capture},
     {"revision", revision_}, {"up_axis", UsdGeomGetStageUpAxis(stage_).GetString()},
     {"meters_per_unit", UsdGeomGetStageMetersPerUnit(stage_)}, {"prims", prims},
     {"layers", layers}, {"warnings", warnings}, {"can_undo", !undo_.empty()}, {"can_redo", !redo_.empty()}};
@@ -253,13 +345,17 @@ Json Document::inspect(const std::string& path) const {
 
 void Document::edit(const std::string& label, const std::function<void()>& operation) {
   require_stage();
-  if (!edit_layer_ || is_capture(edit_layer_)) throw std::runtime_error("Capture layers cannot be edited");
-  const auto before = layer_text(edit_layer_);
+  edit_layer(label, edit_layer_, operation);
+}
+
+void Document::edit_layer(const std::string& label, const SdfLayerHandle& layer, const std::function<void()>& operation) {
+  if (!layer || is_capture(layer) || !layer->PermissionToEdit()) throw std::runtime_error("Layer is read-only");
+  const auto before = layer_text(layer);
   try { operation(); }
-  catch (...) { edit_layer_->ImportFromString(before); throw; }
-  const auto after = layer_text(edit_layer_);
+  catch (...) { layer->ImportFromString(before); throw; }
+  const auto after = layer_text(layer);
   if (before == after) return;
-  undo_.push_back({label, edit_layer_, before, after});
+  undo_.push_back({label, layer, before, after});
   redo_.clear();
   ++revision_;
 }
@@ -478,6 +574,7 @@ void Document::package(const fs::path& directory) {
     auto metadata = snapshot->GetCustomLayerData();
     metadata["lightspeed_layer_type"] = VtValue(std::string("replacement"));
     metadata.erase("omni_layer");
+    metadata.erase(capture_catalog);
     snapshot->SetCustomLayerData(metadata);
     UsdUtilsModifyAssetPaths(snapshot, [&](const std::string& asset) {
       return asset.empty() ? asset : SdfComputeAssetPathRelativeToLayer(root, asset);
@@ -591,6 +688,8 @@ Json Document::dispatch(const Json& request) {
   Json result = Json::object();
   if (op == "open") open(required(request, "path"));
   else if (op == "create") create(required(request, "capture"), required(request, "path"));
+  else if (op == "add_capture") select_capture(required(request, "path"), true);
+  else if (op == "select_capture") select_capture(required(request, "path"), false);
   else if (op == "save") save();
   else if (op == "package") package(required(request, "path"));
   else if (op == "undo") undo();

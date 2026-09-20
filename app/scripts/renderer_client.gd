@@ -1,5 +1,9 @@
 extends Node
 
+const PROTOCOL_VERSION := 2
+const MAX_FRAME_BYTES := 64 * 1024 * 1024
+const MORE_FRAMES := 0x80000000
+
 signal status_changed(message: String)
 signal response_received(response: Dictionary)
 signal texture_ready(texture: Texture2D)
@@ -64,13 +68,23 @@ func send(message: Dictionary) -> void:
 	mutex.lock()
 	next_id += 1
 	message["id"] = next_id
-	message["version"] = 1
+	message["version"] = PROTOCOL_VERSION
 	if message.get("op") in ["scene", "camera"]:
 		for i in range(messages.size() - 1, -1, -1):
 			if messages[i].get("op") == message.op:
 				messages.remove_at(i)
 	messages.append(message)
 	mutex.unlock()
+
+func _read_exact(pipe: FileAccess, length: int) -> PackedByteArray:
+	var bytes := PackedByteArray()
+	while bytes.size() < length:
+		# Pipe reads may return fewer bytes than requested, even in blocking mode.
+		var part := pipe.get_buffer(mini(length - bytes.size(), 64 * 1024))
+		if part.is_empty():
+			break
+		bytes.append_array(part)
+	return bytes
 
 func _exchange_loop(worker_generation: int) -> void:
 	var applied := {"revision": -1, "camera": {}}
@@ -86,19 +100,43 @@ func _exchange_loop(worker_generation: int) -> void:
 			OS.delay_msec(4)
 			continue
 		var payload := JSON.stringify(message).to_utf8_buffer()
-		if payload.size() > 64 * 1024 * 1024:
-			_deliver.call_deferred({"ok": false, "error": "Scene exceeds the renderer message limit."}, worker_generation)
-			continue
-		pipe.store_32(payload.size())
-		pipe.store_buffer(payload)
+		# Frames from a single message stay together, including when UTF-8 code
+		# points cross a boundary. The worker applies only the complete scene.
+		var offset := 0
+		while offset < payload.size():
+			mutex.lock()
+			stop = stopping
+			mutex.unlock()
+			if stop:
+				return
+			var end := mini(offset + MAX_FRAME_BYTES, payload.size())
+			var flags := (end - offset) | (MORE_FRAMES if end < payload.size() else 0)
+			if not pipe.store_32(flags) or not pipe.store_buffer(payload if offset == 0 and end == payload.size() else payload.slice(offset, end)):
+				_deliver.call_deferred({"ok": false, "error": "Renderer disconnected during transfer. Unsaved document edits are retained."}, worker_generation)
+				return
+			offset = end
+		payload.clear()
 		pipe.flush()
-		var length := pipe.get_32()
-		if length <= 0 or length > 64 * 1024 * 1024:
-			_deliver.call_deferred({"ok": false, "error": "Renderer disconnected. Unsaved document edits are retained."}, worker_generation)
-			break
-		var bytes := pipe.get_buffer(length)
+		var bytes := PackedByteArray()
+		while true:
+			var header := _read_exact(pipe, 4)
+			if header.size() != 4:
+				_deliver.call_deferred({"ok": false, "error": "Renderer disconnected. Unsaved document edits are retained."}, worker_generation)
+				return
+			var flags := header.decode_u32(0)
+			var length := flags & ~MORE_FRAMES
+			if length <= 0 or length > MAX_FRAME_BYTES:
+				_deliver.call_deferred({"ok": false, "error": "Renderer disconnected or sent an invalid frame. Unsaved document edits are retained."}, worker_generation)
+				return
+			var chunk := _read_exact(pipe, length)
+			if chunk.size() != length:
+				_deliver.call_deferred({"ok": false, "error": "Renderer response was truncated."}, worker_generation)
+				return
+			bytes.append_array(chunk)
+			if (flags & MORE_FRAMES) == 0:
+				break
 		var decoded = JSON.parse_string(bytes.get_string_from_utf8())
-		if not decoded is Dictionary:
+		if not decoded is Dictionary or decoded.get("version", 0) != PROTOCOL_VERSION:
 			_deliver.call_deferred({"ok": false, "error": "Invalid renderer response."}, worker_generation)
 			break
 		if decoded.get("ok", false):

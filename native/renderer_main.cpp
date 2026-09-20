@@ -218,8 +218,14 @@ private:
         if (v.size() != 8) throw std::runtime_error("Invalid mesh vertex");
         remixapi_HardcodedVertex vertex{};
         for (int i = 0; i < 3; ++i) { vertex.position[i] = v[i].get<float>(); vertex.normal[i] = v[i + 3].get<float>(); }
+        // Some captures contain NaN/Inf UVs, serialized as JSON null. Keep the
+        // mesh renderable with a zero fallback for just the invalid component.
+        for (int i = 0; i < 2; ++i) {
+          const auto uv = v[i + 6].is_null() ? 0.f : v[i + 6].get<float>();
+          vertex.texcoord[i] = std::isfinite(uv) ? uv : 0.f;
+        }
         // Match Remix's USD importer: captures store V flipped from runtime texture coordinates.
-        vertex.texcoord[0] = v[6].get<float>(); vertex.texcoord[1] = 1.f - v[7].get<float>(); vertex.color = 0xffffffff;
+        vertex.texcoord[1] = 1.f - vertex.texcoord[1]; vertex.color = 0xffffffff;
         vertices.back().push_back(vertex);
       }
       for (auto index : indices.back()) if (index >= vertices.back().size()) throw std::runtime_error("Mesh index is out of bounds");

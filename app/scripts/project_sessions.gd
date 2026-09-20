@@ -92,10 +92,25 @@ func read_view(path: String) -> Dictionary:
 	var data := read_json(project_path(path) + ".studio.json")
 	return data if data.get("version") == VERSION else {}
 
-func save_view(path: String, camera: Dictionary, saved_at := 0.0) -> bool:
+func camera_for(path: String, capture := "") -> Variant:
+	var data := read_view(path)
+	if not capture.is_empty():
+		var cameras = data.get("capture_cameras", {})
+		if cameras is Dictionary and cameras.has(capture):
+			return cameras[capture]
+		# A legacy workfile's single camera belongs to its original capture.
+		if data.has("capture_cameras"):
+			return null
+	return data.get("camera")
+
+func save_view(path: String, camera: Dictionary, saved_at := 0.0, capture := "") -> bool:
 	var data := read_view(path)
 	data["version"] = VERSION
 	data["camera"] = camera
+	if not capture.is_empty():
+		if not data.get("capture_cameras") is Dictionary:
+			data["capture_cameras"] = {}
+		data.capture_cameras[capture] = camera
 	if saved_at > 0:
 		data["last_saved"] = saved_at
 	return _write_json(project_path(path) + ".studio.json", data)

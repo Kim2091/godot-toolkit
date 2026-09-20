@@ -25,6 +25,8 @@ var tree: Tree
 var assets: Control
 var inspector: VBoxContainer
 var layer_picker: OptionButton
+var capture_picker: OptionButton
+var add_capture_button: Button
 var status: Label
 var project_label: Label
 var output: RichTextLabel
@@ -151,6 +153,19 @@ func _build_ui() -> void:
 	var left := VBoxContainer.new()
 	left.custom_minimum_size.x = 210
 	workspace.add_child(left)
+	var capture_tools := HBoxContainer.new()
+	left.add_child(capture_tools)
+	_label("CAPTURE", capture_tools, 12).size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	add_capture_button = _button("Add capture", _choose_add_capture, capture_tools)
+	add_capture_button.disabled = true
+	capture_picker = OptionButton.new()
+	capture_picker.fit_to_longest_item = false
+	capture_picker.clip_text = true
+	capture_picker.disabled = true
+	capture_picker.item_selected.connect(func(index: int):
+		if not refreshing:
+			_change_capture(capture_picker.get_item_metadata(index)))
+	left.add_child(capture_picker)
 	_label("SCENE", left)
 	tree = Tree.new()
 	tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -276,18 +291,25 @@ func _command(data: Dictionary) -> void:
 	var previous_revision: int = state.get("revision", -1)
 	var result := _request(data)
 	if result.is_empty():
+		if data.op in ["add_capture", "select_capture"]:
+			_refresh_captures()
 		if data.op in ["set_authoring_property", "reset_authoring_property", "set_light_type", "transform"] and library_selection.is_empty():
 			_select(selection)
 		return
 	if result.has("selection"):
 		selection = result.selection
 	if result.has("document"):
-		if data.op in ["open", "create"]:
+		var capture_changed: bool = result.document.get("active_capture", "") != state.get("active_capture", "")
+		if capture_changed and data.op not in ["open", "create"]:
+			_persist_camera()
+		if data.op in ["open", "create"] or capture_changed:
 			inspector._clear(); inspector.schema_key = ""
 			library_selection = ""; selection = ""; last_scene = {}
 			viewport.set_mouse_capture(false); viewport.rendered_texture = null
 		state = result.document
 		_refresh(state.get("revision", -1) != previous_revision)
+		if capture_changed:
+			_sync_renderer()
 	if data.op in ["open", "create"]:
 		sessions.opened(state.path)
 		_show_editor()
@@ -299,6 +321,7 @@ func _command(data: Dictionary) -> void:
 
 func _refresh(scene_changed := true) -> void:
 	refreshing = true
+	_refresh_captures()
 	project_label.text = String(state.get("path", "No project")).get_file() + (" •" if state.get("dirty", false) else "")
 	tree.clear()
 	var root := tree.create_item()
@@ -332,8 +355,8 @@ func _refresh(scene_changed := true) -> void:
 		restoring_view = first
 		viewport.set_scene(last_scene, false)
 		if first:
-			var saved := sessions.read_view(state.path)
-			if not viewport.restore_view_state(saved.get("camera"), false):
+			var camera = sessions.camera_for(state.path, state.get("active_capture", ""))
+			if not viewport.restore_view_state(camera, false):
 				viewport.reset_view()
 			camera_mode.select(viewport.camera_mode)
 		restoring_view = false
@@ -398,6 +421,32 @@ func _choose_open() -> void:
 
 func _open_project(path: String) -> void:
 	_command({"op": "open", "path": path})
+
+func _refresh_captures() -> void:
+	capture_picker.clear()
+	add_capture_button.disabled = not state.get("open", false)
+	for capture in state.get("captures", []):
+		capture_picker.add_item(capture.name + (" (missing)" if capture.missing else ""))
+		var index := capture_picker.item_count - 1
+		capture_picker.set_item_metadata(index, capture.id)
+		capture_picker.get_popup().set_item_tooltip(index, capture.path)
+		capture_picker.set_item_disabled(index, capture.missing)
+		if capture.active:
+			capture_picker.select(index)
+			capture_picker.tooltip_text = capture.path
+	capture_picker.disabled = capture_picker.item_count == 0
+
+func _choose_add_capture() -> void:
+	if not state.get("open", false):
+		return
+	inspector._finish_editing()
+	await get_tree().process_frame
+	_dialog(FileDialog.FILE_MODE_OPEN_FILE, "Add capture to project", ["*.usd,*.usda,*.usdc ; Remix captures"], func(path: String): _change_capture(path, true))
+
+func _change_capture(path: String, add := false) -> void:
+	inspector._finish_editing()
+	await get_tree().process_frame
+	_command({"op": "add_capture" if add else "select_capture", "path": path})
 
 func _new_capture() -> void:
 	_guard_unsaved(func(): _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select Remix capture", ["*.usd,*.usda,*.usdc ; Remix captures"], func(path: String):
@@ -598,7 +647,7 @@ func _save_from_ui() -> void:
 
 func _persist_camera(saved_at := 0.0) -> bool:
 	if state.get("open", false):
-		return sessions.save_view(state.path, viewport.view_state(), saved_at)
+		return sessions.save_view(state.path, viewport.view_state(), saved_at, state.get("active_capture", ""))
 	return true
 
 func _save_view_and_preview() -> void:

@@ -43,6 +43,9 @@ func _run() -> void:
 	if "--light-below" in OS.get_cmdline_user_args():
 		app._command({"op": "transform", "path": app.selection, "translation": [0, -3, 0]})
 	app.viewport.frame_selection(true)
+	# Captured NaN/Inf UVs become null in JSON and must not abort the scene load.
+	app.last_scene.meshes[0].surfaces[0].vertices[0][6] = null
+	app.last_scene.meshes[0].surfaces[0].vertices[1][7] = null
 	if not restarting:
 		app.last_scene.materials.append({"id": "smoke_emission", "albedo": [1, 0.2, 0.1], "emissive": [1, 0.2, 0.1], "emissive_intensity": 10})
 		for mesh in app.last_scene.meshes:
