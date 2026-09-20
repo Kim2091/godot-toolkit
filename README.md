@@ -33,6 +33,10 @@ To launch the already built app directly:
 
 The capture stays unchanged. Undo/redo operates on the authoring layer, including rollback of failed compound edits. Packaging includes unsaved authored changes, preserves nested replacement layers, excludes the capture sublayer, and refuses to overwrite an existing destination.
 
+Capture texture paths are resolved relative to the USD layer that authored them, including referenced material layers. Windows-style separators are supported when previewing captures on Linux. Missing textures are reported in the editor log; resolving preview paths does not rewrite the capture.
+
+The Remix viewport preserves material filtering and U/V wrap modes. Materials without these settings use Remix's linear filtering and repeat defaults, so terrain and other tiled textures sample correctly outside the 0–1 UV range.
+
 ## Implemented scope
 
 | Area | Support |
@@ -71,6 +75,8 @@ python scripts/bootstrap.py gpu-test
 Native tests cover capture immutability, composition, shared instance edits, transaction rollback, undo/redo, material and mesh replacement, and packaging. Protocol tests cover normal sessions, invalid versions, truncation, oversized messages, and recoverable command errors. The Godot ingestion test checks DDS formats, mipmaps, channel values, glTF ingestion, and material dependency packaging. The GPU test checks visible rendered geometry and worker restart while retaining unsaved edits; it needs an active desktop session and supported GPU. Test screenshots and generated projects are retained under `.work/integration` and `.work/ingestion`.
 
 Layout tests cover nearest-hit picking with transformed instances, shared geometry, cache invalidation, GPU wireframe visibility, selection, resizing, and alignment of the transparent selection overlay with the Remix view.
+
+Texture tests cover referenced layers, Windows-style paths, authoring-layer overrides, missing and cleared assets, material sampling settings, and a four-color DDS texture verifying both UV axes across nine tiles (including negative UVs and UVs above one) in the Remix viewport.
 
 The pinned upstream Remix test suite has independent failures: two referenced Python test files are absent, and its SDL `offscreen` smoke test cannot find a present-capable queue on the tested driver. Its desktop smoke test runs successfully. Our GPU test exercises the patched runtime through the application.
 

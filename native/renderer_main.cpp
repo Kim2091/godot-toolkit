@@ -185,6 +185,9 @@ private:
     info.emissiveIntensity = data.value("emissive_intensity", 0.f);
     info.emissiveColorConstant = vector3(data.value("emissive", Json::array({0, 0, 0})));
     info.spriteSheetRow = 1; info.spriteSheetCol = 1;
+    // Zero-initialized API fields mean nearest/clamp, unlike the MDL defaults.
+    info.filterMode = data.value("filter_mode", 1);
+    info.wrapModeU = data.value("wrap_mode_u", 1); info.wrapModeV = data.value("wrap_mode_v", 1);
     remixapi_MaterialInfoOpaqueEXT opaque{}; opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
     opaque.albedoConstant = vector3(data.value("albedo", Json::array({0.7, 0.7, 0.7})));
     opaque.opacityConstant = data.value("opacity", 1.f); opaque.roughnessConstant = data.value("roughness", 0.5f);
@@ -215,7 +218,8 @@ private:
         if (v.size() != 8) throw std::runtime_error("Invalid mesh vertex");
         remixapi_HardcodedVertex vertex{};
         for (int i = 0; i < 3; ++i) { vertex.position[i] = v[i].get<float>(); vertex.normal[i] = v[i + 3].get<float>(); }
-        vertex.texcoord[0] = v[6].get<float>(); vertex.texcoord[1] = v[7].get<float>(); vertex.color = 0xffffffff;
+        // Match Remix's USD importer: captures store V flipped from runtime texture coordinates.
+        vertex.texcoord[0] = v[6].get<float>(); vertex.texcoord[1] = 1.f - v[7].get<float>(); vertex.color = 0xffffffff;
         vertices.back().push_back(vertex);
       }
       for (auto index : indices.back()) if (index >= vertices.back().size()) throw std::runtime_error("Mesh index is out of bounds");

@@ -187,6 +187,7 @@ def main():
     if args.target == "gpu-test":
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/layout_view_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/gpu_smoke.gd"])
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/capture_textures_smoke.gd"])
     if args.target == "run":
         run([godot_binary(), "--path", ROOT / "app"])
 

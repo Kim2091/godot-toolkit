@@ -6,6 +6,9 @@
 #include <array>
 #include <algorithm>
 #include <pxr/base/gf/vec2f.h>
+#include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/ar/resolverContextBinder.h>
+#include <pxr/usd/sdf/layerUtils.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/mesh.h>
@@ -40,11 +43,51 @@ template<typename T> T attribute(const UsdPrim& prim, const char* name, const T&
   if (attr) attr.Get(&result);
   return result;
 }
-std::string texture(const UsdPrim& shader, const char* name) {
-  auto value = attribute(shader, name, SdfAssetPath());
-  return value.GetResolvedPath().empty() ? value.GetAssetPath() : value.GetResolvedPath();
+int sampler_mode(const UsdPrim& shader, const char* name, int maximum) {
+  // Captures author uints; MDL editors can author ints. Remix defaults to
+  // linear filtering and repeat wrapping (both encoded as 1).
+  if (!shader) return 1;
+  const auto attr = shader.GetAttribute(TfToken(name));
+  VtValue value;
+  if (!attr || !attr.Get(&value)) return 1;
+  if (value.IsHolding<unsigned int>()) {
+    const auto mode = value.Get<unsigned int>();
+    return mode <= unsigned(maximum) ? int(mode) : 1;
+  }
+  if (value.IsHolding<int>()) {
+    const auto mode = value.Get<int>();
+    return mode >= 0 && mode <= maximum ? mode : 1;
+  }
+  return 1;
 }
-Json material_json(const UsdShadeMaterial& material) {
+std::string texture(const UsdPrim& shader, const char* name, Json& warnings) {
+  if (!shader) return {};
+  const auto attr = shader.GetAttribute(TfToken(name));
+  SdfAssetPath value;
+  if (!attr || !attr.Get(&value) || value.GetAssetPath().empty()) return {};
+  if (!value.GetResolvedPath().empty()) return value.GetResolvedPath();
+
+  // Captures made on Windows can contain backslashes even when opened on Linux.
+  // Anchor the normalized identifier at the strongest authored value's layer:
+  // references and sublayers may put it far from the project or capture root.
+  auto normalized = value.GetAssetPath();
+  std::replace(normalized.begin(), normalized.end(), '\\', '/');
+  ArResolverContextBinder context(shader.GetStage()->GetPathResolverContext());
+  std::string anchor;
+  for (const auto& spec : attr.GetPropertyStack(UsdTimeCode::Default())) {
+    if (!spec->HasInfo(SdfFieldKeys->Default)) continue;
+    anchor = spec->GetLayer()->GetIdentifier();
+    auto identifier = SdfComputeAssetPathRelativeToLayer(spec->GetLayer(), normalized);
+    auto resolved = ArGetResolver().Resolve(identifier);
+    if (!resolved.empty()) return resolved.GetPathString();
+    // A missing strong opinion must not silently fall back to a weaker texture.
+    break;
+  }
+  warnings.push_back("Unresolved texture " + attr.GetPath().GetString() + ": " + value.GetAssetPath() +
+    (anchor.empty() ? "" : " (authored in " + anchor + ")"));
+  return {};
+}
+Json material_json(const UsdShadeMaterial& material, Json& warnings) {
   auto connected = material.ComputeSurfaceSource(TfToken("mdl"));
   UsdPrim shader = connected ? connected.GetPrim() : UsdPrim();
   if (!shader) for (auto child : material.GetPrim().GetChildren()) if (child.IsA<UsdShadeShader>()) { shader = child; break; }
@@ -72,11 +115,14 @@ Json material_json(const UsdShadeMaterial& material) {
     {"emissive_intensity", attribute(shader, "inputs:enable_emission", false) ? attribute(shader, "inputs:emissive_intensity", 40.0f) : 0.0f},
     {"ior", attribute(shader, "inputs:ior_constant", 1.3f)},
     {"transmittance", {transmission[0], transmission[1], transmission[2]}},
-    {"albedo_texture", texture(shader, translucent ? "inputs:transmittance_texture" : "inputs:diffuse_texture")},
-    {"normal_texture", texture(shader, "inputs:normalmap_texture")},
-    {"roughness_texture", texture(shader, "inputs:reflectionroughness_texture")},
-    {"metallic_texture", texture(shader, "inputs:metallic_texture")},
-    {"emissive_texture", texture(shader, "inputs:emissive_mask_texture")}
+    {"filter_mode", sampler_mode(shader, "inputs:filter_mode", 1)},
+    {"wrap_mode_u", sampler_mode(shader, "inputs:wrap_mode_u", 3)},
+    {"wrap_mode_v", sampler_mode(shader, "inputs:wrap_mode_v", 3)},
+    {"albedo_texture", texture(shader, translucent ? "inputs:transmittance_texture" : "inputs:diffuse_texture", warnings)},
+    {"normal_texture", texture(shader, "inputs:normalmap_texture", warnings)},
+    {"roughness_texture", texture(shader, "inputs:reflectionroughness_texture", warnings)},
+    {"metallic_texture", texture(shader, "inputs:metallic_texture", warnings)},
+    {"emissive_texture", texture(shader, "inputs:emissive_mask_texture", warnings)}
   };
 }
 int element_index(const TfToken& interpolation, int face, int corner, int vertex) {
@@ -162,7 +208,7 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
           if (std::find(holes.begin(), holes.end(), int(face)) != holes.end()) continue;
           auto material = face_materials.count(face) ? face_materials.at(face) : binding;
           std::string material_id = material ? material.GetPath().GetString() : "default";
-          if (material && materials.insert(material_id).second) result["materials"].push_back(material_json(material));
+          if (material && materials.insert(material_id).second) result["materials"].push_back(material_json(material, result["warnings"]));
           if (!surfaces.count(material_id)) surfaces[material_id] = {{"material", material_id}, {"vertices", Json::array()}, {"indices", Json::array()}};
           auto& surface = surfaces[material_id];
           for (auto triangle : triangulate(points, indices, first, count)) {
@@ -195,7 +241,7 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
         {"radius", attribute(prim, "inputs:radius", 0.5f)}, {"width", attribute(prim, "inputs:width", 1.f)},
         {"height", attribute(prim, "inputs:height", 1.f)}, {"length", attribute(prim, "inputs:length", 1.f)},
         {"angle", attribute(prim, "inputs:angle", 0.53f)}, {"cone_angle", attribute(prim, "inputs:shaping:cone:angle", 180.f)},
-        {"texture", texture(prim, "inputs:texture:file")}});
+        {"texture", texture(prim, "inputs:texture:file", result["warnings"])}});
     } else if (auto camera = UsdGeomCamera(prim)) {
       result["cameras"].push_back({{"id", path}, {"transform", matrix_json(world)},
         {"focal_length", attribute(prim, "focalLength", 50.f)}, {"horizontal_aperture", attribute(prim, "horizontalAperture", 20.955f)}});
