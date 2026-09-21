@@ -1,4 +1,5 @@
 #include "document.h"
+#include "alpha_state.h"
 
 #include <cmath>
 #include <map>
@@ -61,6 +62,35 @@ int sampler_mode(const UsdPrim& shader, const char* name, int maximum) {
   }
   return 1;
 }
+double number_attribute(const UsdPrim& prim, const char* name, double fallback, double maximum) {
+  VtValue value;
+  const auto attr = prim ? prim.GetAttribute(TfToken(name)) : UsdAttribute();
+  if (!attr || !attr.Get(&value)) return fallback;
+  const auto converted = VtValue::Cast<double>(value);
+  if (!converted.IsHolding<double>()) return fallback;
+  const auto number = converted.Get<double>();
+  return std::isfinite(number) && number >= 0 && number <= maximum ? number : fallback;
+}
+Json capture_alpha(const UsdPrim& prim) {
+  auto result = capture_alpha_defaults();
+  for (auto it = result.begin(); it != result.end(); ++it) {
+    const auto name = "primvars:_remix_metadata:" + it.key();
+    if (it.value().is_boolean()) it.value() = attribute(prim, name.c_str(), it.value().get<bool>());
+    else {
+      const auto key = it.key();
+      const double maximum = key == "tFactor" ? double(UINT32_MAX) : key == "alphaTestReferenceValue" ? 255 :
+        key == "alphaTestCompareOp" || key.find("Operation") != std::string::npos ? 7 :
+        key.find("Source") != std::string::npos ? 3 : key.find("BlendOp") != std::string::npos ? 4 : key == "writeMask" ? 15 : 18;
+      it.value() = uint32_t(number_attribute(prim, name.c_str(), it.value().get<double>(), maximum));
+    }
+  }
+  return result;
+}
+uint32_t packed_color(const GfVec3f& color, float alpha) {
+  auto byte = [](float value) { return uint32_t(std::lround(std::clamp(std::isfinite(value) ? value : 1.f, 0.f, 1.f) * 255.f)); };
+  // HardcodedVertex's color is VK_FORMAT_B8G8R8A8_UNORM.
+  return byte(color[2]) | (byte(color[1]) << 8) | (byte(color[0]) << 16) | (byte(alpha) << 24);
+}
 std::string texture(const UsdPrim& shader, const char* name, Json& warnings) {
   if (!shader) return {};
   const auto attr = shader.GetAttribute(TfToken(name));
@@ -97,12 +127,6 @@ Json material_json(const UsdShadeMaterial& material, Json& warnings) {
   auto transmission = attribute(shader, "inputs:transmittance_color", GfVec3f(1.0f));
   auto source = attribute(shader, "info:mdl:sourceAsset", SdfAssetPath()).GetAssetPath();
   const bool translucent = source.find("Translucent") != std::string::npos;
-  VtValue alpha_reference;
-  if (shader) {
-    const auto attr = shader.GetAttribute(TfToken("inputs:alpha_test_reference_value"));
-    if (attr) attr.Get(&alpha_reference);
-  }
-  const auto alpha = VtValue::Cast<float>(alpha_reference);
   return {
     {"id", material.GetPath().GetString()},
     {"kind", translucent ? "translucent" : "opaque"},
@@ -110,8 +134,12 @@ Json material_json(const UsdShadeMaterial& material, Json& warnings) {
     {"roughness", attribute(shader, "inputs:reflection_roughness_constant", 0.5f)},
     {"metallic", attribute(shader, "inputs:metallic_constant", 0.0f)},
     {"opacity", attribute(shader, "inputs:opacity_constant", 1.0f)},
-    {"alpha_test", attribute(shader, "inputs:alpha_test_type", 7)},
-    {"alpha_reference", alpha.IsHolding<float>() ? int(std::clamp(alpha.Get<float>(), 0.f, 255.f)) : 0},
+    {"use_legacy_alpha", attribute(shader, "inputs:use_legacy_alpha_state", true)},
+    {"blend_enabled", attribute(shader, "inputs:blend_enabled", false)},
+    {"blend_type", int(number_attribute(shader, "inputs:blend_type", 0, 10))},
+    {"inverted_blend", attribute(shader, "inputs:inverted_blend", false)},
+    {"alpha_test", int(number_attribute(shader, "inputs:alpha_test_type", 7, 7))},
+    {"alpha_reference", int(number_attribute(shader, "inputs:alpha_test_reference_value", 0, 255))},
     {"emissive", {emission[0], emission[1], emission[2]}},
     {"emissive_intensity", attribute(shader, "inputs:enable_emission", false) ? attribute(shader, "inputs:emissive_intensity", 40.0f) : 0.0f},
     {"ior", attribute(shader, "inputs:ior_constant", 1.3f)},
@@ -235,6 +263,11 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
         VtVec2fArray uv;
         auto st = UsdGeomPrimvarsAPI(mesh).GetPrimvar(TfToken("st"));
         if (st) st.ComputeFlattened(&uv);
+        const auto color_primvar = UsdGeomPrimvarsAPI(mesh).FindPrimvarWithInheritance(TfToken("displayColor"));
+        const auto opacity_primvar = UsdGeomPrimvarsAPI(mesh).FindPrimvarWithInheritance(TfToken("displayOpacity"));
+        VtVec3fArray colors; VtFloatArray opacities;
+        if (color_primvar) color_primvar.ComputeFlattened(&colors);
+        if (opacity_primvar) opacity_primvar.ComputeFlattened(&opacities);
         auto binding = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
         std::map<int, UsdShadeMaterial> face_materials;
         for (auto subset : UsdGeomSubset::GetGeomSubsets(mesh, UsdGeomTokens->face, TfToken("materialBind"))) {
@@ -266,13 +299,23 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
               if (u >= 0 && size_t(u) < uv.size()) texcoord = uv[u];
               surface["indices"].push_back(surface["vertices"].size());
               surface["vertices"].push_back({point[0], point[1], point[2], normal[0], normal[1], normal[2], texcoord[0], texcoord[1]});
+              if (!colors.empty() || !opacities.empty()) {
+                auto color = GfVec3f(1); float opacity = 1;
+                const int ci = color_primvar ? element_index(color_primvar.GetInterpolation(), face, c, vertex) : -1;
+                const int ai = opacity_primvar ? element_index(opacity_primvar.GetInterpolation(), face, c, vertex) : -1;
+                if (ci >= 0 && size_t(ci) < colors.size()) color = colors[ci];
+                if (ai >= 0 && size_t(ai) < opacities.size()) opacity = opacities[ai];
+                surface["colors"].push_back(packed_color(color, opacity));
+              }
             }
           }
         }
         Json parts = Json::array();
         for (auto& entry : surfaces) parts.push_back(std::move(entry.second));
         result["meshes"].push_back({{"id", path}, {"source_path", source_path(prim)}, {"transform", matrix_json(world)}, {"surfaces", parts},
-          {"double_sided", attribute(prim, "doubleSided", false)}});
+          {"double_sided", attribute(prim, "doubleSided", false)}, {"alpha_state", capture_alpha(prim)},
+          {"ignore_alpha", attribute(prim, "remix_category:ignore_alpha_channel", false)},
+          {"alpha_blend_to_cutout", attribute(prim, "remix_category:alpha_blend_to_cutout", false)}});
       } catch (const std::exception& error) { result["warnings"].push_back(path + ": " + error.what()); }
     } else if (auto light = UsdLuxLightAPI(prim)) {
       result["lights"].push_back(light_json(prim, world, result["warnings"]));

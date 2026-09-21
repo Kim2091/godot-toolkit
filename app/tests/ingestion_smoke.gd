@@ -96,6 +96,15 @@ func _run() -> void:
 		request({"op": "add_mesh", "path": "/RootNode/instances/inst_0123456789ABCDEF_0", "asset": mesh.asset})
 		var composed := request({"op": "scene"})
 		check(composed.materials.any(func(value: Dictionary): return value.alpha_test == 6 and value.alpha_reference == 102), "glTF cutout threshold must reach the renderer")
+		gltf.materials[0].alphaMode = "BLEND"
+		file = FileAccess.open(source.path_join("blend.gltf"), FileAccess.WRITE)
+		file.store_string(JSON.stringify(gltf)); file.close()
+		var blended := await ingest({"source": source.path_join("blend.gltf"), "mdl_directory": root_path.path_join("app/materials")})
+		if blended.has("asset"):
+			request({"op": "add_mesh", "asset": blended.asset})
+			composed = request({"op": "scene"})
+			check(composed.materials.any(func(value: Dictionary): return value.blend_enabled and not value.use_legacy_alpha and value.blend_type == 0 and value.alpha_test == 7), "glTF BLEND must author explicit alpha blending")
+			check(blended.get("warnings", []).is_empty(), "glTF BLEND should no longer report unsupported transparency")
 		request({"op": "package", "path": directory.path_join("package")})
 		check(FileAccess.file_exists(directory.path_join("package/mod.usda")), "Material dependencies did not package")
 	print("Ingestion workflow: " + str(failures) + " failures; artifacts: " + directory)

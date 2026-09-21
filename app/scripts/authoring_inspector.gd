@@ -252,6 +252,7 @@ func _field(field: Dictionary, parent: Node) -> void:
 	if widget.get_parent() == null:
 		parent.add_child(widget)
 	widget.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	if field.has("tooltip"): widget.tooltip_text = field.tooltip
 	if field.property == "inputs:radius":
 		widget.tooltip_text = "Physical emitter radius in scene units, not illumination range. Keep the emitter outside surrounding geometry."
 	controls[id] = {"widget": widget, "reset": reset, "request": command}
@@ -264,6 +265,7 @@ func _update_field(field: Dictionary, field_values: Dictionary) -> void:
 	var widget: Control = controls[id].widget
 	controls[id].reset.disabled = not field.get("overridden", false) or not field.get("editable", true)
 	var enabled: bool = field.get("editable", true) and (not field.has("enabled_by") or bool(field_values.get(field.path + "|" + field.enabled_by, false)))
+	enabled = enabled and (not field.has("disabled_by") or not bool(field_values.get(field.path + "|" + field.disabled_by, false)))
 	widget.set_block_signals(true)
 	if widget is SpinBox:
 		widget.editable = enabled

@@ -1,0 +1,24 @@
+diff --git a/src/dxvk/rtx_render/rtx_instance_manager.cpp b/src/dxvk/rtx_render/rtx_instance_manager.cpp
+index cd28edaf..719eedf8 100644
+--- a/src/dxvk/rtx_render/rtx_instance_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_instance_manager.cpp
+@@ -1048,6 +1048,9 @@ namespace dxvk {
+     const RtSurface::AlphaState alphaState = calculateAlphaState(drawCall, *materialData);
+     bool hasTransformChanged = false;
+     bool hasPreviousPositions = false;
++    // Per-instance overrides redirect materialData to this storage. Keep it
++    // alive through preserveInstance(), whose listeners create the RT material.
++    MaterialData tmpMaterialData;
+ 
+     if (!isFirstUpdateThisFrame) {
+       // This is probably the same instance, being drawn twice!  Merge it
+@@ -1119,9 +1122,6 @@ namespace dxvk {
+         currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
+         currentInstance.surface.objectPickingValue = drawCall.drawCallID;
+ 
+-        // Temp storage for the case we need to patch the material data
+-        MaterialData tmpMaterialData;
+-
+         if (materialData->getType() == MaterialDataType::Opaque)
+         {
+           const bool useLegacyAlphaState = materialData->getOpaqueMaterialData().getUseLegacyAlphaState();

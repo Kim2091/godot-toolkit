@@ -1,6 +1,7 @@
 #include "channel.h"
 #include "shared_frame.h"
 #include "render_settings.h"
+#include "alpha_state.h"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -30,6 +31,25 @@ uint64_t hash64(const std::string& value) {
   return h ? h : 1;
 }
 remixapi_Float3D vector3(const Json& v) { return {v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()}; }
+remixapi_InstanceInfoBlendEXT blend_state(const Json& values) {
+  auto data = editor::capture_alpha_defaults(); data.update(values);
+  remixapi_InstanceInfoBlendEXT state{}; state.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+  state.alphaTestEnabled = data.at("alphaTestEnabled").get<bool>();
+  state.alphaTestReferenceValue = data.at("alphaTestReferenceValue").get<uint8_t>();
+  state.alphaTestCompareOp = state.alphaTestEnabled ? data.at("alphaTestCompareOp").get<uint32_t>() : 7u;
+  state.alphaBlendEnabled = data.at("alphaBlendEnabled").get<bool>();
+  state.srcColorBlendFactor = data.at("srcColorBlendFactor"); state.dstColorBlendFactor = data.at("dstColorBlendFactor");
+  state.colorBlendOp = data.at("colorBlendOp");
+  state.srcAlphaBlendFactor = data.at("srcAlphaBlendFactor"); state.dstAlphaBlendFactor = data.at("dstAlphaBlendFactor");
+  state.alphaBlendOp = data.at("alphaBlendOp"); state.writeMask = data.at("writeMask");
+  state.textureColorArg1Source = data.at("textureColorArg1Source"); state.textureColorArg2Source = data.at("textureColorArg2Source");
+  state.textureColorOperation = data.at("textureColorOperation");
+  state.textureAlphaArg1Source = data.at("textureAlphaArg1Source"); state.textureAlphaArg2Source = data.at("textureAlphaArg2Source");
+  state.textureAlphaOperation = data.at("textureAlphaOperation"); state.tFactor = data.at("tFactor");
+  state.isTextureFactorBlend = data.at("isTextureFactorBlend").get<bool>();
+  state.isVertexColorBakedLighting = data.at("isVertexColorBakedLighting").get<bool>();
+  return state;
+}
 remixapi_Transform transform(const Json& values) {
   if (values.size() != 16) throw std::runtime_error("Expected 16 transform elements");
   remixapi_Transform result{};
@@ -129,6 +149,10 @@ public:
     // The pinned native fork's RTXDI path gives black analytical lighting in the
     // embedded viewport. Its RIS path is covered by our rendered-image test.
     checked(api_.SetConfigVariable("rtx.useRTXDI", "False"), "Select preview light sampling");
+    // Preserve the automatic preset's settings, but let the editor override
+    // them. Otherwise the Quality layer outranks SetConfigVariable's User
+    // layer (the native Low preset disables stochastic alpha blending).
+    checked(api_.SetConfigVariable("rtx.graphicsPreset", "4"), "Select custom viewport settings");
     api_.SetUIState(REMIXAPI_UI_STATE_NONE);
     camera_ = {{"position", {0, 2, 5}}, {"forward", {0, 0, -1}}, {"up", {0, 1, 0}}, {"right", {1, 0, 0}}, {"fov", 60.0}};
     Json result{{"status", "ready"}, {"presentation", shared_ ? "shared_vulkan" : "native_window"}, {"width", width_}, {"height", height_},
@@ -140,7 +164,7 @@ public:
     for (auto mesh : meshes_) api_.DestroyMesh(mesh);
     for (auto light : lights_) api_.DestroyLight(light);
     for (const auto& material : materials_) api_.DestroyMaterial(material.second);
-    meshes_.clear(); lights_.clear(); materials_.clear(); instances_.clear();
+    meshes_.clear(); lights_.clear(); materials_.clear(); instances_.clear(); blend_states_.clear();
     mesh_cache_.clear(); instance_origins_.clear(); light_origins_.clear(); previewed_lights_.clear();
   }
   void scene(const Json& scene) {
@@ -227,7 +251,8 @@ public:
     require_running();
     const auto effective = studio::RenderSettings::parse(data).effective(dlss_, ray_reconstruction_, nis_);
     if (effective.width != width_ || effective.height != height_) throw std::runtime_error("Changing viewport resolution requires restarting the renderer");
-    settings(effective.variables());
+    render_variables_ = effective.variables();
+    settings(render_variables_);
     return effective.json();
   }
   Json frame() {
@@ -253,10 +278,21 @@ public:
     remixapi_CameraInfo camera{};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO; camera.pNext = &parameters; camera.type = REMIXAPI_CAMERA_TYPE_WORLD;
     checked(api_.SetupCamera(&camera), "SetupCamera");
-    for (const auto& instance : instances_) checked(api_.DrawInstance(&instance), "DrawInstance");
+    for (size_t i = 0; i < instances_.size(); ++i) {
+      // Attach only for the call: vector growth and transform previews must not
+      // leave stored pNext pointers referring to moved or expired extensions.
+      auto instance = instances_[i]; instance.pNext = &blend_states_[i];
+      checked(api_.DrawInstance(&instance), "DrawInstance");
+    }
     for (auto light : lights_) checked(api_.DrawLightInstance(light), "DrawLightInstance");
     remixapi_PresentInfo present{}; present.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
     checked(api_.Present(&present), "Present");
+    if (frame_ == 0) {
+      // Switching to Custom migrates Quality values over User values at the
+      // first frame boundary. Reapply the editor's settings after migration.
+      settings(render_variables_);
+      checked(api_.SetConfigVariable("rtx.enableStochasticAlphaBlend", "True"), "Enable alpha blending in the viewport");
+    }
     return {{"status", "presented"}, {"revision", revision_}, {"frame", ++frame_}};
   }
 private:
@@ -281,6 +317,10 @@ private:
     opaque.opacityConstant = data.value("opacity", 1.f); opaque.roughnessConstant = data.value("roughness", 0.5f);
     opaque.metallicConstant = data.value("metallic", 0.f); opaque.roughnessTexture = roughness.c_str(); opaque.metallicTexture = metal.c_str();
     opaque.alphaTestType = data.value("alpha_test", 7); opaque.alphaReferenceValue = data.value("alpha_reference", 128);
+    opaque.useDrawCallAlphaState = data.value("use_legacy_alpha", true);
+    opaque.blendType_hasvalue = data.value("blend_enabled", false);
+    opaque.blendType_value = data.value("blend_type", 0);
+    opaque.invertedBlend = data.value("inverted_blend", false);
     remixapi_MaterialInfoTranslucentEXT glass{}; glass.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
     glass.refractiveIndex = data.value("ior", 1.5f);
     glass.transmittanceTexture = albedo.c_str();
@@ -302,6 +342,8 @@ private:
     std::vector<remixapi_MeshInfoSurfaceTriangles> surfaces;
     for (const auto& surface : data.at("surfaces")) {
       vertices.emplace_back(); indices.push_back(surface.at("indices").get<std::vector<uint32_t>>());
+      const auto colors = surface.value("colors", Json::array());
+      if (!colors.empty() && colors.size() != surface.at("vertices").size()) throw std::runtime_error("Invalid mesh vertex colors");
       for (const auto& v : surface.at("vertices")) {
         if (v.size() != 8) throw std::runtime_error("Invalid mesh vertex");
         remixapi_HardcodedVertex vertex{};
@@ -313,7 +355,8 @@ private:
           vertex.texcoord[i] = std::isfinite(uv) ? uv : 0.f;
         }
         // Match Remix's USD importer: captures store V flipped from runtime texture coordinates.
-        vertex.texcoord[1] = 1.f - vertex.texcoord[1]; vertex.color = 0xffffffff;
+        vertex.texcoord[1] = 1.f - vertex.texcoord[1];
+        vertex.color = colors.empty() ? 0xffffffffu : colors.at(vertices.back().size()).get<uint32_t>();
         vertices.back().push_back(vertex);
       }
       for (auto index : indices.back()) if (index >= vertices.back().size()) throw std::runtime_error("Mesh index is out of bounds");
@@ -336,7 +379,10 @@ private:
   void add_instance(const Json& data, remixapi_MeshHandle handle) {
     remixapi_InstanceInfo instance{}; instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
     instance.mesh = handle; instance.transform = transform(data.at("transform")); instance.doubleSided = data.value("double_sided", false);
+    if (data.value("ignore_alpha", false)) instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL;
+    if (data.value("alpha_blend_to_cutout", false)) instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT;
     instances_.push_back(instance);
+    blend_states_.push_back(blend_state(data.value("alpha_state", Json::object())));
     instance_origins_.emplace_back(data.at("id").get<std::string>(), instance.transform);
   }
   void add_light(const Json& data) {
@@ -392,10 +438,12 @@ private:
   uint32_t width_ = 1280, height_ = 720;
   uint64_t revision_ = 0, geometry_revision_ = 0, frame_ = 0;
   Json camera_;
+  Json render_variables_ = Json::object();
   std::map<std::string, remixapi_MaterialHandle> materials_;
   std::vector<remixapi_MeshHandle> meshes_;
   std::map<uint64_t, remixapi_MeshHandle> mesh_cache_;
   std::vector<remixapi_InstanceInfo> instances_;
+  std::vector<remixapi_InstanceInfoBlendEXT> blend_states_;
   std::vector<std::pair<std::string, remixapi_Transform>> instance_origins_;
   std::vector<remixapi_LightHandle> lights_;
   std::vector<Json> light_origins_;

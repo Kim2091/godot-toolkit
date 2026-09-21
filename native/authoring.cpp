@@ -59,7 +59,12 @@ Json fields_for(const UsdPrim& selected) {
     auto& visibility = add("visibility", "Visibility", "Object", "token", "inherited");
     choices(visibility, {"inherited", "invisible"}, {"Visible", "Hidden"});
   }
-  if (UsdGeomMesh(selected)) add("doubleSided", "Double-sided", "Object", "bool", false, 0, 1, "bool");
+  if (UsdGeomMesh(selected)) {
+    add("doubleSided", "Double-sided", "Object", "bool", false, 0, 1, "bool");
+    add("remix_category:ignore_alpha_channel", "Ignore alpha channel", "Opacity", "bool", false, 0, 1, "bool");
+    add("remix_category:alpha_blend_to_cutout", "Force cutout", "Opacity", "bool", false, 0, 1, "bool")
+      ["tooltip"] = "Render blended surfaces as cutouts using Remix's global cutout threshold.";
+  }
   if (UsdLuxLightAPI(selected)) {
     add("inputs:color", "Color", "Light", "color3f", {1, 1, 1}, 0, 1, "color");
     add("inputs:intensity", "Radiance", "Light", "float", 1.f);
@@ -98,10 +103,21 @@ Json fields_for(const UsdPrim& selected) {
     add("inputs:reflectionroughness_texture", "Roughness texture", "Surface", "asset", "", 0, 1, "texture");
     add("inputs:metallic_constant", "Metallic", "Surface", "float", 0.f, 0, 1);
     add("inputs:metallic_texture", "Metallic texture", "Surface", "asset", "", 0, 1, "texture");
-    add("inputs:opacity_constant", "Opacity", "Opacity", "float", 1.f, 0, 1);
+    add("inputs:opacity_constant", "Opacity", "Opacity", "float", 1.f, 0, 1)
+      ["tooltip"] = "Opacity used when no base color texture is assigned. Textured materials use the texture's alpha channel.";
+    add("inputs:use_legacy_alpha_state", "Use captured alpha state", "Opacity", "bool", true, 0, 1, "bool")
+      ["tooltip"] = "Use each captured instance's alpha test and blend settings. Disable to override them with this material.";
+    add("inputs:blend_enabled", "Enable blending", "Opacity", "bool", false, 0, 1, "bool")["disabled_by"] = "inputs:use_legacy_alpha_state";
+    auto& blend = add("inputs:blend_type", "Blend mode", "Opacity", "int", 0);
+    choices(blend, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+      {"Alpha", "Alpha + emissive", "Reverse alpha + emissive", "Color", "Color + emissive", "Reverse color + emissive", "Additive", "Multiply", "Double multiply", "Reverse alpha", "Reverse color"});
+    blend["enabled_by"] = "inputs:blend_enabled"; blend["disabled_by"] = "inputs:use_legacy_alpha_state";
+    auto& inverted = add("inputs:inverted_blend", "Invert blend", "Opacity", "bool", false, 0, 1, "bool");
+    inverted["enabled_by"] = "inputs:blend_enabled"; inverted["disabled_by"] = "inputs:use_legacy_alpha_state";
     auto& cutout = add("inputs:alpha_test_type", "Alpha test", "Opacity", "int", 7);
-    choices(cutout, {0, 1, 2, 3, 4, 5, 6, 7}, {"Never", "Less", "Equal", "Less or equal", "Greater", "Not equal", "Greater or equal (cutout)", "Always (opaque)"});
-    add("inputs:alpha_test_reference_value", "Cutout threshold", "Opacity", "float", 0.f, 0, 255);
+    choices(cutout, {0, 1, 2, 3, 4, 5, 6, 7}, {"Never", "Less", "Equal", "Less or equal", "Greater", "Not equal", "Greater or equal (cutout)", "Always (no cutout)"});
+    cutout["disabled_by"] = "inputs:use_legacy_alpha_state";
+    add("inputs:alpha_test_reference_value", "Cutout threshold (0–255)", "Opacity", "float", 0.f, 0, 255)["disabled_by"] = "inputs:use_legacy_alpha_state";
   }
   add("inputs:normalmap_texture", "Normal texture", "Normal", "asset", "", 0, 1, "texture");
   add("inputs:enable_emission", "Enable emission", "Emission", "bool", false, 0, 1, "bool");

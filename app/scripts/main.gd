@@ -9,6 +9,11 @@ const WelcomeScreen = preload("res://scripts/welcome_screen.gd")
 const StudioTheme = preload("res://scripts/studio_theme.gd")
 const RenderSettings = preload("res://scripts/render_settings.gd")
 const RenderSettingsDialog = preload("res://scripts/render_settings_dialog.gd")
+const GameLink = preload("res://scripts/game_link.gd")
+const GameLinkDialog = preload("res://scripts/game_link_dialog.gd")
+var game_link := GameLink.new()
+var game_link_button: Button
+var game_link_dialog: AcceptDialog
 var sessions := ProjectSessions.new()
 var render_settings := RenderSettings.new()
 var render_settings_dialog: ConfirmationDialog
@@ -54,6 +59,10 @@ func _ready() -> void:
 	theme = StudioTheme.create()
 	_update_dpi()
 	_build_ui()
+	game_link.document = document
+	game_link.warning.connect(_log)
+	game_link.status_changed.connect(_refresh_game_link)
+	add_child(game_link)
 	sessions.warning.connect(_log)
 	sessions.load_history()
 	render_settings.warning.connect(_log)
@@ -131,6 +140,8 @@ func _build_ui() -> void:
 	_button("Package mod", _choose_package, header)
 	var toolbar := HFlowContainer.new()
 	column.add_child(toolbar)
+	game_link_button = _button("Link to game…", _show_game_link, toolbar)
+	game_link_button.disabled = true
 	_button("Undo", func(): _command({"op": "undo"}), toolbar)
 	_button("Redo", func(): _command({"op": "redo"}), toolbar)
 	_button("Ingest asset", _choose_ingest, toolbar)
@@ -304,6 +315,7 @@ func _command(data: Dictionary) -> void:
 		return
 	if data.op in ["open", "create"]:
 		_persist_camera()
+		game_link.flush()
 	var previous_revision: int = state.get("revision", -1)
 	var result := _request(data)
 	if result.is_empty():
@@ -327,9 +339,14 @@ func _command(data: Dictionary) -> void:
 		if capture_changed:
 			_sync_renderer()
 	if data.op in ["open", "create"]:
+		if is_instance_valid(game_link_dialog): game_link_dialog.queue_free()
+		game_link.open_project()
 		sessions.opened(state.path)
 		_show_editor()
+	elif state.get("revision", -1) != previous_revision:
+		game_link.changed()
 	if data.op == "save":
+		if game_link.state.get("linked", false): game_link.sync_now()
 		_log("Project saved.")
 		_save_view_and_preview()
 	elif data.op == "package":
@@ -442,14 +459,14 @@ func _place_selection_at_cursor() -> void:
 func _translate(delta: Vector3) -> void:
 	_command({"op": "transform", "path": selection, "world_delta": [delta.x, delta.y, delta.z]})
 
-func _dialog(mode: FileDialog.FileMode, title: String, filters: PackedStringArray, callback: Callable) -> FileDialog:
+func _dialog(mode: FileDialog.FileMode, title: String, filters: PackedStringArray, callback: Callable, dialog_parent: Node = null) -> FileDialog:
 	var dialog := FileDialog.new()
 	dialog.access = FileDialog.ACCESS_FILESYSTEM
 	dialog.file_mode = mode
 	dialog.title = title
 	dialog.filters = filters
 	dialog.use_native_dialog = false
-	add_child(dialog)
+	(dialog_parent if dialog_parent != null else self).add_child(dialog)
 	if mode == FileDialog.FILE_MODE_OPEN_DIR:
 		dialog.dir_selected.connect(func(path: String): dialog.queue_free(); callback.call_deferred(path))
 	else:
@@ -515,6 +532,28 @@ func _new_capture() -> void:
 func _choose_package() -> void:
 	_dialog(FileDialog.FILE_MODE_OPEN_DIR, "Select parent folder for packaged mod", [], func(path: String):
 		_command({"op": "package", "path": path.path_join("remix_mod_" + str(Time.get_unix_time_from_system()).replace(".", "_"))}))
+
+func _refresh_game_link() -> void:
+	game_link_button.disabled = not state.get("open", false)
+	game_link_button.text = "Game link !" if not game_link.error.is_empty() else ("Game linked" if game_link.state.get("linked", false) else "Link to game…")
+	game_link_button.tooltip_text = game_link.error if not game_link.error.is_empty() else game_link.state.get("target", "Publish edits automatically to a game's rtx-remix/mods folder")
+
+func _show_game_link() -> void:
+	if not state.get("open", false): return
+	inspector._finish_editing()
+	await get_tree().process_frame
+	viewport.set_mouse_capture(false)
+	if is_instance_valid(game_link_dialog): game_link_dialog.queue_free()
+	game_link_dialog = GameLinkDialog.new()
+	game_link_dialog.link = game_link
+	game_link_dialog.mod_name.text = String(state.path).get_file().get_basename().validate_filename()
+	var dialog := game_link_dialog
+	dialog.browse_requested.connect(func():
+		var choose := func(path: String):
+			if is_instance_valid(dialog): dialog.folder.text = path
+		_dialog(FileDialog.FILE_MODE_OPEN_DIR, "Select game folder or rtx-remix/mods", [], choose, dialog))
+	add_child(dialog)
+	dialog.popup_centered()
 
 func _choose_ingest() -> void:
 	if not state.get("open", false) or import_running:
@@ -781,6 +820,7 @@ func _complete_preview(path: String, saved_at: float, serial: int, image: Image,
 
 func _prepare_close() -> void:
 	_persist_camera()
+	game_link.flush()
 	var deadline := Time.get_ticks_msec() + 2000
 	while preview_jobs > 0 and Time.get_ticks_msec() < deadline:
 		await get_tree().process_frame

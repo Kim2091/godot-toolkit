@@ -144,6 +144,7 @@ def remix(jobs):
     if WINDOWS:
         raise RuntimeError("Build the Windows Remix runtime with its upstream build instructions; the shared-frame runtime patch currently targets Linux")
     patch(source, "remix-editor-frame.patch")
+    patch(source, "remix-material-lifetime.patch")
     shutil.copyfile(ROOT / "native/shared_frame.h", source / "src/linux/editor_shared_frame.h")
     sdk = DEPS / "remix-sdk"
     run(["bash", source / "scripts-linux/build-dependencies.sh", sdk])
@@ -213,8 +214,10 @@ def main():
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/project_sessions_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/renderer_transport_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/render_settings_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/game_link_test.gd"])
     if args.target == "gpu-test":
         stage_remix_features()
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/alpha_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/render_settings_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/keyboard_transform_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/light_guides_smoke.gd"])

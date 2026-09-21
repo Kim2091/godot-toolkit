@@ -4,7 +4,7 @@ signal preview_ready(id: String, texture: Texture2D, kind: String)
 signal failed(id: String, message: String)
 signal identified(id: String, kind: String)
 
-const VERSION := 2
+const VERSION := 3
 var provider: Object
 var directory := ""
 var generation := 0
@@ -181,6 +181,7 @@ func _color(values: Array) -> Color:
 
 func _material(data: Dictionary) -> StandardMaterial3D:
 	var material := StandardMaterial3D.new()
+	material.set_meta("source", data)
 	material.albedo_color = _color(data.get("albedo", [0.7, 0.7, 0.7]))
 	material.albedo_texture = _texture(data.get("albedo_texture", ""))
 	if material.albedo_texture != null:
@@ -210,13 +211,26 @@ func _material(data: Dictionary) -> StandardMaterial3D:
 		material.albedo_color.a = 0.45
 		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		material.roughness = 0.1
-	elif data.get("alpha_test", 7) != 7:
-		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
-		material.alpha_scissor_threshold = data.get("alpha_reference", 128.0) / 255.0
-	elif data.get("opacity", 1.0) < 1.0:
-		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		material.albedo_color.a = data.opacity
+	else:
+		_apply_alpha(material, data)
 	return material
+
+func _apply_alpha(material: StandardMaterial3D, data: Dictionary, captured: Dictionary = {}) -> void:
+	var legacy: bool = data.get("use_legacy_alpha", true)
+	var test: int = int(captured.get("alphaTestCompareOp", 7)) if legacy and captured.get("alphaTestEnabled", false) else 7
+	var reference: float = float(captured.get("alphaTestReferenceValue", 0))
+	var blend: bool = captured.get("alphaBlendEnabled", false) if legacy else data.get("blend_enabled", false)
+	if not legacy:
+		test = int(data.get("alpha_test", 7)); reference = float(data.get("alpha_reference", 0))
+	material.albedo_color.a = 1.0 if material.albedo_texture != null else data.get("opacity", 1.0)
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA if blend else BaseMaterial3D.TRANSPARENCY_DISABLED
+	# Thumbnail shading approximates Remix; these are its common cutout modes.
+	if test in [4, 6]:
+		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+		material.alpha_scissor_threshold = maxf(reference / 255.0, 0.001)
+	if blend and not legacy:
+		if data.get("blend_type", 0) == 6: material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+		elif data.get("blend_type", 0) == 7: material.blend_mode = BaseMaterial3D.BLEND_MODE_MUL
 
 func _mesh(data: Dictionary, materials: Dictionary) -> MeshInstance3D:
 	var instance := MeshInstance3D.new()
@@ -238,8 +252,18 @@ func _mesh(data: Dictionary, materials: Dictionary) -> MeshInstance3D:
 		arrays.resize(Mesh.ARRAY_MAX)
 		arrays[Mesh.ARRAY_VERTEX] = points; arrays[Mesh.ARRAY_NORMAL] = normals
 		arrays[Mesh.ARRAY_TEX_UV] = uv; arrays[Mesh.ARRAY_INDEX] = indices
+		if surface.has("colors"):
+			var colors := PackedColorArray()
+			for packed in surface.colors:
+				var bits := int(packed)
+				colors.append(Color(float((bits >> 16) & 255) / 255.0, float((bits >> 8) & 255) / 255.0, float(bits & 255) / 255.0, float((bits >> 24) & 255) / 255.0))
+			arrays[Mesh.ARRAY_COLOR] = colors
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 		var material: StandardMaterial3D = materials.get(surface.material, StandardMaterial3D.new()).duplicate()
+		if material.has_meta("source"):
+			var source: Dictionary = material.get_meta("source")
+			if source.get("kind") != "translucent": _apply_alpha(material, source, data.get("alpha_state", {}))
+		material.vertex_color_use_as_albedo = surface.has("colors")
 		if data.get("double_sided", false):
 			material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh.surface_set_material(mesh.get_surface_count() - 1, material)

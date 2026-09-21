@@ -706,6 +706,10 @@ void Document::save() {
 }
 
 void Document::package(const fs::path& directory) {
+  export_mod(directory, false);
+}
+
+void Document::export_mod(const fs::path& directory, bool link_assets) {
   require_stage();
   if (fs::exists(directory)) throw std::runtime_error("Package destination must not already exist");
   auto temp = fs::absolute(directory).parent_path() / (directory.filename().string() + ".building");
@@ -718,10 +722,16 @@ void Document::package(const fs::path& directory) {
     auto snapshot = SdfLayer::CreateAnonymous("package.usda");
     snapshot->TransferContent(root);
     std::vector<std::string> roots;
+    std::vector<SdfLayerOffset> offsets;
+    size_t sublayer_index = 0;
     for (const auto& path : root->GetSubLayerPaths()) {
       auto layer = SdfLayer::FindOrOpenRelativeToLayer(root, path);
       if (!layer) throw std::runtime_error("Missing project layer: " + std::string(path));
-      if (!is_capture(layer)) roots.push_back(layer->GetRealPath());
+      if (!is_capture(layer)) {
+        roots.push_back(layer->GetRealPath());
+        offsets.push_back(root->GetSubLayerOffsets()[sublayer_index]);
+      }
+      ++sublayer_index;
     }
     snapshot->SetSubLayerPaths(roots);
     auto metadata = snapshot->GetCustomLayerData();
@@ -732,6 +742,7 @@ void Document::package(const fs::path& directory) {
     UsdUtilsModifyAssetPaths(snapshot, [&](const std::string& asset) {
       return asset.empty() ? asset : SdfComputeAssetPathRelativeToLayer(root, asset);
     });
+    for (size_t i = 0; i < offsets.size(); ++i) snapshot->SetSubLayerOffset(offsets[i], i);
     auto package_root = temp / "mod.usda";
     if (!snapshot->Export(package_root.string())) throw std::runtime_error("Could not create package root");
     std::vector<SdfLayerRefPtr> layers;
@@ -740,11 +751,19 @@ void Document::package(const fs::path& directory) {
       throw std::runtime_error("Resolve missing package dependencies before exporting" + (missing.empty() ? std::string() : ": " + missing.front()));
     std::map<std::string, fs::path> destinations;
     size_t index = 0;
+    auto asset_id = [&](const std::string& source) {
+      if (!link_assets) return std::to_string(index++);
+      // Stable names allow live publication to replace small USD files atomically,
+      // without invalidating links used by a running game's previous mod revision.
+      uint64_t hash = 14695981039346656037ull;
+      for (unsigned char c : source) { hash ^= c; hash *= 1099511628211ull; }
+      return std::to_string(hash);
+    };
     for (auto layer : layers) {
       if (is_capture(layer)) throw std::runtime_error("A replacement layer depends on a capture; remove that capture sublayer before packaging");
       auto source = fs::weakly_canonical(layer->GetRealPath()).string();
       destinations[source] = fs::equivalent(source, package_root) ? fs::path("mod.usda") :
-        fs::path("assets") / (std::to_string(index++) + "_" + fs::path(source).filename().string());
+        fs::path("assets") / (asset_id(source) + "_" + fs::path(source).filename().string());
     }
     // MDL imports are not USD asset dependencies. Keep each material module bundle's
     // names and directory structure so sibling and nvidia module imports still resolve.
@@ -755,7 +774,7 @@ void Document::package(const fs::path& directory) {
       if (source.extension() == ".mdl") {
         auto parent = source.parent_path();
         if (!bundles.count(parent)) {
-          auto target = fs::path("assets") / ("materials_" + std::to_string(index++));
+          auto target = fs::path("assets") / ("materials_" + asset_id(parent.string()));
           bundles[parent] = target;
           for (const auto& entry : fs::recursive_directory_iterator(parent)) {
             if (!entry.is_regular_file()) continue;
@@ -766,13 +785,14 @@ void Document::package(const fs::path& directory) {
           }
         }
       }
-      if (!destinations.count(source.string())) destinations[source.string()] = fs::path("assets") / (std::to_string(index++) + "_" + source.filename().string());
+      if (!destinations.count(source.string())) destinations[source.string()] = fs::path("assets") / (asset_id(source.string()) + "_" + source.filename().string());
       files.insert(source.string());
     }
     for (const auto& source : files) {
       auto target = temp / destinations.at(source);
       fs::create_directories(target.parent_path());
-      fs::copy_file(source, target);
+      if (link_assets) fs::create_symlink(source, target);
+      else fs::copy_file(source, target);
     }
     std::set<std::string> written;
     for (auto layer : layers) {
@@ -786,8 +806,11 @@ void Document::package(const fs::path& directory) {
         auto resolved = SdfComputeAssetPathRelativeToLayer(layer, asset);
         auto found = destinations.find(fs::weakly_canonical(resolved).string());
         if (found == destinations.end()) throw std::runtime_error("Unresolved package asset: " + asset);
-        return fs::relative(temp / found->second, (temp / destination).parent_path()).generic_string();
+        // Lexical paths must not follow live asset symlinks back out of the mod.
+        return (temp / found->second).lexically_relative((temp / destination).parent_path()).generic_string();
       });
+      const auto layer_offsets = layer->GetSubLayerOffsets();
+      for (size_t i = 0; i < layer_offsets.size(); ++i) copy->SetSubLayerOffset(layer_offsets[i], i);
       if (!copy->Export((temp / destination).string())) throw std::runtime_error("Failed to write packaged USD");
     }
     fs::rename(temp, fs::absolute(directory));
@@ -874,6 +897,7 @@ Json Document::dispatch(const Json& request) {
   else if (op == "select_capture") select_capture(required(request, "path"), false);
   else if (op == "save") save();
   else if (op == "package") package(required(request, "path"));
+  else if (op == "game_link_status" || op == "game_link" || op == "game_sync" || op == "game_unlink") return game_link(request);
   else if (op == "undo") undo();
   else if (op == "redo") redo();
   else if (op == "select_layer") select_layer(required(request, "layer"));

@@ -38,6 +38,8 @@ public:
   uint64_t revision() const { return revision_; }
 
 private:
+  Json game_link(const Json& request);
+  void export_mod(const fs::path& directory, bool link_assets);
   void require_stage() const;
   void select_layer(const std::string& identifier);
   Json captures() const;

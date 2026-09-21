@@ -49,6 +49,9 @@ UsdShadeMaterial make_material(const UsdStageRefPtr& stage, const SdfPath& path,
   shader.CreateInput(TfToken("alpha_test_type"), SdfValueTypeNames->Int).Set(properties.value("alpha_test", 7));
   shader.CreateInput(TfToken("alpha_test_reference_value"), SdfValueTypeNames->Float).Set(properties.value("alpha_reference", 128.f));
   shader.CreateInput(TfToken("use_legacy_alpha_state"), SdfValueTypeNames->Bool).Set(false);
+  shader.CreateInput(TfToken("blend_enabled"), SdfValueTypeNames->Bool).Set(properties.value("blend_enabled", false));
+  shader.CreateInput(TfToken("blend_type"), SdfValueTypeNames->Int).Set(properties.value("blend_type", 0));
+  shader.CreateInput(TfToken("inverted_blend"), SdfValueTypeNames->Bool).Set(properties.value("inverted_blend", false));
   for (const auto& [key, attr] : std::map<std::string, std::string>{{"albedo_texture", "diffuse_texture"},
       {"normal_texture", "normalmap_texture"}, {"roughness_texture", "reflectionroughness_texture"},
       {"metallic_texture", "metallic_texture"}, {"emissive_texture", "emissive_mask_texture"}}) {
@@ -219,7 +222,7 @@ Json ingest_asset(const Json& request, const fs::path& project_directory,
         float transmission = 0.f, ior = 1.5f;
         mat->Get(AI_MATKEY_TRANSMISSION_FACTOR, transmission); mat->Get(AI_MATKEY_REFRACTI, ior);
         if (transmission > 0) { properties["kind"] = "translucent"; properties["ior"] = ior; }
-        else if (std::string(alpha_mode.C_Str()) == "BLEND") warnings.push_back("Alpha blending on material " + std::to_string(i) + " is preserved as opacity; use cutout or glass for the supported rendering workflow");
+        else if (std::string(alpha_mode.C_Str()) == "BLEND") properties["blend_enabled"] = true;
         aiColor3D emission(0, 0, 0); mat->Get(AI_MATKEY_COLOR_EMISSIVE, emission);
         const auto emission_intensity = std::max({emission.r, emission.g, emission.b});
         properties["emissive_intensity"] = emission_intensity;
