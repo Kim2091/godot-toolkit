@@ -1,0 +1,70 @@
+diff --git a/src/dxvk/rtx_render/rtx_lights_data.cpp b/src/dxvk/rtx_render/rtx_lights_data.cpp
+--- a/src/dxvk/rtx_render/rtx_lights_data.cpp
++++ b/src/dxvk/rtx_render/rtx_lights_data.cpp
+@@ -35,6 +35,8 @@
+ #include "../../lssusd/game_exporter_common.h"
+ #include "../../lssusd/game_exporter_paths.h"
+ 
++#include "rtx_light_usd_value.h"
++
+ #include "../../lssusd/usd_include_begin.h"
+ #include <pxr/base/vt/value.h>
+ #include <pxr/usd/usd/tokens.h>
+@@ -61,10 +63,9 @@
+         pxr::VtValue val; \
+         getLightAttribute(prim, pxr::TfToken(#usd_attr), pxr::TfToken("inputs:"#usd_attr)).Get(&val); \
+         if(!val.IsEmpty()) { \
+-          if(val.IsHolding<type>()) { \
++          if(readUsdLightValue(val, m_##name)) { \
+             static_assert(uint32_t(DirtyFlags::k_##name) < 32); \
+             m_dirty.set(DirtyFlags::k_##name); \
+-            m_##name = val.UncheckedGet<type>(); \
+           } else { \
+             Logger::warn(str::format("Light attribute ", #usd_attr, " has unexpected type, using default value")); \
+           } \
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -284,6 +284,7 @@
+   'rtx_render/rtx_lights.h',
+   'rtx_render/rtx_lights_data.cpp',
+   'rtx_render/rtx_lights_data.h',
++  'rtx_render/rtx_light_usd_value.h',
+   'rtx_render/rtx_light_utils.cpp',
+   'rtx_render/rtx_light_utils.h',
+   'rtx_render/rtx_materials.cpp',
+diff --git a/src/dxvk/rtx_render/rtx_light_usd_value.h b/src/dxvk/rtx_render/rtx_light_usd_value.h
+new file mode 100644
+--- /dev/null
++++ b/src/dxvk/rtx_render/rtx_light_usd_value.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include "../../util/util_vector.h"
++
++#include "../../lssusd/usd_include_begin.h"
++#include <pxr/base/gf/vec3f.h>
++#include <pxr/base/vt/value.h>
++#include "../../lssusd/usd_include_end.h"
++
++namespace dxvk {
++
++  template<typename T>
++  bool readUsdLightValue(const pxr::VtValue& value, T& output) {
++    if (!value.IsHolding<T>()) {
++      return false;
++    }
++    output = value.UncheckedGet<T>();
++    return true;
++  }
++
++  inline bool readUsdLightValue(const pxr::VtValue& value, Vector3& output) {
++    // USD color3f/float3 values hold GfVec3f, never dxvk::Vector3.
++    // Checking the renderer type rejects valid colors and leaves them white.
++    if (!value.IsHolding<pxr::GfVec3f>()) {
++      return false;
++    }
++    output = Vector3(value.UncheckedGet<pxr::GfVec3f>().data());
++    return true;
++  }
++}

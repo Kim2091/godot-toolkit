@@ -1,4 +1,5 @@
 #include "document.h"
+#include "usd_authoring.h"
 
 #include <cmath>
 #include <algorithm>
@@ -177,6 +178,7 @@ void Document::set_authoring_property(const Json& request, bool reset) {
   if (reset) {
     auto attr = prim.GetAttribute(TfToken(name));
     if (attr) attr.Clear();
+    update_light_extent(prim);
     return;
   }
   auto value = request.at("value");
@@ -223,6 +225,7 @@ void Document::set_light_type(const Json& request) {
     shaping.CreateShapingConeSoftnessAttr().Set(0.f);
     shaping.CreateShapingFocusAttr().Set(0.f);
   }
+  update_light_extent(prim);
 }
 
 Json preview_asset(const fs::path& path) {

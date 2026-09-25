@@ -1,5 +1,6 @@
 #include "document.h"
 #include "alpha_state.h"
+#include "skinning.h"
 
 #include <cmath>
 #include <map>
@@ -232,7 +233,7 @@ Json compose_material(const UsdPrim& prim) {
 }
 Json compose_lights(const UsdStageRefPtr& stage, uint64_t revision) {
   Json result{{"revision", revision}, {"lights", Json::array()}, {"warnings", Json::array()}};
-  UsdGeomXformCache transforms;
+  UsdGeomXformCache transforms(UsdTimeCode::EarliestTime());
   for (auto prim : UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies())) {
     // Mesh emitters take the geometry branch in compose_scene as well.
     if (!UsdLuxLightAPI(prim) || prim.IsA<UsdGeomMesh>() || UsdGeomImageable(prim).ComputeVisibility() == UsdGeomTokens->invisible) continue;
@@ -244,7 +245,9 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
   Json result{{"revision", revision}, {"meshes", Json::array()}, {"materials", Json::array()},
     {"lights", Json::array()}, {"cameras", Json::array()}, {"warnings", Json::array()},
     {"up_axis", UsdGeomGetStageUpAxis(stage).GetString()}, {"meters_per_unit", UsdGeomGetStageMetersPerUnit(stage)}};
-  UsdGeomXformCache transforms;
+  const auto time = UsdTimeCode::EarliestTime();
+  UsdGeomXformCache transforms(time);
+  SceneSkinning skinning(transforms);
   std::set<std::string> materials;
   for (auto prim : UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies())) {
     auto imageable = UsdGeomImageable(prim);
@@ -255,23 +258,29 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
       try {
         VtVec3fArray points, normals;
         VtIntArray indices, counts, holes;
-        mesh.GetPointsAttr().Get(&points); mesh.GetFaceVertexIndicesAttr().Get(&indices);
-        mesh.GetFaceVertexCountsAttr().Get(&counts); mesh.GetNormalsAttr().Get(&normals);
-        mesh.GetHoleIndicesAttr().Get(&holes);
+        mesh.GetPointsAttr().Get(&points, time); mesh.GetFaceVertexIndicesAttr().Get(&indices, time);
+        mesh.GetFaceVertexCountsAttr().Get(&counts, time); mesh.GetNormalsAttr().Get(&normals, time);
+        mesh.GetHoleIndicesAttr().Get(&holes, time);
         std::string reason;
         if (!UsdGeomMesh::ValidateTopology(indices, counts, points.size(), &reason)) throw std::runtime_error(reason);
+        auto normal_interpolation = mesh.GetNormalsInterpolation();
+        std::string skeleton;
+        try { skeleton = skinning.deform(mesh, points, normals, normal_interpolation, indices, counts); }
+        catch (const std::exception& error) {
+          result["warnings"].push_back(path + ": " + error.what() + "; showing undeformed geometry");
+        }
         VtVec2fArray uv;
         auto st = UsdGeomPrimvarsAPI(mesh).GetPrimvar(TfToken("st"));
-        if (st) st.ComputeFlattened(&uv);
+        if (st) st.ComputeFlattened(&uv, time);
         const auto color_primvar = UsdGeomPrimvarsAPI(mesh).FindPrimvarWithInheritance(TfToken("displayColor"));
         const auto opacity_primvar = UsdGeomPrimvarsAPI(mesh).FindPrimvarWithInheritance(TfToken("displayOpacity"));
         VtVec3fArray colors; VtFloatArray opacities;
-        if (color_primvar) color_primvar.ComputeFlattened(&colors);
+        if (color_primvar) color_primvar.ComputeFlattened(&colors, time);
         if (opacity_primvar) opacity_primvar.ComputeFlattened(&opacities);
         auto binding = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
         std::map<int, UsdShadeMaterial> face_materials;
         for (auto subset : UsdGeomSubset::GetGeomSubsets(mesh, UsdGeomTokens->face, TfToken("materialBind"))) {
-          VtIntArray faces; subset.GetIndicesAttr().Get(&faces);
+          VtIntArray faces; subset.GetIndicesAttr().Get(&faces, time);
           auto bound = UsdShadeMaterialBindingAPI(subset.GetPrim()).ComputeBoundMaterial();
           for (int face : faces) face_materials[face] = bound;
         }
@@ -292,7 +301,7 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
               int vertex = indices[c];
               auto point = points[vertex];
               auto normal = geometric;
-              auto n = element_index(mesh.GetNormalsInterpolation(), face, c, vertex);
+              auto n = element_index(normal_interpolation, face, c, vertex);
               if (n >= 0 && size_t(n) < normals.size()) normal = normals[n];
               GfVec2f texcoord(0);
               int u = st ? element_index(st.GetInterpolation(), face, c, vertex) : -1;
@@ -312,7 +321,7 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
         }
         Json parts = Json::array();
         for (auto& entry : surfaces) parts.push_back(std::move(entry.second));
-        result["meshes"].push_back({{"id", path}, {"source_path", source_path(prim)}, {"transform", matrix_json(world)}, {"surfaces", parts},
+        result["meshes"].push_back({{"id", path}, {"source_path", source_path(prim)}, {"transform", matrix_json(world)}, {"surfaces", parts}, {"skinned", !skeleton.empty()}, {"skeleton", skeleton},
           {"double_sided", attribute(prim, "doubleSided", false)}, {"alpha_state", capture_alpha(prim)},
           {"ignore_alpha", attribute(prim, "remix_category:ignore_alpha_channel", false)},
           {"alpha_blend_to_cutout", attribute(prim, "remix_category:alpha_blend_to_cutout", false)}});
@@ -324,6 +333,7 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
         {"focal_length", attribute(prim, "focalLength", 50.f)}, {"horizontal_aperture", attribute(prim, "horizontalAperture", 20.955f)}});
     }
   }
+  result["skeletons"] = skinning.skeletons();
   return result;
 }
 }

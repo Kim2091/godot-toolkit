@@ -45,6 +45,9 @@ func sync_now() -> bool:
 	timer.stop()
 	return _request({"op": "game_sync"}) if state.get("linked", false) else false
 
+func refresh_status() -> void:
+	_request({"op": "game_link_status"})
+
 func unlink_game() -> bool:
 	timer.stop()
 	return _request({"op": "game_unlink"})

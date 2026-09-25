@@ -65,8 +65,11 @@ int main() {
     doc.dispatch({{"op", "transform"}, {"path", light}, {"world_matrix", matrix(moved)}});
     same(world(doc, light), moved, "World gizmo transform must account for the selected instance parent");
     doc.undo(); same(world(doc, light), pose, "A gizmo transform must undo in one step");
+    UsdGeomXformable(doc.stage()->GetPrimAtPath(SdfPath("/RootNode/meshes/mesh_0123456789ABCDEF/mesh"))).MakeMatrixXform().Set(
+      GfMatrix4d(GfRotation(GfVec3d(0, 1, 0), 15), GfVec3d(7, 8, 9)));
     light = parent(light, mesh);
     same(world(doc, light), pose, "Attaching to a captured mesh child must keep the world pose");
+    check(SdfPath(light).GetParentPath() == SdfPath(instance), "Picking capture geometry must attach to its draw-call root, not its mesh child");
     light = parent(light, "");
     same(world(doc, light), pose, "Detaching must keep world pose under a transformed scene root");
     check(doc.scene()["lights"].size() == 3, "Detach removes all shared copies of only that attachment");
@@ -105,6 +108,13 @@ int main() {
     same(world(reopened, child), pose, "Parent attachments must survive save and reopen");
     check(reopened.inspect(duplicate)["attachment"]["parent"] == instance, "Duplicate parent must persist");
     doc.package(root / "package");
+    auto packaged = UsdStage::Open((root / "package/mod.usda").string());
+    const auto published = SdfPath(child).ReplacePrefix(SdfPath(instance), SdfPath("/RootNode/meshes/mesh_0123456789ABCDEF"));
+    check(packaged->GetPrimAtPath(published).IsDefined(), "Attachments must remain defined when capture layers are absent");
+    const auto root_prim = packaged->GetPrimAtPath(SdfPath("/RootNode/meshes/mesh_0123456789ABCDEF"));
+    bool reset = false;
+    auto local = UsdGeomXformCache().ComputeRelativeTransform(packaged->GetPrimAtPath(published), root_prim, &reset);
+    same(local * world(doc, instance), pose, "Runtime draw-call transform must reconstruct the visible attachment pose");
     check(text(capture) == original, "Placement must leave the capture untouched");
     check(errors.IsClean(), "Placement emitted USD errors");
     fs::remove_all(root);

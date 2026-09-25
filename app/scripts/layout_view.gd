@@ -3,6 +3,7 @@ extends Control
 const LayoutGeometry = preload("res://scripts/layout_geometry.gd")
 const WireframeShader = preload("res://shaders/layout_wireframe.gdshader")
 const TransformGizmo = preload("res://scripts/transform_gizmo.gd")
+const SkeletonOverlay = preload("res://scripts/skeleton_overlay.gd")
 enum CameraMode { DRONE, ORBIT }
 
 signal selected(path: String)
@@ -10,7 +11,14 @@ signal camera_changed(camera: Dictionary)
 signal translation_requested(delta: Vector3)
 signal transform_preview_requested(path: String, delta: Array)
 signal transform_committed(path: String, matrix: Array)
+signal parent_picked(path: String, parent: String)
+signal parent_pick_ended
 var gizmo := TransformGizmo.new()
+var skeleton_overlay := SkeletonOverlay.new()
+var parent_pick_path := ""
+var parent_hover := ""
+var parent_candidates: Dictionary = {}
+var parent_exclude := ""
 
 var scene: Dictionary = {}
 var selected_path := "":
@@ -85,6 +93,8 @@ func _ready() -> void:
 	selection_material.shader = WireframeShader
 	selection_material.set_shader_parameter("wire_color", Color("62dac2"))
 	resized.connect(_sync_view)
+	mouse_exited.connect(func():
+		if not parent_pick_path.is_empty(): _set_parent_hover(""))
 	_rebuild_geometry()
 
 func set_mouse_capture(capture: bool, restore_cursor := true) -> void:
@@ -92,6 +102,7 @@ func set_mouse_capture(capture: bool, restore_cursor := true) -> void:
 		return
 	if capture == mouse_captured:
 		return
+	if capture: cancel_parent_pick()
 	gizmo.cancel()
 	mouse_captured = capture
 	orbiting = false
@@ -111,11 +122,13 @@ func set_mouse_capture(capture: bool, restore_cursor := true) -> void:
 
 func _notification(what: int) -> void:
 	if what in [NOTIFICATION_WM_WINDOW_FOCUS_OUT, NOTIFICATION_APPLICATION_FOCUS_OUT]:
+		cancel_parent_pick()
 		gizmo.cancel()
 		set_mouse_capture(false, false)
 		orbiting = false
 		dragging = false
 	elif what == NOTIFICATION_VISIBILITY_CHANGED and not is_visible_in_tree():
+		cancel_parent_pick()
 		gizmo.cancel()
 		set_mouse_capture(false, false)
 
@@ -138,7 +151,7 @@ func _unhandled_key_input(event: InputEvent) -> void:
 			get_viewport().set_input_as_handled()
 
 func _start_keyboard_transform(event: InputEvent) -> void:
-	if not is_visible_in_tree() or gizmo.active or not event is InputEventKey or not event.pressed or event.echo: return
+	if not parent_pick_path.is_empty() or not is_visible_in_tree() or gizmo.active or not event is InputEventKey or not event.pressed or event.echo: return
 	if event.ctrl_pressed or event.alt_pressed or event.meta_pressed or not _view_rect().has_point(get_local_mouse_position()): return
 	var focused := get_viewport().gui_get_focus_owner()
 	if focused is LineEdit or focused is TextEdit: return
@@ -156,6 +169,9 @@ func _start_keyboard_transform(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 
 func _input(event: InputEvent) -> void:
+	if not parent_pick_path.is_empty():
+		if (event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE) or (event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_RIGHT):
+			cancel_parent_pick(); get_viewport().set_input_as_handled(); return
 	if gizmo.modal != null:
 		# Modal transforms own pointer events even when the cursor crosses into
 		# a panel. Confirmation clicks must not also activate editor controls.
@@ -227,6 +243,7 @@ func _rebuild_geometry() -> void:
 		instance.free()
 	wire_instances.clear()
 	geometry.rebuild(scene)
+	skeleton_overlay.configure(scene)
 	for entry in geometry.entries:
 		var instance := MeshInstance3D.new()
 		instance.mesh = entry.geometry.mesh
@@ -237,8 +254,9 @@ func _rebuild_geometry() -> void:
 	_update_selection()
 
 func _update_selection() -> void:
+	skeleton_overlay.select(selected_path)
 	for i in range(wire_instances.size()):
-		var highlight: bool = geometry.entries[i].matches(selected_path)
+		var highlight: bool = geometry.entries[i].matches(selected_path if parent_pick_path.is_empty() else parent_hover)
 		wire_instances[i].layers = 3 if highlight else 1
 		wire_instances[i].material_override = selection_material if highlight else wire_material
 	_invalidate_wireframe()
@@ -402,6 +420,7 @@ func _draw() -> void:
 			_line(a, b, Color("23303c")); _line(c, d, Color("23303c"))
 	if wire_viewport != null:
 		draw_texture_rect(wire_viewport.get_texture(), _view_rect(), false)
+	skeleton_overlay.draw(self)
 	for light in scene.get("lights", []):
 		var point := _project(gizmo.world.origin if gizmo.active and light.id == gizmo.path else _world(light.transform, [0, 0, 0]))
 		if point.is_finite():
@@ -416,6 +435,10 @@ func _draw() -> void:
 		draw_line(aim - Vector2(5, 0), aim + Vector2(5, 0), Color("c3d1df"))
 		draw_line(aim - Vector2(0, 5), aim + Vector2(0, 5), Color("c3d1df"))
 	if gizmo.modal != null: help = gizmo.modal.hint()
+	if not parent_pick_path.is_empty():
+		help = "Pick parent · Click a mesh · Middle drag: look · Esc/right click: cancel"
+		if not parent_hover.is_empty():
+			draw_string(ThemeDB.fallback_font, Vector2(18, 48), parent_hover, HORIZONTAL_ALIGNMENT_LEFT, size.x - 36, 12, Color("62dac2"))
 	draw_string(ThemeDB.fallback_font, Vector2(18, 28), ("REMIX" if rendering else "LAYOUT") + " · " + help, HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color("9bb0c0"))
 	if scene.is_empty():
 		draw_string(ThemeDB.fallback_font, size * 0.5 - Vector2(150, 0), "Open a project or create one from a capture", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color("9bb0c0"))
@@ -449,6 +472,40 @@ func _pick(position: Vector2) -> String:
 			return light.id
 	var ray := _ray(position)
 	return geometry.pick(ray.origin, ray.direction)
+
+func begin_parent_pick(path: String, candidates: Array, exclude: String) -> void:
+	set_mouse_capture(false)
+	gizmo.cancel()
+	orbiting = false; dragging = false
+	parent_pick_path = path; parent_exclude = exclude
+	parent_candidates.clear()
+	for candidate: Dictionary in candidates: parent_candidates[candidate.path] = true
+	mouse_default_cursor_shape = Control.CURSOR_CROSS
+	grab_focus()
+	_update_parent_hover(get_local_mouse_position())
+	_update_selection()
+
+func cancel_parent_pick() -> void:
+	if parent_pick_path.is_empty(): return
+	parent_pick_path = ""; parent_hover = ""; parent_candidates.clear(); parent_exclude = ""
+	orbiting = false; dragging = false
+	mouse_default_cursor_shape = Control.CURSOR_ARROW
+	_update_selection()
+	parent_pick_ended.emit()
+
+func _set_parent_hover(path: String) -> void:
+	if parent_hover == path: return
+	parent_hover = path
+	_update_selection()
+
+func _update_parent_hover(position: Vector2) -> void:
+	var path := ""
+	if _view_rect().has_point(position):
+		var ray := _ray(position)
+		path = geometry.raycast(ray.origin, ray.direction, parent_exclude).get("path", "")
+		while not path.is_empty() and not parent_candidates.has(path):
+			path = path.get_base_dir() if path != "/" else ""
+	_set_parent_hover(path)
 
 func _ray(position: Vector2) -> Dictionary:
 	var rectangle := _view_rect()
@@ -511,6 +568,7 @@ func light_spawn_transform(type: String, properties: Dictionary) -> Transform3D:
 	return pose
 
 func _gizmo_preview(path: String, delta: Transform3D) -> void:
+	skeleton_overlay.preview(path, delta)
 	for i in range(wire_instances.size()):
 		var entry = geometry.entries[i]
 		if entry.id == path or entry.id.begins_with(path + "/"):
@@ -521,7 +579,7 @@ func _gizmo_preview(path: String, delta: Transform3D) -> void:
 func _gui_input(event: InputEvent) -> void:
 	if mouse_captured:
 		return
-	if gizmo.handle_input(event):
+	if parent_pick_path.is_empty() and gizmo.handle_input(event):
 		accept_event(); return
 	if event is InputEventMouseButton:
 		if event.pressed:
@@ -533,7 +591,14 @@ func _gui_input(event: InputEvent) -> void:
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 			distance *= 1.15
 		elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-			if event.shift_pressed and not selected_path.is_empty():
+			if not parent_pick_path.is_empty():
+				_update_parent_hover(event.position)
+				if not parent_hover.is_empty():
+					var asset := parent_pick_path; var parent := parent_hover
+					cancel_parent_pick()
+					parent_picked.emit(asset, parent)
+				accept_event(); return
+			elif event.shift_pressed and not selected_path.is_empty():
 				dragging = true
 				drag_start = event.position
 			else:
@@ -551,3 +616,5 @@ func _gui_input(event: InputEvent) -> void:
 		_look(event.relative, camera_mode == CameraMode.DRONE)
 	elif event is InputEventMouseButton:
 		_camera_updated()
+	if not parent_pick_path.is_empty() and (event is InputEventMouseMotion or event is InputEventMouseButton):
+		_update_parent_hover(event.position)

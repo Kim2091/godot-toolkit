@@ -43,6 +43,32 @@ func _run() -> void:
 	request({"op": "create", "capture": root_path.path_join("tests/fixtures/capture.usda"), "path": directory.path_join("project.usda")})
 	var source := directory.path_join("source")
 	DirAccess.make_dir_recursive_absolute(source)
+	# FBX paths retain Windows separators even when the model is opened on Linux.
+	var fbx_directory := source.path_join("fbx with spaces")
+	DirAccess.make_dir_recursive_absolute(fbx_directory.path_join("Textures"))
+	DirAccess.copy_absolute(root_path.path_join("tests/fixtures/textured_model.fbx"), fbx_directory.path_join("textured_model.fbx"))
+	var fbx_color := Image.create(16, 16, false, Image.FORMAT_RGBA8)
+	fbx_color.fill(Color(0.8, 0.2, 0.1, 1))
+	fbx_color.save_png(fbx_directory.path_join("Textures/color map.png"))
+	var fbx_sources := [fbx_directory.path_join("textured_model.fbx")]
+	# Optional real-world FBX files are read only; ingestion stays in this test project.
+	for argument in OS.get_cmdline_user_args():
+		if argument.begins_with("--fbx="): fbx_sources.append(argument.trim_prefix("--fbx="))
+	for fbx_source in fbx_sources:
+		var fbx := await ingest({"source": fbx_source, "mdl_directory": root_path.path_join("app/materials")})
+		if not fbx.has("asset"): continue
+		request({"op": "add_mesh", "asset": fbx.asset})
+		var fbx_scene := request({"op": "scene"})
+		var texture_found := false
+		for fbx_material in fbx_scene.materials:
+			var texture_path: String = fbx_material.get("albedo_texture", "")
+			if not texture_path.begins_with(String(fbx.asset).get_base_dir() + "/"): continue
+			texture_found = true
+			var texture := load_dds(texture_path)
+			check(texture != null and texture.is_compressed() and texture.has_mipmaps() and texture.get_format() == Image.FORMAT_BPTC_RGBA,
+				"FBX texture must resolve and become mipmapped BC7 DDS: " + fbx_source)
+		check(texture_found, "FBX diffuse texture was lost: " + fbx_source)
+		request({"op": "undo"})
 	var colors := {"albedo": Color(0.8, 0.2, 0.1, 1), "normal": Color(0.5, 0.5, 1, 1), "orm": Color(1, 0.6, 0.25, 1)}
 	for name in colors:
 		var image := Image.create(16, 16, false, Image.FORMAT_RGBA8)

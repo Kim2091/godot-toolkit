@@ -1,4 +1,5 @@
 #include "document.h"
+#include "game_inheritance.h"
 
 #include <chrono>
 #include <fstream>
@@ -88,7 +89,9 @@ Json Document::game_link(const Json& request) {
   auto status = [&]() -> Json {
     const auto target = config.is_null() ? std::string() : config.at("target").get<std::string>();
     return {{"linked", !target.empty()}, {"connected", !target.empty() && owns_link(target, directory)},
-            {"target", target}, {"directory", directory.string()}};
+            {"target", target}, {"directory", directory.string()},
+            {"retained_mods", config.is_null() ? Json::array() : config.value("retained_mods", Json::array())},
+            {"priority_changed", !config.is_null() && config.value("priority_changed", false)}};
   };
   if (op == "game_link_status") return status();
   if (op == "game_unlink") {
@@ -97,6 +100,9 @@ Json Document::game_link(const Json& request) {
       const fs::path target = config.at("target").get<std::string>();
       if (owns_link(target, directory)) fs::remove(target);
       else if (present(target)) message = "Link settings cleared. The destination was replaced and has been left untouched.";
+      // Only remove old priority aliases which still point at our live directory.
+      for (const auto& alias : config.value("aliases", Json::array()))
+        if (alias.is_string() && owns_link(alias.get<std::string>(), directory)) fs::remove(alias.get<std::string>());
       fs::remove(settings);
     }
     config = nullptr;
@@ -120,6 +126,26 @@ Json Document::game_link(const Json& request) {
       throw std::runtime_error("The game link is missing or was replaced. Unlink it and link the project again.");
   } else throw std::runtime_error("Unknown game link command");
 
+  const auto inherited = find_game_inheritance(stage_, target.parent_path(), directory);
+  fs::path previous_target;
+  bool priority_changed = false;
+  if (!inherited.empty() && target >= inherited.front().path.parent_path()) {
+    previous_target = config.is_null() ? fs::path() : target;
+    auto stem = "000_" + target.filename().string();
+    const auto first = inherited.front().path.parent_path().filename().string();
+    for (size_t i = 0; stem >= first && i <= first.size(); ++i) stem = "!" + stem;
+    if (stem >= first) throw std::runtime_error("Choose a project link name sorting before " + first);
+    for (unsigned i = 0;; ++i) {
+      auto candidate = target.parent_path() / (stem + (i ? "_" + std::to_string(i + 1) : ""));
+      if (candidate < inherited.front().path.parent_path() && (!present(candidate) || owns_link(candidate, directory))) {
+        target = candidate; break;
+      }
+      if (i == 1000) throw std::runtime_error("Could not find a free game link name before the existing mod");
+    }
+    create_link = !present(target);
+    priority_changed = true;
+  }
+
   const auto marker = directory / "project.json";
   if (present(directory)) {
     plain_directory(directory);
@@ -133,6 +159,7 @@ Json Document::game_link(const Json& request) {
   const auto staging = directory / (".publish-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   try {
     export_mod(staging, true);
+    publish_game_inheritance(inherited, stage_, staging);
     // Publish dependencies first and mod.usda last. The runtime watches the root's
     // timestamp; it must never see a half-written root or a missing dependency.
     for (const auto& entry : fs::recursive_directory_iterator(staging / "assets")) {
@@ -160,9 +187,20 @@ Json Document::game_link(const Json& request) {
           "\nOn Windows, enable Developer Mode or run with permission to create symbolic links.");
       }
     }
-    if (op == "game_link") {
-      config = {{"version", 1}, {"target", target.string()}};
-      try { write_json(settings, config); }
+    {
+      auto aliases = config.is_null() ? Json::array() : config.value("aliases", Json::array());
+      if (!previous_target.empty() && std::find(aliases.begin(), aliases.end(), previous_target.string()) == aliases.end())
+        aliases.push_back(previous_target.string());
+      Json retained = Json::array();
+      for (const auto& mod : inherited) retained.push_back({{"name", mod.path.parent_path().filename().string()},
+        {"path", mod.path.string()}, {"roots", mod.roots.size()}});
+      // Keep the old owned alias until Unlink. A running game may still have a
+      // file watcher on it, so deleting it here can crash older Remix builds.
+      const Json next{{"version", 1}, {"target", target.string()}, {"aliases", aliases}, {"retained_mods", retained},
+        {"priority_changed", priority_changed || (!config.is_null() && config.value("priority_changed", false))}};
+      const bool changed = next != config;
+      config = next;
+      try { if (changed) write_json(settings, config); }
       catch (...) { if (create_link && owns_link(target, directory)) fs::remove(target); throw; }
     }
   } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }

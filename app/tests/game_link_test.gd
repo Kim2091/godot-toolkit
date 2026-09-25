@@ -12,6 +12,7 @@ func _initialize() -> void:
 	run.call_deferred()
 
 func run() -> void:
+	root.size = Vector2i(1440, 900)
 	var directory := ProjectSettings.globalize_path("res://../.work/game-link/%d" % Time.get_ticks_usec()).simplify_path()
 	var app: Control = load("res://main.tscn").instantiate()
 	app.sessions = Sessions.new(directory.path_join("recent.json"))
@@ -31,7 +32,7 @@ func run() -> void:
 	await process_frame; await process_frame
 	var dialog = app.game_link_dialog
 	check(dialog.visible and dialog.mod_name.text == "work", "Dialog proposes the workfile name")
-	check(dialog.size.y < root.size.y and dialog.get_ok_button().get_global_rect().end.y <= dialog.size.y, "Dialog and Close button must fit the window")
+	check(dialog.size.y < root.size.y and dialog.get_ok_button().get_global_rect().end.y <= dialog.size.y, "Dialog and Close button must fit the window: %s / %s / %s" % [dialog.size, root.size, dialog.get_ok_button().get_global_rect()])
 	dialog.browse.pressed.emit()
 	await process_frame; await process_frame
 	var picker: FileDialog
@@ -41,7 +42,7 @@ func run() -> void:
 	picker.dir_selected.emit(game)
 	await process_frame; await process_frame
 	check(dialog.folder.text == game, "Folder picker must fill the game destination")
-	dialog.mod_name.text = "Live test"
+	dialog.mod_name.text = "light-test"
 	dialog.connect_button.pressed.emit()
 	check(app.game_link.state.get("connected", false) and dialog.sync_button.visible and not dialog.folder.editable, "Link UI creates and displays the connection")
 	check(app.game_link_button.text == "Game linked" and app.state.dirty, "Link status is visible without clearing unsaved edits")
@@ -82,6 +83,24 @@ func run() -> void:
 	app._show_game_link()
 	await process_frame; await process_frame
 	dialog = app.game_link_dialog
+	# Existing links must resolve shared-hash conflicts without another setting.
+	app._command({"op": "set_parent", "path": light, "parent": "/RootNode/instances/inst_0123456789ABCDEF_0"})
+	var base := game.path_join("rtx-remix/mods/base_mod/mod.usda")
+	DirAccess.make_dir_recursive_absolute(base.get_base_dir())
+	var base_file := FileAccess.open(base, FileAccess.WRITE)
+	base_file.store_string('#usda 1.0\ndef "RootNode" {\n def "meshes" {\n  def "mesh_0123456789ABCDEF" {\n   def SphereLight "BaseLight" {\n    float inputs:intensity = 42\n   }\n  }\n }\n}\n')
+	base_file.close()
+	var base_before := FileAccess.get_file_as_string(base)
+	dialog.sync_button.pressed.emit()
+	check(app.game_link.error.is_empty() and app.game_link.state.get("retained_mods", []).size() == 1, "Sync must automatically retain attachments from the installed base")
+	check(app.game_link.state.get("priority_changed", false) and dialog.notice.text.contains("restart the game once"), "Link controls must explain the required game refresh after priority changes")
+	check(dialog.notice.text.contains("base_mod") and not dialog.notice.text.contains("Apply base mod"), "Retention must be reported without a separate base-mod setting")
+	check(FileAccess.get_file_as_string(base) == base_before, "Automatic retention must leave the installed mod unchanged")
+	await process_frame; await process_frame
+	check(dialog.size.y < root.size.y, "Retention status must fit in the link dialog")
+	if DisplayServer.get_name() != "headless":
+		root.get_texture().get_image().save_png(directory.path_join("retained-attachments.png"))
+	mod = app.game_link.state.target.path_join("mod.usda")
 	DirAccess.remove_absolute(mod.get_base_dir())
 	DirAccess.make_dir_recursive_absolute(mod.get_base_dir())
 	var keep := FileAccess.open(mod.get_base_dir().path_join("keep.txt"), FileAccess.WRITE)

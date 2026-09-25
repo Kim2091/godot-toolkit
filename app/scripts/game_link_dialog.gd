@@ -56,5 +56,9 @@ func refresh() -> void:
 		notice.text = "Live update failed: " + link.error
 	elif linked:
 		notice.text = ("Live updates on: " if link.state.get("connected", false) else "Link missing: ") + String(link.state.target)
+		var retained := PackedStringArray()
+		for mod: Dictionary in link.state.get("retained_mods", []): retained.append(mod.name)
+		if not retained.is_empty(): notice.text += "\nExisting attachments retained from: " + ", ".join(retained) + "."
+		if link.state.get("priority_changed", false): notice.text += "\nThe project link was placed ahead of those mods. Refresh the game's mod list or restart the game once after this change."
 	else:
 		notice.text = link.state.get("message", "Creates a symlink in rtx-remix/mods. Existing mods are never replaced.")

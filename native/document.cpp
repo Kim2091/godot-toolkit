@@ -1,4 +1,5 @@
 #include "document.h"
+#include "usd_authoring.h"
 
 #include <chrono>
 #include <cmath>
@@ -53,6 +54,15 @@ bool is_capture(const SdfLayerHandle& layer) {
 }
 constexpr const char* capture_catalog = "remix_studio_captures";
 constexpr const char* standalone_root = "/RootNode/StudioAssets";
+const TfToken replacement_tag("remixStudioMeshReplacement");
+const TfToken replacement_restore("remixStudioMeshRestore");
+void define_ancestors(const SdfLayerHandle& layer, SdfPath path) {
+  for (; !path.IsAbsoluteRootPath(); path = path.GetParentPath()) {
+    auto spec = SdfCreatePrimInLayer(layer, path);
+    if (!spec) throw std::runtime_error("Could not define attachment parent");
+    if (spec->GetSpecifier() == SdfSpecifierOver) spec->SetSpecifier(SdfSpecifierDef);
+  }
+}
 Json matrix_json(const GfMatrix4d& matrix) {
   Json values = Json::array();
   for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) values.push_back(matrix[r][c]);
@@ -169,7 +179,7 @@ void Document::create(const fs::path& capture, const fs::path& project) {
   auto mod = SdfLayer::CreateNew(mod_path.string());
   auto work = SdfLayer::CreateNew(fs::absolute(project).string());
   if (!mod || !work) throw std::runtime_error("Could not create project files");
-  mod->SetCustomLayerData({{"lightspeed_layer_type", VtValue(std::string("replacement"))}});
+  replacement_metadata(mod, source);
   work->SetCustomLayerData({
     {"lightspeed_layer_type", VtValue(std::string("workfile"))},
     {capture_catalog, VtValue(VtStringArray{fs::relative(fs::absolute(capture), root).generic_string()})},
@@ -285,7 +295,7 @@ Json Document::describe() const {
     prims.push_back({{"path", prim.GetPath().GetString()}, {"name", prim.GetName().GetString()},
       {"type", prim.GetTypeName().GetString()}, {"active", prim.IsActive()},
       {"visible", !imageable || imageable.ComputeVisibility() != UsdGeomTokens->invisible}});
-    if (prim.GetTypeName() == TfToken("SkelRoot") || prim.GetTypeName() == TfToken("OmniGraph"))
+    if (prim.GetTypeName() == TfToken("OmniGraph"))
       warnings.push_back("Preserved without editing support: " + prim.GetPath().GetString());
   }
   for (auto layer : stage_->GetLayerStack(false)) {
@@ -320,15 +330,15 @@ Json Document::inspect(const std::string& path) const {
   auto transform = UsdGeomXformable(prim);
   if (transform) {
     GfMatrix4d matrix; bool reset;
-    transform.GetLocalTransformation(&matrix, &reset);
+    transform.GetLocalTransformation(&matrix, &reset, UsdTimeCode::EarliestTime());
     auto translation = matrix.ExtractTranslation();
     result["translation"] = {translation[0], translation[1], translation[2]};
     GfTransform components(matrix);
     auto scale = components.GetScale();
-    auto rotation = components.GetRotation().Decompose(GfVec3d(1, 0, 0), GfVec3d(0, 1, 0), GfVec3d(0, 0, 1));
+    auto rotation = components.GetRotation().Decompose(GfVec3d::ZAxis(), GfVec3d::YAxis(), GfVec3d::XAxis());
     result["scale"] = {scale[0], scale[1], scale[2]};
-    result["rotation"] = {rotation[0], rotation[1], rotation[2]};
-    UsdGeomXformCache cache;
+    result["rotation"] = {rotation[2], rotation[1], rotation[0]};
+    UsdGeomXformCache cache(UsdTimeCode::EarliestTime());
     result["world_transform"] = matrix_json(cache.GetLocalToWorldTransform(prim));
   }
   try { result["anchor"] = anchor_for(path); } catch (const std::runtime_error&) { result["anchor"] = nullptr; }
@@ -360,6 +370,8 @@ Json Document::inspect(const std::string& path) const {
     const auto parent = SdfPath(owner).GetParentPath().GetString();
     result["attachment"] = {{"path", owner}, {"parent", parent == standalone_root ? "" : parent}};
   } catch (const std::runtime_error&) {}
+  const auto replacement = mesh_replacement(path);
+  if (!replacement.empty()) result["mesh_replacement"] = replacement;
   return result;
 }
 
@@ -412,6 +424,7 @@ void Document::set_property(const Json& request) {
   auto attr = prim.GetAttribute(TfToken(required(request, "property")));
   if (!attr) throw std::runtime_error("Unknown attribute");
   set_value(attr, request.at("value"));
+  update_light_extent(prim);
 }
 
 void Document::set_transform(const Json& request) {
@@ -421,7 +434,7 @@ void Document::set_transform(const Json& request) {
   UsdGeomXformable xform(prim);
   if (!xform) throw std::runtime_error("Selection cannot be transformed");
   GfMatrix4d matrix; bool reset;
-  xform.GetLocalTransformation(&matrix, &reset);
+  xform.GetLocalTransformation(&matrix, &reset, UsdTimeCode::EarliestTime());
   if (request.contains("matrix") || request.contains("world_matrix")) {
     const auto& elements = request.at(request.contains("world_matrix") ? "world_matrix" : "matrix");
     if (elements.size() != 16) throw std::runtime_error("Expected a 4x4 matrix");
@@ -430,14 +443,14 @@ void Document::set_transform(const Json& request) {
       if (!std::isfinite(matrix[r][c])) throw std::runtime_error("Non-finite transform");
     }
     if (request.contains("world_matrix") && !reset) {
-      UsdGeomXformCache cache;
+      UsdGeomXformCache cache(UsdTimeCode::EarliestTime());
       matrix *= invertible_inverse(cache.GetParentToWorldTransform(stage_->GetPrimAtPath(SdfPath(selected_path))));
     }
   } else {
     if (request.contains("rotation") || request.contains("scale")) {
       GfTransform original(matrix);
-      auto old_rotation = original.GetRotation().Decompose(GfVec3d(1, 0, 0), GfVec3d(0, 1, 0), GfVec3d(0, 0, 1));
-      auto rotation = request.contains("rotation") ? vector3(request.at("rotation")) : old_rotation;
+      auto old_rotation = original.GetRotation().Decompose(GfVec3d::ZAxis(), GfVec3d::YAxis(), GfVec3d::XAxis());
+      auto rotation = request.contains("rotation") ? vector3(request.at("rotation")) : GfVec3d(old_rotation[2], old_rotation[1], old_rotation[0]);
       auto scale = request.contains("scale") ? vector3(request.at("scale")) : original.GetScale();
       if (scale[0] == 0 || scale[1] == 0 || scale[2] == 0) throw std::runtime_error("Scale cannot be zero");
       auto t = matrix.ExtractTranslation();
@@ -449,14 +462,13 @@ void Document::set_transform(const Json& request) {
     }
     if (request.contains("translation")) matrix.SetTranslateOnly(vector3(request.at("translation")));
     if (request.contains("world_delta")) {
-      UsdGeomXformCache cache;
+      UsdGeomXformCache cache(UsdTimeCode::EarliestTime());
       auto selected = stage_->GetPrimAtPath(SdfPath(selected_path));
       auto parent = cache.GetParentToWorldTransform(selected);
       matrix.SetTranslateOnly(matrix.ExtractTranslation() + (reset ? GfMatrix4d(1) : invertible_inverse(parent)).TransformDir(vector3(request.at("world_delta"))));
     }
   }
-  if (!xform.MakeMatrixXform().Set(matrix)) throw std::runtime_error("Could not author transform");
-  xform.SetResetXformStack(reset);
+  author_transform(xform, matrix, reset);
 }
 
 std::string Document::authored_path(const std::string& path) const {
@@ -495,13 +507,18 @@ std::string Document::anchor_for(const std::string& path) const {
 std::string Document::parent_path(const std::string& path) const {
   auto prim = stage_->GetPrimAtPath(SdfPath(path));
   if (!prim || !UsdGeomXformable(prim)) throw std::runtime_error("Choose a transformable parent prim");
-  if (prim.GetParent().GetPath() == SdfPath("/RootNode/instances")) return anchor_for(path);
-  return authored_path(path);
+  // Authored assets retain their hierarchy. Capture geometry, however, only
+  // exists in the editor: a game attachment belongs to the draw-call hash root.
+  try { authored_asset(path); return authored_path(path); }
+  catch (const std::runtime_error&) {}
+  return anchor_for(path);
 }
 
 std::string Document::authored_asset(const std::string& path) const {
   auto prim = stage_->GetPrimAtPath(SdfPath(authored_path(path)));
   for (; prim && !prim.IsPseudoRoot(); prim = prim.GetParent()) {
+    if (prim.GetPath().GetParentPath() == SdfPath("/RootNode/meshes") ||
+        prim.GetPath().GetParentPath() == SdfPath("/RootNode/lights")) break;
     auto spec = edit_layer_->GetPrimAtPath(prim.GetPath());
     bool reference = false;
     auto flag = prim.GetAttribute(TfToken("IsRemixRef"));
@@ -540,15 +557,17 @@ std::string Document::set_parent(const Json& request) {
   const auto context = required(request, "path");
   const SdfPath old(authored_asset(context));
   const auto selected = stage_->GetPrimAtPath(SdfPath(display_path(old.GetString(), context)));
-  UsdGeomXformCache cache;
+  UsdGeomXformCache cache(UsdTimeCode::EarliestTime());
   const auto world = cache.GetLocalToWorldTransform(selected);
   const auto target = request.value("parent", std::string());
   const SdfPath parent(target.empty() ? standalone_root : parent_path(target));
   if (parent.HasPrefix(old)) throw std::runtime_error("An object cannot be parented to itself or its descendants");
   if (target.empty()) UsdGeomXform::Define(stage_, parent);
-  const auto parent_world = cache.GetLocalToWorldTransform(stage_->GetPrimAtPath(target.empty() ? parent : SdfPath(target)));
+  const auto displayed_parent = target.empty() ? parent.GetString() : display_path(parent.GetString(), target);
+  const auto parent_world = cache.GetLocalToWorldTransform(stage_->GetPrimAtPath(SdfPath(displayed_parent)));
   const auto local = world * invertible_inverse(parent_world);
   const auto next = old.GetParentPath() == parent ? old : SdfPath(unique_child(stage_, parent.GetString(), old.GetName()));
+  define_ancestors(edit_layer_, parent);
   if (next != old) {
     SdfCreatePrimInLayer(edit_layer_, parent);
     if (!SdfCopySpec(edit_layer_, old, edit_layer_, next)) throw std::runtime_error("Could not attach object");
@@ -556,7 +575,11 @@ std::string Document::set_parent(const Json& request) {
     if (!edit_layer_->Apply(removal)) throw std::runtime_error("Could not remove the previous attachment");
   }
   auto xform = UsdGeomXformable(stage_->GetPrimAtPath(next));
-  xform.MakeMatrixXform().Set(local); xform.SetResetXformStack(false);
+  author_transform(xform, local, false);
+  // A replacement moved to a different parent becomes an added attachment.
+  // Restoring the old draw call must not later remove this moved asset.
+  if (next != old && xform.GetPrim().GetCustomDataByKey(replacement_tag) == VtValue(true))
+    xform.GetPrim().SetCustomDataByKey(replacement_tag, VtValue(false));
   if (!target.empty()) {
     std::string anchor;
     try { anchor = anchor_for(target); } catch (const std::runtime_error&) {}
@@ -565,26 +588,65 @@ std::string Document::set_parent(const Json& request) {
       int previous = 1; preserve.Get(&previous); preserve.Set(previous);
     }
   }
-  return target.empty() ? next.GetString() : SdfPath(target).AppendChild(next.GetNameToken()).GetString();
+  return SdfPath(displayed_parent).AppendChild(next.GetNameToken()).GetString();
 }
 
 std::string Document::add_reference(const Json& request) {
   const auto selected = request.value("path", std::string());
   if (request.value("replace", false) && selected.empty()) throw std::runtime_error("Select a captured mesh to replace");
   const auto anchor = selected.empty() ? std::string(standalone_root) : anchor_for(selected);
+  // Remember the visible instance before replacement can deactivate the picked
+  // capture geometry. Editing stays shared, but the gizmo uses this instance.
+  const auto displayed_anchor = selected.empty() ? anchor : display_path(anchor, selected);
   if (selected.empty()) UsdGeomXform::Define(stage_, SdfPath(anchor));
   fs::path asset = fs::absolute(required(request, "asset"));
   auto source = UsdStage::Open(asset.string());
   if (!source || !source->GetDefaultPrim()) throw std::runtime_error("Asset requires a valid USD default prim; ingest it first");
+  define_ancestors(edit_layer_, SdfPath(anchor));
   auto root = stage_->OverridePrim(SdfPath(anchor));
   bool replace = request.value("replace", false);
   if (replace) {
+    // Persist only the opinions replacement changes, so reverting after a
+    // save/reopen preserves unrelated transform, material and visibility edits.
+    auto backup = SdfLayer::CreateAnonymous();
+    auto local_root = edit_layer_->GetPrimAtPath(SdfPath(anchor));
+    const VtDictionary saved = local_root->GetCustomData();
+    auto existing = saved.find(replacement_restore.GetString());
+    if (existing != saved.end() && existing->second.IsHolding<std::string>()) {
+      if (!backup->ImportFromString(existing->second.Get<std::string>()))
+        throw std::runtime_error("Could not read mesh replacement restore data");
+    } else {
+      auto preserve = edit_layer_->GetAttributeAtPath(SdfPath(anchor).AppendProperty(TfToken("preserveOriginalDrawCall")));
+      const bool legacy_replaced = preserve && preserve->GetDefaultValue() == VtValue(0);
+      // Upgrade a replacement selected from an older project before adding
+      // another one. Its empty reference list/inactive opinions are suppression,
+      // not the original state to restore.
+      if (legacy_replaced) {
+        const auto previous = mesh_replacement(selected);
+        if (!previous.empty()) for (const auto& ref : previous.at("references"))
+          stage_->GetPrimAtPath(SdfPath(ref.get<std::string>())).SetCustomDataByKey(replacement_tag, VtValue(true));
+        for (auto child : local_root->GetNameChildren())
+          if (child->GetSpecifier() == SdfSpecifierOver && child->HasActive() && !child->GetActive())
+            SdfCreatePrimInLayer(backup, child->GetPath());
+      }
+      auto record = SdfCreatePrimInLayer(backup, SdfPath(anchor));
+      auto refs = local_root->GetReferenceList();
+      if (local_root->HasInfo(SdfFieldKeys->References) && !(legacy_replaced && refs.IsExplicit() && refs.GetExplicitItems().empty()))
+        record->SetInfo(SdfFieldKeys->References, local_root->GetInfo(SdfFieldKeys->References));
+    }
     // Inline captured meshes survive clearing reference arcs. Suppress original
     // children while retaining the user's authored attachments.
     for (auto child : root.GetChildren()) {
       auto spec = edit_layer_->GetPrimAtPath(child.GetPath());
-      if (!spec || spec->GetSpecifier() != SdfSpecifierDef) child.SetActive(false);
+      if (!spec || spec->GetSpecifier() != SdfSpecifierDef) {
+        if (!backup->GetPrimAtPath(child.GetPath())) {
+          auto record = SdfCreatePrimInLayer(backup, child.GetPath());
+          if (spec && spec->HasActive()) record->SetActive(spec->GetActive());
+        }
+        child.SetActive(false);
+      }
     }
+    root.SetCustomDataByKey(replacement_restore, VtValue(layer_text(backup)));
     root.GetReferences().SetReferences({});
   }
   if (!selected.empty()) {
@@ -595,20 +657,147 @@ std::string Document::add_reference(const Json& request) {
   auto prim = UsdGeomXform::Define(stage_, SdfPath(path)).GetPrim();
   prim.GetReferences().AddReference(relative_asset(asset, edit_layer_));
   prim.CreateAttribute(TfToken("IsRemixRef"), SdfValueTypeNames->Bool, true).Set(true);
+  // Distinguish added attachments from replacements, including after reopening.
+  prim.SetCustomDataByKey(replacement_tag, VtValue(replace));
   GfMatrix4d normalization;
   normalization.SetScale(UsdGeomGetStageMetersPerUnit(source) / UsdGeomGetStageMetersPerUnit(stage_));
   if (UsdGeomGetStageUpAxis(source) != UsdGeomGetStageUpAxis(stage_)) {
     normalization *= GfMatrix4d(GfRotation(GfVec3d(1, 0, 0), UsdGeomGetStageUpAxis(source) == UsdGeomTokens->y ? 90.0 : -90.0), GfVec3d(0));
   }
-  UsdGeomXformable(prim).MakeMatrixXform().Set(normalization);
+  // A stronger xformOpOrder replaces the referenced root's entire transform.
+  // Include that transform (notably FBX's cm-to-m conversion) before converting
+  // the asset's units/up axis into the project coordinate system.
+  GfMatrix4d asset_transform(1);
+  bool reset = false;
+  if (auto source_xform = UsdGeomXformable(source->GetDefaultPrim()))
+    source_xform.GetLocalTransformation(&asset_transform, &reset, UsdTimeCode::EarliestTime());
+  author_transform(UsdGeomXformable(prim), asset_transform * normalization, false);
   if (request.contains("translation")) {
     if (selected.empty()) {
-      UsdGeomXformCache cache;
+      UsdGeomXformCache cache(UsdTimeCode::EarliestTime());
       auto delta = vector3(request.at("translation")) - cache.GetLocalToWorldTransform(prim).ExtractTranslation();
       set_transform({{"path", path}, {"world_delta", {delta[0], delta[1], delta[2]}}});
     } else set_transform({{"path", path}, {"translation", request.at("translation")}});
   }
-  return path;
+  return SdfPath(path).ReplacePrefix(SdfPath(anchor), SdfPath(displayed_anchor)).GetString();
+}
+
+Json Document::mesh_replacement(const std::string& path) const {
+  std::string anchor;
+  try { anchor = anchor_for(path); } catch (const std::runtime_error&) { return {}; }
+  if (SdfPath(anchor).GetParentPath() != SdfPath("/RootNode/meshes")) return {};
+  auto root = edit_layer_->GetPrimAtPath(SdfPath(anchor));
+  if (!root) return {};
+  // Only expose this for the captured mesh, its replacement or the hash root;
+  // selecting an independently attached light/mesh must not offer to remove it.
+  SdfPath selected;
+  try { selected = SdfPath(authored_path(path)); } catch (const std::runtime_error&) { selected = SdfPath(anchor); }
+  if (!selected.HasPrefix(SdfPath(anchor))) return {};
+  for (auto prim = stage_->GetPrimAtPath(selected); prim && prim.GetPath() != SdfPath(anchor); prim = prim.GetParent()) {
+    if (UsdLuxLightAPI(prim)) return {};
+    auto spec = edit_layer_->GetPrimAtPath(prim.GetPath());
+    if (spec) {
+      const VtDictionary data = spec->GetCustomData();
+      auto tag = data.find(replacement_tag.GetString());
+      if (tag != data.end() && tag->second == VtValue(false)) return {};
+    }
+  }
+  auto child = selected;
+  while (child != SdfPath(anchor) && child.GetParentPath() != SdfPath(anchor)) child = child.GetParentPath();
+  auto selected_spec = edit_layer_->GetPrimAtPath(child);
+  if (child != SdfPath(anchor) && selected_spec && selected_spec->GetSpecifier() == SdfSpecifierDef) {
+    bool reference = false;
+    auto prim = stage_->GetPrimAtPath(child);
+    if (auto flag = prim.GetAttribute(TfToken("IsRemixRef"))) flag.Get(&reference);
+    VtDictionary data = selected_spec->GetCustomData();
+    if (!reference || data[replacement_tag.GetString()] == VtValue(false)) return {};
+  }
+  Json references = Json::array(), legacy = Json::array();
+  for (auto spec : root->GetNameChildren()) {
+    if (spec->GetSpecifier() != SdfSpecifierDef) continue;
+    const VtDictionary data = spec->GetCustomData();
+    auto tag = data.find(replacement_tag.GetString());
+    if (tag != data.end()) {
+      if (tag->second == VtValue(true)) references.push_back(spec->GetPath().GetString());
+    } else {
+      auto flag = edit_layer_->GetAttributeAtPath(spec->GetPath().AppendProperty(TfToken("IsRemixRef")));
+      if (flag && flag->GetDefaultValue() == VtValue(true)) legacy.push_back(spec->GetPath().GetString());
+    }
+  }
+  // Older projects did not distinguish Add from Replace. Revert the picked
+  // reference, leaving any other unmarked attachments intact. A root selection
+  // is unambiguous only when there is one legacy reference.
+  auto preserve = edit_layer_->GetAttributeAtPath(SdfPath(anchor).AppendProperty(TfToken("preserveOriginalDrawCall")));
+  if (preserve && preserve->GetDefaultValue() == VtValue(0)) {
+    for (const auto& candidate : legacy)
+      if (candidate == child.GetString() || (references.empty() && legacy.size() == 1 && child == SdfPath(anchor)))
+        references.push_back(candidate);
+  }
+  const VtDictionary data = root->GetCustomData();
+  if (references.empty() && !data.count(replacement_restore.GetString())) return {};
+  return {{"anchor", anchor}, {"references", references}};
+}
+
+std::string Document::revert_mesh(const std::string& path) {
+  const auto replacement = mesh_replacement(path);
+  if (replacement.empty()) throw std::runtime_error("Select a mesh replacement in the active authoring layer");
+  const SdfPath anchor(replacement.at("anchor").get<std::string>());
+  const SdfPath displayed(display_path(anchor.GetString(), path));
+  auto root = stage_->GetPrimAtPath(anchor);
+  auto local_root = edit_layer_->GetPrimAtPath(anchor);
+  const VtDictionary data = local_root->GetCustomData();
+  auto saved = data.find(replacement_restore.GetString());
+  auto backup = SdfLayer::CreateAnonymous();
+  if (saved != data.end()) {
+    if (!saved->second.IsHolding<std::string>() || !backup->ImportFromString(saved->second.Get<std::string>()) || !backup->GetPrimAtPath(anchor))
+      throw std::runtime_error("Could not read mesh replacement restore data");
+  }
+  for (const auto& reference : replacement.at("references")) {
+    const SdfPath ref(reference.get<std::string>());
+    // Keep user-authored attachments even when they were parented inside the
+    // imported model. Move their outermost authored roots to the draw-call root.
+    std::vector<SdfPath> attachments;
+    auto range = UsdPrimRange(stage_->GetPrimAtPath(ref));
+    for (auto it = range.begin(); it != range.end(); ++it) {
+      if (it->GetPath() == ref) continue;
+      auto spec = edit_layer_->GetPrimAtPath(it->GetPath());
+      // define_ancestors also creates untyped defs along the attachment path;
+      // these are imported model hierarchy, not separately authored assets.
+      if (spec && spec->GetSpecifier() == SdfSpecifierDef && !spec->GetTypeName().IsEmpty() &&
+          (UsdLuxLightAPI(*it) || it->IsA<UsdGeomMesh>() || it->GetAttribute(TfToken("IsRemixRef")))) {
+        attachments.push_back(it->GetPath()); it.PruneChildren();
+      }
+    }
+    for (const auto& attachment : attachments)
+      set_parent({{"path", attachment.ReplacePrefix(anchor, displayed).GetString()}, {"parent", displayed.GetString()}});
+    SdfBatchNamespaceEdit removal; removal.Add(SdfNamespaceEdit::Remove(ref));
+    if (!edit_layer_->Apply(removal)) throw std::runtime_error("Could not remove mesh replacement");
+  }
+  if (saved != data.end()) {
+    auto record = backup->GetPrimAtPath(anchor);
+    if (record->HasInfo(SdfFieldKeys->References)) local_root->SetInfo(SdfFieldKeys->References, record->GetInfo(SdfFieldKeys->References));
+    else local_root->ClearInfo(SdfFieldKeys->References);
+    for (auto child : record->GetNameChildren()) {
+      auto spec = edit_layer_->GetPrimAtPath(child->GetPath());
+      if (!spec) continue;
+      if (child->HasActive()) spec->SetActive(child->GetActive());
+      else spec->ClearActive();
+    }
+  } else {
+    // Compatibility with replacements authored before restore records existed.
+    auto refs = local_root->GetReferenceList();
+    if (refs.IsExplicit() && refs.GetExplicitItems().empty()) root.GetReferences().ClearReferences();
+    for (auto child : local_root->GetNameChildren())
+      if (child->GetSpecifier() == SdfSpecifierOver && child->HasActive() && !child->GetActive()) child->ClearActive();
+  }
+  root.ClearCustomDataByKey(replacement_restore);
+  root.CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true).Set(1);
+  // Keep selection on the restored geometry in the same visible instance.
+  for (auto prim : UsdPrimRange(stage_->GetPrimAtPath(displayed))) {
+    if (!prim.IsA<UsdGeomMesh>()) continue;
+    try { authored_asset(prim.GetPath().GetString()); } catch (const std::runtime_error&) { return prim.GetPath().GetString(); }
+  }
+  return displayed.GetString();
 }
 
 Json Document::light_defaults(const std::string& type) const {
@@ -640,6 +829,7 @@ std::string Document::add_light(const Json& request) {
   const auto anchor = selected.empty() ? std::string(standalone_root) : anchor_for(selected);
   if (selected.empty()) UsdGeomXform::Define(stage_, SdfPath(anchor));
   auto type = request.value("type", std::string("SphereLight"));
+  define_ancestors(edit_layer_, SdfPath(anchor));
   auto path = unique_child(stage_, anchor, request.value("name", type));
   auto sdf = SdfPath(path);
   UsdPrim light;
@@ -654,6 +844,7 @@ std::string Document::add_light(const Json& request) {
   const auto defaults = light_defaults(type).at("properties");
   for (auto it = defaults.begin(); it != defaults.end(); ++it) set_value(light.GetAttribute(TfToken(it.key())), it.value());
   if (request.contains("intensity")) UsdLuxLightAPI(light).CreateIntensityAttr().Set(request.at("intensity").get<float>());
+  update_light_extent(light);
   if (!selected.empty()) {
     auto preserve = stage_->OverridePrim(SdfPath(anchor)).CreateAttribute(TfToken("preserveOriginalDrawCall"), SdfValueTypeNames->Int, true);
     int previous = 1; preserve.Get(&previous); preserve.Set(previous);
@@ -662,7 +853,7 @@ std::string Document::add_light(const Json& request) {
   if (request.contains("world_matrix")) {
     set_transform({{"path", path}, {"world_matrix", request.at("world_matrix")}});
   } else if (selected.empty()) {
-    UsdGeomXformCache cache;
+    UsdGeomXformCache cache(UsdTimeCode::EarliestTime());
     auto delta = position - cache.GetLocalToWorldTransform(light).ExtractTranslation();
     set_transform({{"path", path}, {"world_delta", {delta[0], delta[1], delta[2]}}});
   } else set_transform({{"path", path}, {"translation", {position[0], position[1], position[2]}}});
@@ -739,6 +930,7 @@ void Document::export_mod(const fs::path& directory, bool link_assets) {
     metadata.erase("omni_layer");
     metadata.erase(capture_catalog);
     snapshot->SetCustomLayerData(metadata);
+    replacement_metadata(snapshot, stage_);
     UsdUtilsModifyAssetPaths(snapshot, [&](const std::string& asset) {
       return asset.empty() ? asset : SdfComputeAssetPathRelativeToLayer(root, asset);
     });
@@ -801,6 +993,19 @@ void Document::export_mod(const fs::path& directory, bool link_assets) {
       const auto destination = destinations.at(source);
       auto copy = SdfLayer::CreateAnonymous(fs::path(source).filename().string());
       copy->TransferContent(layer);
+      const auto project_layers = stage_->GetLayerStack(false);
+      if (destination == fs::path("mod.usda") || std::find(project_layers.begin(), project_layers.end(), layer) != project_layers.end()) {
+        replacement_metadata(copy, stage_);
+        normalize_replacement(copy, stage_);
+      }
+      // Old projects may define attachments beneath capture-only `over` parents.
+      // Make those ancestors explicit in the capture-free mod as Toolkit does.
+      std::vector<SdfPath> definitions;
+      copy->Traverse(SdfPath::AbsoluteRootPath(), [&](const SdfPath& path) {
+        auto spec = copy->GetPrimAtPath(path);
+        if (path.IsPrimPath() && spec && spec->GetSpecifier() == SdfSpecifierDef) definitions.push_back(path);
+      });
+      for (const auto& path : definitions) define_ancestors(copy, path.GetParentPath());
       UsdUtilsModifyAssetPaths(copy, [&](const std::string& asset) {
         if (asset.empty()) return asset;
         auto resolved = SdfComputeAssetPathRelativeToLayer(layer, asset);
@@ -856,6 +1061,7 @@ void Document::mutate(const Json& request, Json& result) {
     auto data = request; data["replace"] = op == "replace_mesh";
     result["selection"] = add_reference(data);
   } else if (op == "add_light") result["selection"] = add_light(request);
+  else if (op == "revert_mesh") result["selection"] = revert_mesh(required(request, "path"));
   else if (op == "replace_material") replace_material(request);
   else if (op == "visibility") {
     auto prim = stage_->GetPrimAtPath(SdfPath(authored_path(required(request, "path"))));

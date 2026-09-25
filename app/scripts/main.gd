@@ -11,6 +11,8 @@ const RenderSettings = preload("res://scripts/render_settings.gd")
 const RenderSettingsDialog = preload("res://scripts/render_settings_dialog.gd")
 const GameLink = preload("res://scripts/game_link.gd")
 const GameLinkDialog = preload("res://scripts/game_link_dialog.gd")
+const MODEL_EXTENSIONS := ["usd", "usda", "usdc", "gltf", "glb", "fbx", "obj"]
+const IMAGE_EXTENSIONS := ["png", "jpg", "jpeg", "tga", "exr", "hdr", "dds"]
 var game_link := GameLink.new()
 var game_link_button: Button
 var game_link_dialog: AcceptDialog
@@ -51,6 +53,11 @@ var root_directory := ""
 var library_selection := ""
 var import_folder := ""
 var import_project := ""
+var import_workfile := ""
+var import_queue: Array[Dictionary] = []
+var import_dialog: ConfirmationDialog
+var import_button: Button
+var import_total := 0
 
 func _ready() -> void:
 	root_directory = ProjectSettings.globalize_path("res://").get_base_dir().get_base_dir()
@@ -70,6 +77,7 @@ func _ready() -> void:
 	dpi_timer = Timer.new(); dpi_timer.wait_time = 1.0
 	dpi_timer.timeout.connect(_update_dpi); add_child(dpi_timer); dpi_timer.start()
 	get_window().dpi_changed.connect(_update_dpi)
+	get_window().files_dropped.connect(_files_dropped)
 	renderer = RendererClient.new()
 	add_child(renderer)
 	renderer.status_changed.connect(_log)
@@ -144,10 +152,9 @@ func _build_ui() -> void:
 	game_link_button.disabled = true
 	_button("Undo", func(): _command({"op": "undo"}), toolbar)
 	_button("Redo", func(): _command({"op": "redo"}), toolbar)
-	_button("Ingest asset", _choose_ingest, toolbar)
-	_button("Cancel import", func():
-		if document != null and import_running:
-			document.cancel_ingestion(), toolbar)
+	import_button = _button("Ingest asset", _choose_ingest, toolbar)
+	import_button.tooltip_text = "Choose assets, or drop model/image files into the window to ingest them."
+	_button("Cancel import", _cancel_import, toolbar)
 	_button("Add mesh", func(): _use_asset("add_mesh"), toolbar)
 	_button("Replace mesh", func(): _use_asset("replace_mesh"), toolbar)
 	_button("Replace material", func(): _use_asset("replace_material"), toolbar)
@@ -233,6 +240,8 @@ func _build_ui() -> void:
 	viewport.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	viewport.custom_minimum_size = Vector2(400, 300)
 	viewport.selected.connect(_select)
+	viewport.parent_picked.connect(func(path: String, parent: String): _command.call_deferred({"op": "set_parent", "path": path, "parent": parent}))
+	viewport.parent_pick_ended.connect(func(): inspector.set_parent_picking(false))
 	viewport.camera_changed.connect(func(camera: Dictionary):
 		if renderer != null and renderer.is_ready and not restoring_view:
 			renderer.send({"op": "camera", "camera": camera}))
@@ -253,6 +262,7 @@ func _build_ui() -> void:
 	right.add_child(scroll)
 	inspector = AuthoringInspector.new()
 	inspector.request = _request
+	inspector.parent_pick_requested.connect(_begin_parent_pick)
 	inspector.command_requested.connect(func(command: Dictionary): _command.call_deferred(command))
 	inspector.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(inspector)
@@ -310,6 +320,7 @@ func _request(data: Dictionary) -> Dictionary:
 	return response.get("result", {})
 
 func _command(data: Dictionary) -> void:
+	viewport.cancel_parent_pick()
 	if data.op == "open" and not FileAccess.file_exists(data.path):
 		_log("Project file is missing: " + data.path)
 		return
@@ -327,6 +338,8 @@ func _command(data: Dictionary) -> void:
 	if result.has("selection"):
 		selection = result.selection
 	if result.has("document"):
+		if result.document.get("path", "") != state.get("path", ""):
+			_cancel_import()
 		var capture_changed: bool = result.document.get("active_capture", "") != state.get("active_capture", "")
 		if capture_changed and data.op not in ["open", "create"]:
 			_persist_camera()
@@ -424,6 +437,7 @@ func _tree_selected() -> void:
 		_select(item.get_metadata(0))
 
 func _select(path: String) -> void:
+	viewport.cancel_parent_pick()
 	var details := _request({"op": "inspect", "path": path}) if not path.is_empty() else {}
 	if details.is_empty(): path = ""
 	selection = path
@@ -433,6 +447,18 @@ func _select(path: String) -> void:
 	inspector.project_directory = String(state.get("path", "")).get_base_dir()
 	inspector.show_selection(details)
 	viewport.gizmo.set_target(details)
+
+func _begin_parent_pick(path: String) -> void:
+	if not viewport.parent_pick_path.is_empty():
+		viewport.cancel_parent_pick(); return
+	# Pending inspector changes are dispatched on the next frame.
+	await get_tree().process_frame
+	var details := _request({"op": "inspect", "path": path})
+	if not details.has("attachment"): return
+	var candidates := _request({"op": "parent_candidates", "path": path})
+	if not candidates.has("parents"): return
+	viewport.begin_parent_pick(path, candidates.parents, details.authoring.edit_path)
+	inspector.set_parent_picking(true)
 
 func _spawn_light(type: String) -> void:
 	var defaults := _request({"op": "light_defaults", "type": type})
@@ -468,9 +494,11 @@ func _dialog(mode: FileDialog.FileMode, title: String, filters: PackedStringArra
 	dialog.use_native_dialog = false
 	(dialog_parent if dialog_parent != null else self).add_child(dialog)
 	if mode == FileDialog.FILE_MODE_OPEN_DIR:
-		dialog.dir_selected.connect(func(path: String): dialog.queue_free(); callback.call_deferred(path))
+		dialog.dir_selected.connect(func(path: String): dialog.hide(); dialog.queue_free(); callback.call_deferred(path))
+	elif mode == FileDialog.FILE_MODE_OPEN_FILES:
+		dialog.files_selected.connect(func(paths: PackedStringArray): dialog.hide(); dialog.queue_free(); callback.call_deferred(paths))
 	else:
-		dialog.file_selected.connect(func(path: String): dialog.queue_free(); callback.call_deferred(path))
+		dialog.file_selected.connect(func(path: String): dialog.hide(); dialog.queue_free(); callback.call_deferred(path))
 	dialog.canceled.connect(dialog.queue_free)
 	dialog.popup_centered_ratio(0.65)
 	return dialog
@@ -543,6 +571,7 @@ func _show_game_link() -> void:
 	inspector._finish_editing()
 	await get_tree().process_frame
 	viewport.set_mouse_capture(false)
+	game_link.refresh_status()
 	if is_instance_valid(game_link_dialog): game_link_dialog.queue_free()
 	game_link_dialog = GameLinkDialog.new()
 	game_link_dialog.link = game_link
@@ -556,32 +585,126 @@ func _show_game_link() -> void:
 	dialog.popup_centered()
 
 func _choose_ingest() -> void:
-	if not state.get("open", false) or import_running:
+	if not state.get("open", false) or import_running or not import_queue.is_empty() or is_instance_valid(import_dialog):
 		_log("Open a project and finish any running import first.")
 		return
-	_dialog(FileDialog.FILE_MODE_OPEN_FILE, "Ingest model or material", ["*.usd,*.usda,*.usdc,*.gltf,*.glb,*.fbx,*.obj,*.png,*.jpg,*.jpeg,*.tga,*.exr,*.hdr,*.dds ; Assets"], func(path: String):
-		_import_options(path))
+	viewport.set_mouse_capture(false)
+	_dialog(FileDialog.FILE_MODE_OPEN_FILES, "Ingest models or materials", ["*.usd,*.usda,*.usdc,*.gltf,*.glb,*.fbx,*.obj,*.png,*.jpg,*.jpeg,*.tga,*.exr,*.hdr,*.dds ; Assets"], _files_dropped)
 
-func _import_options(path: String) -> void:
+func _files_dropped(files: PackedStringArray) -> void:
+	if not state.get("open", false) or document == null:
+		_log("Open or create a project before dropping assets to ingest.")
+		return
+	if import_running or not import_queue.is_empty() or is_instance_valid(import_dialog):
+		_log("Finish or cancel the current import before dropping more files.")
+		return
+	for child in find_children("*", "Window", true, false):
+		if child.visible and child.exclusive:
+			_log("Close the current dialog before dropping assets.")
+			return
+	var accepted := PackedStringArray()
+	var skipped := PackedStringArray()
+	for file in files:
+		var path := file.simplify_path()
+		var extension := path.get_extension().to_lower()
+		if not FileAccess.file_exists(path) or not (extension in MODEL_EXTENSIONS or extension in IMAGE_EXTENSIONS):
+			skipped.append(path.get_file())
+		elif not accepted.has(path):
+			accepted.append(path)
+	if not skipped.is_empty():
+		_log("Skipped unsupported files, folders, or missing files: " + ", ".join(skipped))
+	if accepted.is_empty():
+		if not skipped.is_empty():
+			var notice := AcceptDialog.new()
+			notice.title = "No assets to ingest"
+			notice.dialog_text = "Drop USD, glTF, GLB, FBX, OBJ, or supported image files.\nFolders and unsupported or missing files were skipped."
+			add_child(notice)
+			notice.confirmed.connect(notice.queue_free)
+			notice.canceled.connect(notice.queue_free)
+			notice.popup_centered()
+		return
+	viewport.set_mouse_capture(false)
+	_show_editor()
+	_import_options(accepted, skipped)
+
+func _available_import_name(value: String, reserved: Array[String] = []) -> String:
+	# Match USD's ASCII identifier sanitization, including UTF-8 byte replacement.
+	var stem := ""
+	for byte in value.to_utf8_buffer():
+		var valid := (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95 or (not stem.is_empty() and byte >= 48 and byte <= 57)
+		stem += String.chr(byte) if valid else "_"
+	if stem.is_empty(): stem = "asset"
+	var name := stem
+	var index := 2
+	var directory := String(state.path).get_base_dir().path_join("assets")
+	while name in reserved or FileAccess.file_exists(directory.path_join(name)) or DirAccess.dir_exists_absolute(directory.path_join(name)):
+		name = stem + "_" + str(index)
+		index += 1
+	return name
+
+func _cancel_import() -> void:
+	import_queue.clear()
+	if is_instance_valid(import_dialog):
+		import_dialog.hide()
+		import_dialog.queue_free()
+		import_dialog = null
+	if document != null and import_running:
+		document.cancel_ingestion()
+	else:
+		import_button.text = "Ingest asset"
+		import_button.disabled = false
+
+func _start_next_import() -> void:
+	if import_running: return
+	import_button.text = "Ingest asset"
+	import_button.disabled = false
+	if state.get("path", "") != import_workfile:
+		import_queue.clear()
+		return
+	while not import_queue.is_empty():
+		var request: Dictionary = import_queue.pop_front()
+		var response = JSON.parse_string(document.start_ingestion(JSON.stringify(request)))
+		if response.get("ok", false):
+			import_running = true
+			import_button.text = "Ingesting %d/%d" % [import_total - import_queue.size(), import_total]
+			import_button.disabled = true
+			_log("Ingesting %s (%d/%d)…" % [String(request.source).get_file(), import_total - import_queue.size(), import_total])
+			return
+		_log(response.get("error", "Could not start ingestion"))
+
+func _import_options(paths: PackedStringArray, skipped := PackedStringArray()) -> void:
+	var project := String(state.path)
+	var folder: String = assets.current_folder
+	var has_models := false
+	var has_images := false
+	for path in paths:
+		if path.get_extension().to_lower() in IMAGE_EXTENSIONS: has_images = true
+		else: has_models = true
 	var dialog := ConfirmationDialog.new()
-	dialog.title = "Ingest " + path.get_file()
+	import_dialog = dialog
+	dialog.title = "Ingest " + paths[0].get_file() if paths.size() == 1 else "Ingest %d assets" % paths.size()
 	dialog.ok_button_text = "Ingest"
 	var fields := VBoxContainer.new()
 	dialog.add_child(fields)
-	_label("Asset name", fields)
+	_label("Destination: " + assets.catalog.folder_path(folder), fields)
+	if not skipped.is_empty(): _label("Skipped %d unsupported or missing item(s)." % skipped.size(), fields)
 	var asset_name := LineEdit.new()
-	asset_name.text = path.get_file().get_basename()
-	fields.add_child(asset_name)
-	var is_material := path.get_extension().to_lower() in ["png", "jpg", "jpeg", "tga", "exr", "hdr", "dds"]
+	asset_name.text = _available_import_name(paths[0].get_file().get_basename())
+	if paths.size() == 1:
+		_label("Asset name", fields)
+		fields.add_child(asset_name)
+	else:
+		_label("Files keep their names; existing names receive a numbered suffix.", fields)
+		dialog.add_child(asset_name); asset_name.hide()
 	var scale_field := SpinBox.new()
 	scale_field.min_value = 0.0001; scale_field.max_value = 100000; scale_field.step = 0.01; scale_field.value = 1
-	if not is_material:
+	if has_models:
 		_label("Scale multiplier (after source unit conversion)", fields)
 		fields.add_child(scale_field)
 	var material_kind := OptionButton.new()
 	var texture_role := OptionButton.new()
-	if is_material:
-		_label("Material", fields)
+	if has_images:
+		_label("Image material", fields)
 		for name in ["Opaque", "Cutout", "Glass"]:
 			material_kind.add_item(name)
 		fields.add_child(material_kind)
@@ -595,25 +718,31 @@ func _import_options(path: String) -> void:
 	normal.add_item("DirectX (-Y)")
 	fields.add_child(normal)
 	dialog.confirmed.connect(func():
-		var request := {"source": path, "name": asset_name.text, "scale": scale_field.value, "material": is_material,
-			"normal_encoding": "normal_ogl" if normal.selected == 0 else "normal_dx", "mdl_directory": root_directory.path_join("app/materials")}
-		if is_material:
-			request["texture_role"] = ["albedo", "normal", "roughness", "metallic", "emissive"][texture_role.selected]
-			request["properties"] = {"kind": "translucent" if material_kind.selected == 2 else "opaque", "alpha_test": 6 if material_kind.selected == 1 else 7}
-		var response = JSON.parse_string(document.start_ingestion(JSON.stringify(request)))
-		if response.get("ok", false):
-			import_folder = assets.current_folder
-			import_project = String(state.path).get_base_dir()
-			import_running = true
-			_log("Ingesting " + path.get_file() + "…")
-		else:
-			_log(response.get("error", "Could not start ingestion"))
-		dialog.queue_free())
-	dialog.canceled.connect(dialog.queue_free)
+		if state.get("path", "") != project: return
+		var names: Array[String] = []
+		for path in paths:
+			var is_material := path.get_extension().to_lower() in IMAGE_EXTENSIONS
+			var name := _available_import_name(asset_name.text if paths.size() == 1 else path.get_file().get_basename(), names)
+			names.append(name)
+			var request := {"source": path, "name": name, "scale": scale_field.value, "material": is_material,
+				"normal_encoding": "normal_ogl" if normal.selected == 0 else "normal_dx", "mdl_directory": root_directory.path_join("app/materials")}
+			if is_material:
+				request["texture_role"] = ["albedo", "normal", "roughness", "metallic", "emissive"][texture_role.selected]
+				request["properties"] = {"kind": "translucent" if material_kind.selected == 2 else "opaque", "alpha_test": 6 if material_kind.selected == 1 else 7}
+			import_queue.append(request)
+		import_folder = folder
+		import_workfile = project
+		import_project = project.get_base_dir()
+		import_total = import_queue.size()
+		import_dialog = null
+		dialog.hide()
+		dialog.queue_free()
+		_start_next_import())
+	dialog.canceled.connect(func(): import_dialog = null; dialog.hide(); dialog.queue_free())
 	# Keep all controls owned, including those hidden for this asset type.
-	if is_material:
+	if not has_models:
 		dialog.add_child(scale_field); scale_field.hide()
-	else:
+	if not has_images:
 		dialog.add_child(material_kind); material_kind.hide()
 		dialog.add_child(texture_role); texture_role.hide()
 	add_child(dialog)
@@ -729,11 +858,20 @@ func _process(_delta: float) -> void:
 					_log(warning)
 				if assets.project_directory == import_project:
 					assets.register_ingestion(result.result.asset, import_folder)
+				else:
+					# An already-completed job may finish after switching projects.
+					# Preserve its destination folder in the original catalog.
+					var catalog := AssetBrowser.Catalog.new()
+					catalog.error.connect(_log)
+					catalog.open_project(import_project)
+					var id: String = String(result.result.asset).trim_prefix(import_project.trim_suffix("/") + "/")
+					catalog.move_assets([id], import_folder if catalog.folders.has(import_folder) else "")
 			else:
 				_log(result.get("error", "Ingestion failed"))
+			_start_next_import()
 
 func _unhandled_key_input(event: InputEvent) -> void:
-	if welcome.visible:
+	if welcome.visible or not viewport.parent_pick_path.is_empty():
 		return
 	if not event.is_pressed() or event.is_echo() or get_viewport().gui_get_focus_owner() is LineEdit or get_viewport().gui_get_focus_owner() is TextEdit:
 		return
@@ -819,6 +957,7 @@ func _complete_preview(path: String, saved_at: float, serial: int, image: Image,
 		welcome.refresh(sessions, state.get("open", false))
 
 func _prepare_close() -> void:
+	_cancel_import()
 	_persist_camera()
 	game_link.flush()
 	var deadline := Time.get_ticks_msec() + 2000

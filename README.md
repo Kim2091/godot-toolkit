@@ -23,17 +23,56 @@ To launch the already built app directly:
 .work/deps/godot/bin/godot.linuxbsd.editor.x86_64.llvm --path app
 ```
 
+## Portable Linux build
+
+After building the application, run `python scripts/bootstrap.py portable`. This creates
+`dist/RemixStudio-linux-x86_64.tar.gz` and its SHA-256 checksum. Extract the archive
+to a writable folder and run `./remix-studio`; no installation or build tools are needed.
+The package includes the patched Godot engine, GDExtension, Remix worker/runtime,
+DLSS libraries, USD libraries and schemas, Assimp, oneTBB, and MDL materials.
+Godot retains its editor capabilities for the authoring image codecs/compressors.
+
+The package needs Linux x86_64, an X11/Wayland desktop, a Vulkan loader and a
+Remix-capable GPU driver. It uses the build host's glibc baseline, recorded in
+`build-info.json` and checked by the launcher; the current build needs **glibc 2.44+**.
+It does not bundle glibc or GPU drivers. Build on an older compatible toolchain/sysroot
+to target older distributions. This is a Linux toolkit package; the game's Windows
+`d3d9.dll` is separate.
+
+Settings, recent projects, logs and caches live in the bundle's `data/` directory.
+`REMIX_STUDIO_DATA_DIR=/writable/path ./remix-studio` relocates that data when needed.
+Existing renderer/settings environment overrides remain supported. CLI access is
+available with `./remix-studio --cli inspect /path/to/project.usda`.
+
+Packaging uses an explicit application-file allowlist and a fresh extension registry;
+it excludes local projects, captures, screenshots, tests, settings and import caches.
+Projects remain external and must retain access to their captures/assets. Shared
+libraries use relative runtime paths, and USD keeps its plugin/schema layout.
+Component notices, source patches, build provenance and file checksums are included.
+For custom output names/locations, run `python scripts/package_portable.py --help`.
+
+Run `python scripts/test_portable.py --gpu` to extract and validate the archive in
+a path containing spaces, with the source checkout hidden by Bubblewrap. The test
+covers USD loading, BC7/MDL ingestion, project reopening, CLI access, relocation,
+separate writable settings and actual Remix viewport presentation. Omit `--gpu`
+for headless checks. Test logs/screenshots remain in the reported temporary folder.
+
 ## Workflow
 
 1. The welcome screen offers your recent projects with previews from their last successful Save. Choose **New from capture**, select a Remix capture, and create the project in a new directory. Or choose **Open** for an existing Toolkit workfile.
 2. Remix starts automatically when you open or create a project with the **Remix** toggle enabled. Turning it off pauses rendering and shows the Layout view; turning it on starts or resumes Remix. Toggle it off and on to retry after a renderer failure. Initial shader compilation can take tens of seconds. The camera defaults to **Drone**: press **Z** over the viewport to capture the mouse, look around with the mouse, and fly with **WASD**. **Q/E** moves down/up, **Shift** moves faster, and the wheel adjusts flight speed. Press **Z** or **Escape** to release the cursor. While released, middle/right drag looks around and the wheel zooms. Choose **Orbit** for orbit controls; **F** frames the selection in either mode. Controls work in both Layout and Remix views.
-3. **Add light** creates a light at the nearest surface in the centre of the view, with space for the emitter outside the surface. Area and spot lights face the surface. To place a mesh, ingest it, select it in the asset library, and choose **Add mesh**. Both start unattached. Use **Parent → Choose parent…** in Properties to search for an attachment prim, or choose **World (unattached)** to detach. Changing parent preserves the object's world pose; duplicates inherit the same parent and local transform. **Replace mesh** and **Replace material** still use the selected captured asset.
+3. **Add light** creates a light at the nearest surface in the centre of the view, with space for the emitter outside the surface. Area and spot lights face the surface. To place a mesh, ingest it, select it in the asset library, and choose **Add mesh**. Both start unattached. Use **Parent → Pick parent in viewport** in Properties, hover a mesh to highlight it, and click to attach. Escape or right-click cancels; **Detach** returns the object to the world. The picker works over the live Remix image and Layout view; middle-drag and the wheel still move the camera. Changing parent preserves the object's world pose; duplicates inherit the same parent and local transform. Picking captured geometry attaches to its stable mesh-hash root rather than the capture-only mesh child. **Replace mesh** and **Replace material** still use the selected captured asset.
 4. Select a scene object to use its grouped authoring controls: transforms and bound materials for meshes; radiance, color, temperature, shape, and cone controls for lights; texture channels and surface settings for materials. Commit numeric edits with Enter, focus loss, or release of a drag; use ↺ to reset an active-layer property override. Choose **Move** or **Rotate** above the viewport and drag the colored world axes or rotation rings. The center square moves in the view plane. **Snap** uses whole scene units and 15° increments; **Escape** or right-click cancels a drag. Light guides show the physical sphere, rectangle, disk, or cylinder, with emission arrows and spotlight cones including their soft edge. Distant and environment lights use orientation symbols. Guides and transform handles remain visible during Drone flight; release the cursor to manipulate them. Gizmos work in Layout and Remix views, preview live, and commit one undo step on release. Edits and attachments to captured assets affect every instance of the same hash.
-5. Save the project, or choose **Package mod** to create a new, self-contained replacement mod directory containing `mod.usda` and its dependencies.
+5. To restore a captured mesh, select its replacement in the viewport or scene tree and choose **Revert mesh replacement** in Properties. This restores matching captured instances, keeps added meshes and lights, and supports Undo/Redo. Lights or meshes parented inside the replacement move back under the captured mesh without changing their world pose. The ingested asset remains in the library.
+6. Save the project, or choose **Package mod** to create a new, self-contained replacement mod directory containing `mod.usda` and its dependencies.
 
 Choose **Link to game…** in the toolbar, select the game folder (or its `rtx-remix/mods` folder), and enter a mod folder name. This creates `rtx-remix/mods/<name>` as a symlink to the project's live mod. Existing mod folders and unrelated symlinks are never replaced. Enable the mod in the game's Remix menu if necessary; the runtime's hot reload applies updates after its next file check.
 
 While linked, committed edits and Undo/Redo publish automatically after a short debounce; Save also publishes immediately. Drag previews publish when confirmed. The **Game linked** button opens the link controls: **Sync now** and **Unlink**. Link errors appear on the button and in the dialog. The link survives restarting the editor and reopening the project, which republishes the loaded project state. Unlink removes only the game symlink and its remembered settings.
+
+Light and mesh attachments use explicit USD translate, rotateXYZ and scale operations, with matrices retained when needed to preserve shear. Light bounds follow their emitter dimensions. Live publication and packaging also normalize static matrix attachments from older projects and add replacement-layer game, timing and coordinate metadata. This preserves the authored position and size.
+
+When installed mods already replace an attached mesh/light hash, live publishing automatically retains the first matching mod's attachments beneath the project's edits. Remix's first-match lookup must see the combined entry, so the editor gives its own symlink an earlier name when necessary. Refresh the game's mod list or restart it once after that change; the link dialog reports the new path and retained mods. The previous owned link remains valid until **Unlink** for running file watchers. Other mods' files are never edited, and unrelated replacement hashes keep their original behavior. Inherited mesh material bindings and dependencies are retained with their source layout. The editor viewport and portable **Package mod** remain project-only; automatic retention applies to the linked game's generated mod.
 
 Live publishing includes unsaved replacement opinions, excludes captures, and links textures and MDL dependencies without copying their data. It leaves project saving and Undo history unchanged. The game keeps the last published state when the editor closes, including unsaved edits; Save is still required to retain those edits in the project. Generated USD and asset links live in `<project>.studio-live/`; `<project>.studio-link.json` remembers the destination. Keep the project and source assets in place while linked. After unlinking, the live cache may be deleted. Use **Package mod** for a portable copy. On Windows, creating symlinks requires Developer Mode or suitable permissions.
 
@@ -65,7 +104,17 @@ Capture transparency uses each mesh instance's alpha-test, blend, texture-factor
 
 The build/run helper places NVIDIA's downloaded NGX feature libraries beside `libremix.so` so DLSS and Ray Reconstruction can be discovered. An externally supplied runtime must include its corresponding feature libraries; capability detection also checks hardware and driver support.
 
-The resizable bottom asset library shows mesh previews and material spheres. Use **New folder**, **Rename**, **Move to…**, or drag assets/folders onto a folder to organize the library. Search finds assets across all folders; the type filter separates meshes and materials. Removing a folder moves its contents to its parent. Imports go into the folder selected when ingestion starts.
+The resizable bottom asset library shows mesh previews and material spheres. Use **New folder**, **Rename**, **Move to…**, or drag assets/folders onto a folder to organize the library. Search finds assets across all folders; the type filter separates meshes and materials. Removing a folder moves its contents to its parent. Imports go into the folder selected when import options open.
+
+Drag one or more model/image files from your file manager into the toolkit window
+to ingest them into the current project's selected asset folder. The import dialog
+lets you adjust model scale, image material type/texture role, and normal convention
+before starting. Multiple files share those options and import one at a time;
+existing asset names receive numbered suffixes. **Ingest asset** also supports
+multiple selection. Unsupported files and folders are skipped, and a failed file
+does not stop the rest of the batch. **Cancel import** cancels the active job and
+remaining queue; switching projects discards pending imports. New assets receive
+the usual library entries and thumbnails.
 
 Folders and display names are virtual: asset files and USD references stay in place. Organization autosaves to `assets/.library.json`, independently of scene Save and Undo. Existing ingested assets are discovered automatically, missing assets remain marked, and a damaged catalog is preserved with organization made read-only. Selecting a library asset shows read-only details; Replace uses the last selected scene object and bound material slot, while Add mesh spawns a standalone object.
 
@@ -77,6 +126,7 @@ Thumbnails use a separate Godot preview scene with approximate material shading.
 | --- | --- |
 | USD documents | `.usd`, `.usda`, `.usdc`; workfile sublayers; authoring layer selection; captured hash references; save/reopen; dependency remapping through the native command API |
 | Static mesh ingestion | USD assets with a default prim; glTF/GLB, FBX, OBJ through Assimp; transforms, normals, UVs, material assignments; unit/axis normalization |
+| Captured skinned meshes | Referenced USD skeletons, per-instance captured poses, rest-pose fallback, joint weights and bind transforms; posed geometry and normals in both viewports, picking and framing |
 | Materials | AperturePBR opaque/cutout and translucent parameters; material replacement; PNG/JPEG/TGA/EXR/HDR conversion and existing DDS assets |
 | Texture processing | BC7 color, BC6H HDR, BC5 hemispherical-octahedral normals, BC4 scalar maps, mipmaps, glTF packed metallic/roughness extraction |
 | Authoring UI | Curated typed mesh/material/light controls; bound material slots; active-layer reset; virtual asset folders, search, and cached thumbnails |
@@ -84,7 +134,11 @@ Thumbnails use a separate Godot preview scene with approximate material shading.
 | Viewport | Composed USD triangles, material subsets, material/light updates, camera orbit, nearest-triangle picking, selection outline, wireframe layout mode |
 | Renderer isolation | Framed IPC; GPU memory sharing on Linux; synchronized GPU texture copies; manual worker restart without discarding the document |
 
-Unsupported USD content is retained when opening and saving a project. The preview is a static rendering adapter: skeletal animation, animation playback, graphs, particles, arbitrary MDL networks, terrain authoring, and Toolkit-specific advanced workflows are outside this implementation. Imported non-Remix USD shaders are not automatically converted into complete AperturePBR networks.
+Captured skinned meshes automatically resolve the skeleton assets referenced by the capture (normally in its sibling `skeletons/` directory). Keep that directory with the capture's other dependencies. Each instance displays its captured skeletal pose; time-sampled captures display the first sample. Evaluation changes only viewport geometry, leaving skeletons, weights, poses, and source mesh data intact when saving or publishing. Missing or invalid skeleton data produces a status warning and displays the undeformed mesh.
+
+Selecting a skinned mesh or its instance shows its bones over the model in both Remix and Layout views: blue joint connections and markers, with gold root joints. The overlay follows the captured pose, stays visible during Drone flight, and clears when the mesh is deselected or hidden. It is a visual guide; selecting and editing individual bones is not supported.
+
+Unsupported USD content is retained when opening and saving a project. The preview is a static rendering adapter: animation playback, bone/weight authoring, blend shapes, graphs, particles, arbitrary MDL networks, terrain authoring, and Toolkit-specific advanced workflows are outside this implementation. FBX/glTF ingestion remains static; imported non-Remix USD shaders are not automatically converted into complete AperturePBR networks.
 
 ## Architecture and limits
 
@@ -102,7 +156,21 @@ The editor retains the runtime's automatic quality settings in Custom mode and e
 
 The runtime material-lifetime patch keeps per-instance material overrides alive through surface creation. Captured additive/emissive blends otherwise leave dangling texture references and can crash the renderer while loading a scene.
 
-Windows currently has a separate native Remix preview window fallback. Windows external memory/handle transport, embedded viewport validation, and an in-game Windows mod compatibility run are still outstanding. Packaged mods have been tested by reopening their USD composition, not by loading them into a game. A redistributable application bundle is also not produced yet.
+If a colored light appears white in a linked game while its published USD has the correct `color3f inputs:color`, check the game's runtime build. The `sambow23/dxvk-remix-gmod` build `12759b3e` checks USD colors against the renderer's private `Vector3` type; USD stores them as `GfVec3f`, so the loader rejects them and keeps white. The editor viewport sends light colors through the Remix API and does not use this broken USD loader. Changing the exported property name or its USD vector type cannot fix that runtime check.
+
+[`patches/remix-usd-light-color.patch`](patches/remix-usd-light-color.patch) fixes the conversion while retaining type validation for malformed values. It applies to both the pinned reference and `12759b3e`. Bootstrap applies it to the local runtime source, but this does **not** update a game's Windows `d3d9.dll`. Apply the patch to the matching game runtime source checkout with `git apply /path/to/godot-toolkit/patches/remix-usd-light-color.patch`, then build and install that game's runtime. The `12759b3e` patch has been built as a release x64 DLL with Visual Studio 2022: Windows DLL loading, D3D9/Remix API exports, and color conversion using the runtime's stock USD 25.11 libraries passed. In-game rendering remains unverified.
+
+For that revision, from an x64 Visual Studio Developer PowerShell with the runtime's prerequisites installed:
+
+```powershell
+meson setup _Comp64Release --buildtype release --backend ninja -Denable_tracy=false "-Dcpp_link_args=['/IGNORE:4099','/IGNORE:4199']"
+meson compile -C _Comp64Release d3d9
+meson install -C _Comp64Release --no-rebuild --tags output
+```
+
+This stages the runtime in `_output`. The two narrow linker exclusions handle missing vendor PDB files and an unused delay-load declaration; other warnings remain errors. Build the `d3d9` target explicitly: the optional Hydra demo application at this revision has a separate `LNK4098` C-runtime conflict. The standalone Godot editor's Windows viewport transport is still unvalidated.
+
+Windows currently has a separate native Remix preview window fallback. Windows external memory/handle transport and embedded viewport validation are still outstanding. The portable application bundle currently targets Linux only.
 
 ## Validation
 
@@ -112,6 +180,14 @@ python scripts/bootstrap.py gpu-test
 ```
 
 Native tests cover capture immutability, composition, shared instance edits, transaction rollback, undo/redo, material and mesh replacement, and packaging. Protocol tests cover normal sessions, invalid versions, truncated continuations, oversized frames, UTF-8 across frame boundaries, transfers and replies above 64 MiB, and recoverable command errors. A headless Godot test exercises large transfers through the real client and worker. The Godot ingestion test checks DDS formats, mipmaps, channel values, glTF ingestion, and material dependency packaging. The GPU test checks visible rendered geometry, invalid captured UV handling, and worker restart while retaining unsaved edits; it needs an active desktop session and supported GPU. Test screenshots and generated projects are retained under `.work/integration` and `.work/ingestion`.
+
+Model import tests cover FBX texture paths with Windows separators, spaces and
+absolute paths, plus missing-texture cleanup. Added and replaced meshes retain
+their imported root transforms through project unit/axis conversion. Replacement
+selection and gizmo edits use the visible capture instance while authoring shared
+hash replacements; tests cover transformed parents, undo/redo, reopening and export.
+The Godot ingestion smoke test also accepts `-- --fbx=/path/to/model.fbx` to check
+real FBX files without modifying them.
 
 Layout tests cover nearest-hit picking with transformed instances, shared geometry, cache invalidation, GPU wireframe visibility, selection, resizing, and alignment of the transparent selection overlay with the Remix view.
 
@@ -135,6 +211,14 @@ The bootstrap copies AperturePBR modules and their license notices from the Remi
 
 Multiple-capture tests cover legacy workfiles, exclusive scene composition, shared unsaved replacements, layer ordering and offsets, coordinate systems, duplicate and missing captures, undo/redo, save/reopen, capture immutability, packaging, per-capture cameras, pending inspector edits, and renderer reuse.
 
-Placement tests cover standalone spawning, parent selection, pose preservation under transformed parents, reference roots, duplicate attachments, cycle rejection, undo/redo, save/reopen, and capture immutability. Gizmo tests cover both up axes, letterboxed projections, constrained moves, rotation, snapping, cancellation, and one-step commits. The placement GPU test verifies the parent picker, spawning without a capture selection, live light and mesh previews, restored illumination after cancellation, and rejection of stale preview requests. Artifacts are under `.work/placement`.
+Placement tests cover standalone spawning, parent selection, pose preservation under transformed parents, reference roots, duplicate attachments, cycle rejection, undo/redo, save/reopen, and capture immutability. Gizmo tests cover both up axes, letterboxed projections, constrained moves, rotation, snapping, cancellation, and one-step commits. The placement GPU test verifies mesh picking over the rendered viewport, spawning without a capture selection, live light and mesh previews, restored illumination after cancellation, and rejection of stale preview requests. Artifacts are under `.work/placement`.
 
 Surface placement tests cover nearest-hit depth, mirrored transforms, self-exclusion, ground fallback, emitter clearance, and both up axes. The light placement GPU test creates each analytical light type on a running scene in metre and centimetre units, verifies visible illumination, and exercises Ctrl+T, Drone placement, inspector focus, and undo. Artifacts are under `.work/light_placement`.
+
+Parent-picker tests cover nearest mesh hits, capture-hash normalization, transformed parents, referenced mesh roots, hover selection, letterboxing, cancellation, deletion, detach, and Undo/Redo. Native tests verify capture-free attachment definitions and game-relative transforms.
+
+Replacement-format tests cover explicit transform operations, capture matrix roundoff, mirrored scales, gimbal-lock rotations, shear and animation preservation, light bounds, metadata, and publication without mutating project or capture files.
+
+When the runtime color patch is applied to `REMIX_SOURCE_DIR`, `remix_usd_light_color` exercises its conversion helper with the real USD and Remix vector types. Tests cover all five analytical light types, RGB and mixed colors through live publication and packaging, legacy light attributes, and rejection of malformed values without changing defaults. `build/remix_light_color_tests /path/to/mod.usda` also verifies a supplied mod's colors without modifying it.
+
+Game-inheritance tests cover first-match hash conflicts, automatic link ordering, retained lights and meshes, material bindings and texture paths, suppression of the original draw call, unrelated mods, old link aliases, repeated publication, deletion, Undo, reopen and safe Unlink.

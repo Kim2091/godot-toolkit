@@ -26,29 +26,23 @@ func presented(count := 12) -> bool:
 
 func parent_picker(parent: String) -> void:
 	check(app.inspector.parent_button != null, "Authored asset must expose a parent picker")
+	if parent.is_empty():
+		app.inspector.detach_button.pressed.emit(); await settle(); return
 	app.inspector.parent_button.pressed.emit()
 	await settle()
-	var dialog: ConfirmationDialog
-	for child in app.inspector.get_children():
-		if child is ConfirmationDialog: dialog = child
-	check(dialog != null, "Choose parent must open a searchable dialog")
-	if dialog == null: return
-	var list: ItemList
-	var search: LineEdit
-	for child in dialog.get_children():
-		if child is VBoxContainer:
-			for control in child.get_children():
-				if control is ItemList: list = control
-				if control is LineEdit: search = control
-	check(list != null and search != null, "Parent picker needs search and a list")
-	if list == null or search == null: return
-	search.text = parent.get_file()
-	search.text_changed.emit(search.text)
-	var found := false
-	for i in range(list.item_count):
-		if list.get_item_metadata(i) == parent:
-			list.select(i); list.item_activated.emit(i); found = true; break
-	check(found, "Requested parent must be available: " + parent + " in " + str(range(list.item_count).map(func(i: int): return list.get_item_metadata(i))))
+	check(not app.viewport.parent_pick_path.is_empty(), "Parent button must start viewport picking")
+	app.viewport.center = Vector3(2, 0, 0); app.viewport.distance = 12; app.viewport.yaw = 0; app.viewport.pitch = 0.7
+	app.viewport._camera_updated()
+	var event := InputEventMouseButton.new(); event.button_index = MOUSE_BUTTON_LEFT; event.pressed = true
+	event.position = app.viewport._project(Vector3(4, 0, 0))
+	var motion := InputEventMouseMotion.new(); motion.position = event.position
+	app.viewport._gui_input(motion)
+	check(app.viewport.parent_hover == parent + "/mesh", "Visible mesh must highlight before attachment")
+	if app.renderer.is_ready:
+		await presented(3)
+		await RenderingServer.frame_post_draw
+		root.get_texture().get_image().save_png(directory.path_join("parent-picker.png"))
+	app.viewport._gui_input(event)
 	await settle()
 
 func preview(path: String, delta: Transform3D) -> void:
@@ -129,6 +123,15 @@ func run() -> void:
 		check(response.get("ok", false), "Renderer request failed: " + str(response))
 		if response.get("request_op") == "frame": frames += 1)
 	app.render_toggle.button_pressed = true
+	if not await presented(): app.renderer.stop_worker(); quit(1); return
+	var camera: Dictionary = view.view_state()
+	var worker: int = app.renderer.process.pid
+	await parent_picker(PARENT)
+	check(app.selection.get_base_dir() == PARENT and view.gizmo.world.is_equal_approx(pose), "Live Remix picker must attach without moving the light")
+	await parent_picker("")
+	light = app.selection
+	view.restore_view_state(camera)
+	check(app.renderer.process.pid == worker, "Picking parents must keep the Remix worker running")
 	if not await presented(): app.renderer.stop_worker(); quit(1); return
 	await RenderingServer.frame_post_draw
 	var baseline := root.get_texture().get_image()

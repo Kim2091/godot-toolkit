@@ -145,6 +145,7 @@ def remix(jobs):
         raise RuntimeError("Build the Windows Remix runtime with its upstream build instructions; the shared-frame runtime patch currently targets Linux")
     patch(source, "remix-editor-frame.patch")
     patch(source, "remix-material-lifetime.patch")
+    patch(source, "remix-usd-light-color.patch")
     shutil.copyfile(ROOT / "native/shared_frame.h", source / "src/linux/editor_shared_frame.h")
     sdk = DEPS / "remix-sdk"
     run(["bash", source / "scripts-linux/build-dependencies.sh", sdk])
@@ -190,12 +191,19 @@ def godot_binary():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", choices=["all", "deps", "godot", "remix", "editor", "test", "gpu-test", "run"], nargs="?", default="all")
+    parser.add_argument("target", choices=["all", "deps", "godot", "remix", "editor", "test", "gpu-test", "run", "portable"], nargs="?", default="all")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 4, 8))
     args = parser.parse_args()
     if platform.machine().lower() not in ["x86_64", "amd64"]:
         parser.error("The Remix editor currently requires x86_64")
     tools()
+    if args.target == "portable":
+        if WINDOWS:
+            parser.error("Portable packaging currently supports Linux x86_64")
+        if not (BIN / "patchelf").exists() and not shutil.which("patchelf"):
+            run([BIN / "python", "-m", "pip", "install", "patchelf==0.17.2.4"])
+        run([sys.executable, ROOT / "scripts/package_portable.py"])
+        return
     if args.target in ["all", "test", "gpu-test"]:
         ENV["REMIX_STUDIO_SETTINGS_DIR"] = tempfile.mkdtemp(prefix="studio-test-settings-", dir=WORK)
     if args.target in ["all", "deps"]: dependencies(args.jobs)
@@ -205,6 +213,10 @@ def main():
     if args.target in ["all", "test"]:
         run(["ctest", "--test-dir", ROOT / "build", "--output-on-failure"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/ingestion_smoke.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/drop_ingestion_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/mesh_revert_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/skinned_capture_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/skeleton_overlay_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/layout_geometry_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/camera_controls_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/transform_gizmo_test.gd"])
@@ -215,6 +227,7 @@ def main():
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/renderer_transport_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/render_settings_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/game_link_test.gd"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/parent_picker_test.gd"])
     if args.target == "gpu-test":
         stage_remix_features()
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/alpha_smoke.gd"])

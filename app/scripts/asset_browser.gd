@@ -87,7 +87,7 @@ func _ready() -> void:
 		asset_activated.emit(catalog.entries[selected_id].get("kind", "unknown")))
 	cards.get_v_scroll_bar().value_changed.connect(func(_value: float): _prioritize())
 	contents.add_child(cards)
-	empty = Label.new(); empty.text = "Ingest an asset to start your library."; contents.add_child(empty)
+	empty = Label.new(); empty.text = "Drop model or image files here, or use Ingest asset."; contents.add_child(empty)
 	var image := Image.create(96, 96, false, Image.FORMAT_RGBA8)
 	image.fill(Color("304150"))
 	placeholder = ImageTexture.create_from_image(image)
@@ -158,7 +158,7 @@ func _refresh() -> void:
 			previews.request(id)
 	cards.get_v_scroll_bar().set_deferred("value", scroll)
 	empty.visible = ids.is_empty()
-	empty.text = "No matching assets." if not search.text.is_empty() else "Ingest an asset or move assets into this folder."
+	empty.text = "No matching assets." if not search.text.is_empty() else "Drop model or image files here, or use Ingest asset."
 	refreshing = false
 	if catalog.entries.has(selected_id):
 		asset_details_changed.emit(selected_id, _details(selected_id))

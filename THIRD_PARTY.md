@@ -15,4 +15,9 @@ The application builds against the following components; their source and notice
 
 Godot supplies the image codecs and BC compressors. Its full copyright file records their respective licenses. The project patches modify the corresponding upstream sources and retain the surrounding upstream notices.
 
-No release packaging or redistribution license review has been performed. In particular, the local AperturePBR/MDL files and optional NVIDIA SDK components are not relicensed by this project.
+Portable Linux packages retain component notices under `licenses/`, including Godot's
+bundled dependencies, OpenUSD, the Remix SDKs, and the GCC runtime libraries and
+runtime-library exception. Applied source patches are included there as well.
+AperturePBR/MDL and NVIDIA SDK components remain subject to their included terms;
+they are not relicensed by this project. This software contains source code provided
+by NVIDIA Corporation.

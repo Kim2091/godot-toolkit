@@ -246,7 +246,11 @@ Json ingest_asset(const Json& request, const fs::path& project_directory,
             stream.write(reinterpret_cast<const char*>(embedded->pcData), embedded->mWidth);
             if (!stream) throw std::runtime_error("Could not write embedded texture");
           } else {
-            auto texture_path = source.parent_path() / fs::path(name.C_Str());
+            // FBX stores paths from the exporting OS. On Linux, filesystem::path
+            // treats Windows separators as literal filename characters.
+            auto texture_name = std::string(name.C_Str());
+            std::replace(texture_name.begin(), texture_name.end(), '\\', '/');
+            auto texture_path = (source.parent_path() / fs::path(texture_name)).lexically_normal();
             if (!fs::is_regular_file(texture_path)) throw std::runtime_error("Missing model texture: " + texture_path.string());
             file_name += texture_path.extension().string();
             fs::copy_file(texture_path, staging / file_name);

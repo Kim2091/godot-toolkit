@@ -51,7 +51,8 @@ int main() {
     mesh.CreateAttribute(TfToken("texture"), SdfValueTypeNames->Asset).Set(SdfAssetPath("../textures/color.dds"));
     mesh.CreateAttribute(TfToken("module"), SdfValueTypeNames->Asset).Set(SdfAssetPath("../materials/Surface.mdl"));
     asset->GetRootLayer()->Save();
-    const auto mesh_path = doc.dispatch({{"op", "add_mesh"}, {"path", instance}, {"asset", (directory / "external/meshes/mesh.usda").string()}})["selection"].get<std::string>();
+    const auto mesh_selection = doc.dispatch({{"op", "add_mesh"}, {"path", instance}, {"asset", (directory / "external/meshes/mesh.usda").string()}})["selection"].get<std::string>();
+    const auto mesh_path = doc.inspect(mesh_selection)["authoring"]["edit_path"].get<std::string>();
 
     // Nested layers, root opinions and offsets must survive without captures.
     auto nested = SdfLayer::CreateNew((project.parent_path() / "nested.usda").string());
@@ -133,6 +134,25 @@ int main() {
     link_to("last"); fs::remove(target.parent_path() / "last");
     check(!reopened.dispatch({{"op", "game_link_status"}})["connected"].get<bool>(), "Missing links must be reported");
     reopened.dispatch({{"op", "game_unlink"}});
+    // Neighboring mods and a legacy base-mod choice must not affect publication.
+    const auto neighbor = target.parent_path() / "base_mod/mod.usda";
+    fs::create_directories(neighbor.parent_path());
+    std::ofstream(neighbor) << "An unrelated mod; do not load or rewrite it";
+    const auto independent = link_to("z_independent");
+    const auto independent_target = fs::path(independent["target"].get<std::string>());
+    const auto alias = target.parent_path() / "old_owned_alias";
+    fs::create_directory_symlink(live, alias);
+    const auto settings = fs::path(project.string() + ".studio-link.json");
+    std::ofstream(settings) << Json{{"version", 1}, {"target", independent_target.string()},
+      {"base_mod", neighbor.string()}, {"aliases", Json::array({alias.string(), neighbor.parent_path().string()})}}.dump();
+    auto status = reopened.dispatch({{"op", "game_sync"}});
+    check(status["target"] == independent_target.string() && !status.contains("base_mod") && !status.contains("mods"),
+      "Publishing must keep the chosen destination and ignore removed base-mod settings");
+    reopened.package(directory / "independent-package");
+    check(text(neighbor) == "An unrelated mod; do not load or rewrite it", "Other mods must remain untouched");
+    reopened.dispatch({{"op", "game_unlink"}});
+    check(!fs::exists(alias) && !fs::exists(independent_target) && fs::exists(neighbor),
+      "Unlink must safely clean up old owned aliases without removing neighboring mods");
     check(errors.IsClean(), "Game link workflow emitted USD errors");
     fs::remove_all(directory);
     std::cout << "Game link workflows passed\n";

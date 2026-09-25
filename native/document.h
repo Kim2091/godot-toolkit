@@ -58,6 +58,8 @@ private:
   Json parent_candidates(const std::string& path) const;
   std::string set_parent(const Json& request);
   std::string add_reference(const Json& request);
+  Json mesh_replacement(const std::string& path) const;
+  std::string revert_mesh(const std::string& path);
   std::string add_light(const Json& request);
   Json light_defaults(const std::string& type) const;
   void replace_material(const Json& request);
