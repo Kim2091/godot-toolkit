@@ -22,6 +22,8 @@ var render_settings_dialog: ConfirmationDialog
 var welcome: Control
 var editor_page: Control
 var camera_mode: OptionButton
+var renderer_select: OptionButton
+var runtime_paths: Dictionary = {}
 var render_toggle: CheckButton
 var dpi_timer: Timer
 var restoring_view := false
@@ -74,6 +76,7 @@ func _ready() -> void:
 	sessions.load_history()
 	render_settings.warning.connect(_log)
 	render_settings.load_settings()
+	renderer_select.select(1 if render_settings.renderer == "openremix" else 0)
 	dpi_timer = Timer.new(); dpi_timer.wait_time = 1.0
 	dpi_timer.timeout.connect(_update_dpi); add_child(dpi_timer); dpi_timer.start()
 	get_window().dpi_changed.connect(_update_dpi)
@@ -212,7 +215,14 @@ func _build_ui() -> void:
 	center_panel.add_child(view_tools)
 	_label("Viewport", view_tools).size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	render_toggle = CheckButton.new()
-	render_toggle.text = "Remix"
+	var renderer_label := Label.new(); renderer_label.text = "Renderer"
+	view_tools.add_child(renderer_label)
+	renderer_select = OptionButton.new()
+	renderer_select.add_item("Remix"); renderer_select.add_item("OpenRemix")
+	renderer_select.select(1 if render_settings.renderer == "openremix" else 0)
+	renderer_select.item_selected.connect(_select_renderer)
+	view_tools.add_child(renderer_select)
+	render_toggle.text = "Render"
 	render_toggle.button_pressed = true
 	render_toggle.toggled.connect(func(value: bool):
 		viewport.show_render = value
@@ -313,11 +323,15 @@ func _request(data: Dictionary) -> Dictionary:
 	if document == null:
 		_log("Build the native USD extension before opening a project.")
 		return {}
-	var response = JSON.parse_string(document.execute(JSON.stringify(data)))
+	var response = document.execute_data(JSON.stringify(data))
 	if not response is Dictionary or not response.get("ok", false):
 		_log(response.get("error", "Invalid native response") if response is Dictionary else "Invalid native response")
 		return {}
-	return response.get("result", {})
+	var result = response.get("result", {})
+	if not result is Dictionary:
+		_log("Invalid native response for " + String(data.get("op", "request")))
+		return {}
+	return result
 
 func _command(data: Dictionary) -> void:
 	viewport.cancel_parent_pick()
@@ -403,6 +417,8 @@ func _refresh(scene_changed := true, lights_only := false) -> void:
 		lights_only = lights_only and not first
 		if lights_only:
 			var changes := _request({"op": "lights"})
+			if not changes.has_all(["lights", "revision"]):
+				return
 			# Queued scene messages may still hold the old dictionary on the writer
 			# thread. Share immutable geometry, but never mutate that dictionary.
 			last_scene = last_scene.duplicate()
@@ -410,8 +426,20 @@ func _refresh(scene_changed := true, lights_only := false) -> void:
 			last_scene["revision"] = changes.revision
 			for warning in changes.get("warnings", []): _log(warning)
 		else:
-			last_scene = _request({"op": "scene"})
+			var previous_sources: Array = last_scene.get("category_sources", [])
+			var next_scene := _request({"op": "scene"})
+			if not next_scene.has_all(["revision", "meshes", "materials", "lights"]):
+				# Do not send an empty/stale snapshot to the renderer. Keep the
+				# document open so edits can still be saved and loading retried.
+				last_scene = {}
+				viewport.set_scene({})
+				renderer.stop_worker()
+				return
+			last_scene = next_scene
 			last_scene["geometry_revision"] = last_scene.revision
+			var category_sources: Array = last_scene.get("category_sources", [])
+			if (first or category_sources != previous_sources) and not category_sources.is_empty():
+				_log("Remix categories: " + ", ".join(PackedStringArray(category_sources)))
 		restoring_view = first
 		viewport.set_scene(last_scene, false, lights_only)
 		if first:
@@ -785,10 +813,22 @@ func _use_asset(op: String) -> void:
 func _sync_renderer() -> void:
 	if renderer == null:
 		return
-	var active: bool = editor_page.visible and viewport.show_render and state.get("open", false)
+	var active: bool = editor_page.visible and viewport.show_render and state.get("open", false) and not last_scene.is_empty()
 	renderer.set_process(active)
 	if active and DisplayServer.get_name() != "headless":
 		_start_renderer()
+
+func _select_renderer(index: int) -> void:
+	var selected := "openremix" if index == 1 else "remix"
+	if selected == render_settings.renderer: return
+	if not render_settings.select_renderer(selected):
+		renderer_select.select(1 if render_settings.renderer == "openremix" else 0)
+		return
+	if is_instance_valid(runtime_dialog): runtime_dialog.queue_free(); runtime_dialog = null
+	if is_instance_valid(render_settings_dialog): render_settings_dialog.hide()
+	renderer.stop_worker()
+	viewport.rendered_texture = null
+	_sync_renderer()
 
 func _start_renderer() -> void:
 	if renderer.is_ready or renderer.is_starting or is_instance_valid(runtime_dialog):
@@ -796,24 +836,33 @@ func _start_renderer() -> void:
 	if not state.get("open", false):
 		_log("Open a scene before starting the renderer.")
 		return
-	var configured := OS.get_environment("REMIX_RUNTIME_PATH")
+	var active := render_settings.renderer
+	var configured := OS.get_environment("OPENREMIX_RUNTIME_PATH" if active == "openremix" else "REMIX_RUNTIME_PATH")
+	if not runtime_paths.has(active):
+		var path_file := root_directory.path_join("build/runtime_paths.json")
+		if FileAccess.file_exists(path_file):
+			var paths = JSON.parse_string(FileAccess.get_file_as_string(path_file))
+			if paths is Dictionary and FileAccess.file_exists(str(paths.get(active, ""))): runtime_paths[active] = str(paths[active])
+	var remembered: String = runtime_paths.get(active, runtime_path if active == "remix" else "")
+	var built := root_directory.path_join(".work/build/openremix/src/native/libremix.so" if active == "openremix" else ".work/build/remix/src/linux/libremix.so")
 	if not configured.is_empty():
 		_launch_renderer(configured)
-	elif not runtime_path.is_empty():
-		_launch_renderer(runtime_path)
-	elif FileAccess.file_exists(root_directory.path_join(".work/build/remix/src/linux/libremix.so")):
-		_launch_renderer(root_directory.path_join(".work/build/remix/src/linux/libremix.so"))
+	elif not remembered.is_empty():
+		_launch_renderer(remembered)
+	elif FileAccess.file_exists(built):
+		_launch_renderer(built)
 	else:
-		runtime_dialog = _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select Remix runtime library", [], _launch_renderer)
+		runtime_dialog = _dialog(FileDialog.FILE_MODE_OPEN_FILE, "Select %s runtime library" % active.capitalize(), [], _launch_renderer)
 
 func _launch_renderer(library: String) -> void:
-	runtime_path = library
+	runtime_paths[render_settings.renderer] = library
+	if render_settings.renderer == "remix": runtime_path = library
 	if not state.get("open", false) or not viewport.show_render or not editor_page.visible:
 		return
 	var worker := OS.get_environment("REMIX_RENDERER_WORKER")
 	if worker.is_empty():
 		worker = root_directory.path_join("build/remix-renderer" + (".exe" if OS.get_name() == "Windows" else ""))
-	renderer.start_worker(worker, library, render_settings.values)
+	renderer.start_worker(worker, library, render_settings.values, render_settings.renderer)
 	if is_instance_valid(render_settings_dialog): render_settings_dialog.set_capabilities({})
 
 func _show_render_settings() -> void:
@@ -822,7 +871,7 @@ func _show_render_settings() -> void:
 		render_settings_dialog = RenderSettingsDialog.new()
 		add_child(render_settings_dialog)
 		render_settings_dialog.settings_applied.connect(_apply_render_settings)
-	render_settings_dialog.show_settings(render_settings.values, renderer.capabilities)
+	render_settings_dialog.show_settings(render_settings.values, renderer.capabilities, render_settings.renderer, renderer.effective_settings)
 
 func _apply_render_settings(values: Dictionary) -> void:
 	if not render_settings.save_settings(values):
@@ -841,8 +890,13 @@ func _apply_render_settings(values: Dictionary) -> void:
 	_sync_renderer()
 
 func _renderer_response(response: Dictionary) -> void:
+	if response.get("ok", false) and response.get("request_op") == "frame" and is_instance_valid(render_settings_dialog) and render_settings_dialog.visible:
+		render_settings_dialog.set_effective_settings(renderer.effective_settings)
 	if response.get("ok", false) and response.get("request_op") == "start":
 		if is_instance_valid(render_settings_dialog): render_settings_dialog.set_capabilities(renderer.capabilities)
+		if last_scene.is_empty():
+			renderer.stop_worker()
+			return
 		renderer.send({"op": "scene", "scene": last_scene})
 		renderer.send({"op": "camera", "camera": viewport.camera()})
 

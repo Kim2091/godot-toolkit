@@ -2,8 +2,8 @@ extends SceneTree
 const Sessions = preload("res://scripts/project_sessions.gd")
 const ThemeTools = preload("res://scripts/studio_theme.gd")
 class FailedSave extends RefCounted:
-	func execute(_request: String) -> String:
-		return '{"ok": false, "error": "Simulated USD save failure"}'
+	func execute_data(_request: String) -> Dictionary:
+		return {"ok": false, "error": "Simulated USD save failure"}
 
 var failures := 0
 var app: Control

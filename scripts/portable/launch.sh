@@ -20,7 +20,8 @@ export REMIX_STUDIO_SETTINGS_DIR=${REMIX_STUDIO_SETTINGS_DIR:-"$data/settings"}
 export XDG_DATA_HOME="$data/user"
 export XDG_CONFIG_HOME="$data/config"
 export XDG_CACHE_HOME="$data/cache"
-export REMIX_RUNTIME_PATH=${REMIX_RUNTIME_PATH:-"$bundle/runtime/libremix.so"}
+export REMIX_RUNTIME_PATH=${REMIX_RUNTIME_PATH:-"$bundle/runtime/remix/libremix.so"}
+export OPENREMIX_RUNTIME_PATH=${OPENREMIX_RUNTIME_PATH:-"$bundle/runtime/openremix/libremix.so"}
 export REMIX_RENDERER_WORKER=${REMIX_RENDERER_WORKER:-"$bundle/bin/remix-renderer"}
 export PXR_PLUGINPATH_NAME="$bundle/lib/usd:$bundle/plugin/usd${PXR_PLUGINPATH_NAME:+:$PXR_PLUGINPATH_NAME}"
 mkdir -p -- "$data/run" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$REMIX_STUDIO_SETTINGS_DIR"

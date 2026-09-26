@@ -6,12 +6,13 @@ var failures := 0
 var frames := 0
 var responses: Array[Dictionary] = []
 var directory := ""
+var openremix := false
 
 func check(condition: bool, message: String) -> void:
 	if not condition: push_error(message); failures += 1
 
 func presented(count := 12) -> bool:
-	var deadline := Time.get_ticks_msec() + 60000
+	var deadline := Time.get_ticks_msec() + (600000 if frames == 0 else 60000)
 	var after := frames + count
 	while Time.get_ticks_msec() < deadline:
 		await process_frame
@@ -46,12 +47,21 @@ func _initialize() -> void:
 
 func run() -> void:
 	root.size = Vector2i(1600, 1000)
-	app = load("res://main.tscn").instantiate(); root.add_child(app)
+	openremix = "--openremix" in OS.get_cmdline_user_args()
+	app = load("res://main.tscn").instantiate()
+	if openremix:
+		var settings_path := ProjectSettings.globalize_path("res://../.work/light_updates/openremix-%d.json" % Time.get_ticks_usec())
+		app.render_settings = load("res://scripts/render_settings.gd").new(settings_path)
+		app.render_settings.select_renderer("openremix")
+		app.render_settings.save_settings({"backend": "pathtrace", "upscaler": "none", "width": 640, "height": 360})
+	root.add_child(app)
 	app.render_toggle.button_pressed = false
 	directory = app.root_directory.path_join(".work/light_updates/" + str(Time.get_ticks_usec()))
 	DirAccess.make_dir_recursive_absolute(directory)
 	app.renderer.frame_presented.connect(func(_context: Dictionary): frames += 1)
 	app.renderer.response_received.connect(func(response: Dictionary):
+		if openremix and response.get("request_op") == "start":
+			app.renderer.send({"op": "settings", "settings": {"rtx.native.pathtrace.denoiser": "off", "rtx.native.pathtrace.taa": "0", "rtx.native.pathtrace.sigma": "0", "rtx.native.pathtrace.sharc": "0", "rtx.native.pathtrace.bounces": "1"}})
 		responses.append(response)
 		check(response.get("ok", false), "Renderer request failed: " + str(response)))
 	app._command({"op": "create", "capture": app.root_directory.path_join("tests/fixtures/capture.usda"), "path": directory.path_join("project.usda")})
@@ -68,7 +78,7 @@ func run() -> void:
 	var wire_id: int = view.wire_instances[0].get_instance_id()
 	var geometry_revision: int = app.last_scene.geometry_revision
 	# Shorten the fork's static-light sleep threshold so the regression is quick.
-	await request({"op": "settings", "settings": {"rtx.numFramesToKeepLights": "4"}})
+	if not openremix: await request({"op": "settings", "settings": {"rtx.numFramesToKeepLights": "4"}})
 	responses.clear()
 	# Commit repeated real gizmo drags, then update the inspector between drags.
 	for i in range(8):

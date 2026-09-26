@@ -7,9 +7,39 @@
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/godot.hpp>
+#include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 
 namespace editor {
 void register_gpu_bridge();
+namespace {
+godot::Variant variant(const Json& value) {
+  if (value.is_object()) {
+    godot::Dictionary result;
+    for (auto item = value.begin(); item != value.end(); ++item)
+      result[godot::String::utf8(item.key().data(), item.key().size())] = variant(item.value());
+    return result;
+  }
+  if (value.is_array()) {
+    godot::Array result;
+    if (result.resize(value.size()) != godot::OK) throw std::runtime_error("Not enough memory for scene data");
+    for (size_t i = 0; i < value.size(); ++i) result[i] = variant(value[i]);
+    return result;
+  }
+  if (value.is_string()) {
+    const auto& string = value.get_ref<const std::string&>();
+    return godot::String::utf8(string.data(), string.size());
+  }
+  if (value.is_boolean()) return value.get<bool>();
+  if (value.is_number()) {
+    auto number = value.get<double>();
+    // JSON serializes non-finite capture components as null. Keep the same
+    // contract without constructing/parsing a potentially >2 GiB string.
+    return std::isfinite(number) ? godot::Variant(number) : godot::Variant();
+  }
+  return {};
+}
+}
 void convert_texture(const fs::path& source, const fs::path& target, const std::string& kind) {
   using godot::Image;
   auto image = Image::load_from_file(source.string().c_str());
@@ -79,6 +109,22 @@ public:
       return Json({{"ok", false}, {"error", error.what()}}).dump().c_str();
     }
   }
+  godot::Dictionary execute_data(const godot::String& json) {
+    godot::Dictionary response;
+    try {
+      // Convert directly to Godot containers. Serializing this result to JSON
+      // first exceeds Godot's signed 32-bit String/JSON limits on big captures,
+      // and holds extra copies of the entire scene in memory.
+      auto result = document_.dispatch(Json::parse(json.utf8().get_data()));
+      response["result"] = variant(result);
+      response["ok"] = true;
+    } catch (const std::exception& error) {
+      response.clear();
+      response["ok"] = false;
+      response["error"] = godot::String::utf8(error.what());
+    }
+    return response;
+  }
   godot::String start_ingestion(const godot::String& json) {
     try {
       if (job_.valid()) throw std::runtime_error("An ingestion job is already running");
@@ -131,6 +177,7 @@ public:
 protected:
   static void _bind_methods() {
     godot::ClassDB::bind_method(godot::D_METHOD("execute", "request"), &RemixDocument::execute);
+    godot::ClassDB::bind_method(godot::D_METHOD("execute_data", "request"), &RemixDocument::execute_data);
     godot::ClassDB::bind_method(godot::D_METHOD("start_ingestion", "request"), &RemixDocument::start_ingestion);
     godot::ClassDB::bind_method(godot::D_METHOD("poll_ingestion"), &RemixDocument::poll_ingestion);
     godot::ClassDB::bind_method(godot::D_METHOD("cancel_ingestion"), &RemixDocument::cancel_ingestion);

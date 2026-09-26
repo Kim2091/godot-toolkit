@@ -1,6 +1,7 @@
 #include "document.h"
 #include "alpha_state.h"
 #include "skinning.h"
+#include "capture_categories.h"
 
 #include <cmath>
 #include <map>
@@ -248,6 +249,8 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
   const auto time = UsdTimeCode::EarliestTime();
   UsdGeomXformCache transforms(time);
   SceneSkinning skinning(transforms);
+  CaptureCategories categories(stage, result["warnings"]);
+  result["category_sources"] = categories.sources();
   std::set<std::string> materials;
   for (auto prim : UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies())) {
     auto imageable = UsdGeomImageable(prim);
@@ -264,6 +267,8 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
         std::string reason;
         if (!UsdGeomMesh::ValidateTopology(indices, counts, points.size(), &reason)) throw std::runtime_error(reason);
         auto normal_interpolation = mesh.GetNormalsInterpolation();
+        auto normal_primvar = UsdGeomPrimvarsAPI(mesh).GetPrimvar(TfToken("normals"));
+        if (normal_primvar && normal_primvar.ComputeFlattened(&normals, time)) normal_interpolation = normal_primvar.GetInterpolation();
         std::string skeleton;
         try { skeleton = skinning.deform(mesh, points, normals, normal_interpolation, indices, counts); }
         catch (const std::exception& error) {
@@ -292,7 +297,8 @@ Json compose_scene(const UsdStageRefPtr& stage, uint64_t revision) {
           auto material = face_materials.count(face) ? face_materials.at(face) : binding;
           std::string material_id = material ? material.GetPath().GetString() : "default";
           if (material && materials.insert(material_id).second) result["materials"].push_back(material_json(material, result["warnings"]));
-          if (!surfaces.count(material_id)) surfaces[material_id] = {{"material", material_id}, {"vertices", Json::array()}, {"indices", Json::array()}};
+          if (!surfaces.count(material_id)) surfaces[material_id] = {{"material", material_id},
+            {"category_flags", categories.flags(prim, material)}, {"vertices", Json::array()}, {"indices", Json::array()}};
           auto& surface = surfaces[material_id];
           for (auto triangle : triangulate(points, indices, first, count)) {
             if (attribute(prim, "orientation", UsdGeomTokens->rightHanded) == UsdGeomTokens->leftHanded) std::swap(triangle[1], triangle[2]);

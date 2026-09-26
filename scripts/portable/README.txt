@@ -6,7 +6,7 @@ An X11/Wayland desktop, Vulkan loader, and a driver/GPU supporting Remix ray
 tracing are required. GPU drivers and glibc are supplied by your Linux system.
 
 The bundle includes the patched Godot engine, editor extension, OpenUSD schemas
-and libraries, Assimp, oneTBB, Remix runtime, DLSS features and MDL materials.
+and libraries, Assimp, oneTBB, separate Remix and OpenRemix runtimes, DLSS features and MDL materials.
 The Godot build retains editor capabilities for authoring image codecs/compressors;
 the launcher opens Remix Studio directly. Third-party terms are in licenses/.
 This software contains source code provided by NVIDIA Corporation. The NVIDIA
@@ -14,7 +14,12 @@ SDK portions remain subject to their included NVIDIA RTX SDK license terms.
 
 Settings, recent-project history, logs and caches stay in data/ beside the launcher.
 Set REMIX_STUDIO_DATA_DIR to put that data elsewhere (for a read-only installation).
-REMIX_STUDIO_SETTINGS_DIR, REMIX_RUNTIME_PATH and REMIX_RENDERER_WORKER overrides
+Choose the renderer beside Render. Remix remains the default; OpenRemix defaults
+to path tracing and also offers an unlit raster mode. Each renderer keeps its own
+settings. OpenRemix supports authored USD lights; results are not pixel-identical.
+
+REMIX_STUDIO_SETTINGS_DIR, REMIX_RUNTIME_PATH, OPENREMIX_RUNTIME_PATH and
+REMIX_RENDERER_WORKER overrides
 are also supported. Moving the whole folder retains its settings. Recent-project
 paths and game links still refer to the original project locations.
 

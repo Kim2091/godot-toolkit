@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path, nargs="?", default=ROOT / "dist/RemixStudio-linux-x86_64.tar.gz")
     parser.add_argument("--gpu", action="store_true", help="Also test real Vulkan viewport presentation")
+    parser.add_argument("--openremix-source", type=Path, default=Path(os.environ.get("OPENREMIX_SOURCE_DIR", ROOT / ".work/deps/openremix")))
     args = parser.parse_args()
     if not shutil.which("bwrap"):
         parser.error("Install bubblewrap to verify that the bundle works without the checkout")
@@ -32,13 +33,13 @@ def main():
     allowed = {"project.godot", "main.tscn", "remix_editor.gdextension", ".godot", "bin", "materials", "scripts", "shaders"}
     assert {path.name for path in (bundle / "app").iterdir()} == allowed
     assert not (bundle / "data").exists(), "Package contains user settings/caches"
-    for feature in (bundle / "runtime").glob("libnvidia-ngx-*.so.*"):
+    for feature in (bundle / "runtime/remix").glob("libnvidia-ngx-*.so.*"):
         original = ROOT / ".work/deps/remix-sdk/prefix/lib" / feature.name
         with original.open("rb") as source, feature.open("rb") as packaged:
             assert hashlib.file_digest(source, "sha256").digest() == hashlib.file_digest(packaged, "sha256").digest(), "NGX signature was modified"
     shutil.copy(ROOT / "scripts/portable/smoke.gd", directory / "smoke.gd")
     environment = dict(os.environ)
-    for key in ("REMIX_RUNTIME_PATH", "REMIX_RENDERER_WORKER", "REMIX_STUDIO_SETTINGS_DIR",
+    for key in ("REMIX_RUNTIME_PATH", "OPENREMIX_RUNTIME_PATH", "REMIX_RENDERER_WORKER", "REMIX_STUDIO_SETTINGS_DIR",
                 "REMIX_STUDIO_DATA_DIR", "PXR_PLUGINPATH_NAME", "LD_LIBRARY_PATH"):
         environment.pop(key, None)
     sandbox = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev",
@@ -46,16 +47,20 @@ def main():
                "--bind", str(directory), str(directory), "--tmpfs", str(ROOT),
                "--chdir", str(directory)]
 
+    if args.openremix_source.exists() and not args.openremix_source.resolve().is_relative_to(ROOT):
+        sandbox += ["--tmpfs", str(args.openremix_source.resolve())]
+
     def execute(name, arguments, expected=None):
         result = subprocess.run(sandbox + list(map(str, arguments)), env=environment,
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=660)
         (directory / (name + ".log")).write_text(result.stdout)
         if result.returncode != 0 or (expected and expected not in result.stdout):
             raise RuntimeError(f"{name} failed ({result.returncode}):\n{result.stdout}")
         print(f"{name}: PASS", flush=True)
         return result.stdout
 
-    for name in ("headless", "gpu") if args.gpu else ("headless",):
+    for name in ("headless", "gpu", "openremix") if args.gpu else ("headless",):
+        environment["REMIX_STUDIO_TEST_RENDERER"] = "openremix" if name == "openremix" else "remix"
         project_dir = directory / name
         project_dir.mkdir()
         shutil.copy(ROOT / "tests/fixtures/capture.usda", project_dir / "capture.usda")

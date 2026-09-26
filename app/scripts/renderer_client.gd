@@ -3,6 +3,7 @@ extends Node
 const PROTOCOL_VERSION := 2
 const MAX_FRAME_BYTES := 64 * 1024 * 1024
 const MORE_FRAMES := 0x80000000
+const JsonStream = preload("res://scripts/json_stream.gd")
 
 signal status_changed(message: String)
 signal response_received(response: Dictionary)
@@ -29,10 +30,12 @@ var copy_context: Dictionary = {}
 var frame_texture: Texture2D
 var capabilities: Dictionary = {}
 var effective_settings: Dictionary = {}
+var renderer_id := "remix"
 var output_size := Vector2i(960, 540)
 
-func start_worker(executable: String, library: String, render_settings: Dictionary = {}) -> void:
+func start_worker(executable: String, library: String, render_settings: Dictionary = {}, selected_renderer := "remix") -> void:
 	stop_worker()
+	renderer_id = selected_renderer
 	capabilities = {}
 	effective_settings = {}
 	output_size = Vector2i(int(render_settings.get("width", 960)), int(render_settings.get("height", 540)))
@@ -50,7 +53,7 @@ func start_worker(executable: String, library: String, render_settings: Dictiona
 			texture_ready.emit(texture)
 			is_ready = true
 			is_starting = false
-			status_changed.emit("Remix viewport ready"))
+			status_changed.emit("%s viewport ready" % ("OpenRemix" if renderer_id == "openremix" else "Remix")))
 		gpu.frame_copied.connect(_frame_copied)
 		gpu.failed.connect(func(message: String):
 			is_ready = false
@@ -62,12 +65,12 @@ func start_worker(executable: String, library: String, render_settings: Dictiona
 	writer.start(_exchange_loop.bind(generation))
 	log_reader = Thread.new()
 	log_reader.start(_read_log)
-	var start := {"op": "start", "library": library, "width": output_size.x, "height": output_size.y}
+	var start := {"op": "start", "library": library, "renderer": renderer_id, "width": output_size.x, "height": output_size.y}
 	if not render_settings.is_empty(): start["render_settings"] = render_settings.duplicate(true)
 	if shared_frames:
 		start["frame_channel"] = endpoint
 	send(start)
-	status_changed.emit("Starting Remix…")
+	status_changed.emit("Starting %s…" % ("OpenRemix" if renderer_id == "openremix" else "Remix"))
 
 func send(message: Dictionary) -> void:
 	if process.is_empty():
@@ -108,23 +111,12 @@ func _exchange_loop(worker_generation: int) -> void:
 		if message.is_empty():
 			OS.delay_msec(4)
 			continue
-		var payload := JSON.stringify(message).to_utf8_buffer()
-		# Frames from a single message stay together, including when UTF-8 code
-		# points cross a boundary. The worker applies only the complete scene.
-		var offset := 0
-		while offset < payload.size():
-			mutex.lock()
-			stop = stopping
-			mutex.unlock()
-			if stop:
-				return
-			var end := mini(offset + MAX_FRAME_BYTES, payload.size())
-			var flags := (end - offset) | (MORE_FRAMES if end < payload.size() else 0)
-			if not pipe.store_32(flags) or not pipe.store_buffer(payload if offset == 0 and end == payload.size() else payload.slice(offset, end)):
+		# Preserve the existing wire format, but serialize scenes incrementally
+		# so neither Godot's String limit nor a second full payload copy applies.
+		if not JsonStream.new().write(pipe, message, MAX_FRAME_BYTES, _is_stopping):
+			if not _is_stopping():
 				_deliver.call_deferred({"ok": false, "error": "Renderer disconnected during transfer. Unsaved document edits are retained."}, worker_generation)
-				return
-			offset = end
-		payload.clear()
+			return
 		pipe.flush()
 		var bytes := PackedByteArray()
 		while true:
@@ -160,6 +152,12 @@ func _exchange_loop(worker_generation: int) -> void:
 		decoded["request_op"] = message["op"]
 		_deliver.call_deferred(decoded, worker_generation)
 
+func _is_stopping() -> bool:
+	mutex.lock()
+	var result := stopping
+	mutex.unlock()
+	return result
+
 func _deliver(response: Dictionary, worker_generation: int) -> void:
 	if worker_generation != generation:
 		return
@@ -176,10 +174,12 @@ func _deliver(response: Dictionary, worker_generation: int) -> void:
 		else:
 			is_ready = true
 			is_starting = false
-			status_changed.emit("Remix preview running in its native window")
+			status_changed.emit("Renderer preview running in its native window")
 	elif response.get("request_op") == "render_settings":
 		effective_settings = response.get("result", {})
 	elif response.get("request_op") == "frame":
+		if response.get("result", {}).has("render_settings"):
+			effective_settings = response.result.render_settings
 		if shared_frames and response.get("result", {}).get("status") == "presented":
 			copy_context = response.get("view_context", {}).duplicate(true)
 			gpu.copy_frame()
@@ -187,7 +187,7 @@ func _deliver(response: Dictionary, worker_generation: int) -> void:
 			frame_pending = false
 		if response.get("result", {}).get("status") == "closed":
 			is_ready = false
-			status_changed.emit("Remix preview closed")
+			status_changed.emit("Renderer preview closed")
 	response_received.emit(response)
 
 func _frame_copied() -> void:
@@ -218,6 +218,7 @@ func stop_worker() -> void:
 	generation += 1
 	is_ready = false
 	is_starting = false
+	effective_settings = {}
 	mutex.lock()
 	stopping = true
 	messages.clear()

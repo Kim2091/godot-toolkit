@@ -1,7 +1,11 @@
 #include "channel.h"
 #include "shared_frame.h"
 #include "render_settings.h"
+#include "openremix/remix_editor_ext.h"
+#include "openremix/remix_native_ext.h"
+#include "openremix/remix_reconstruction_ext.h"
 #include "alpha_state.h"
+#include "render_categories.h"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -21,6 +25,7 @@
 #include <remix/remix_c.h>
 
 using Json = nlohmann::json;
+static_assert(sizeof(EditorSharedFrame) == sizeof(remixapi_EditorSharedFrame));
 namespace {
 void checked(remixapi_ErrorCode code, const char* operation) {
   if (code != REMIXAPI_ERROR_CODE_SUCCESS) throw std::runtime_error(std::string(operation) + " failed (Remix code " + std::to_string(code) + ")");
@@ -85,13 +90,19 @@ public:
   }
   Json start(const Json& message) {
     if (running_) throw std::runtime_error("Renderer already started");
+    const auto renderer = message.value("renderer", std::string("remix"));
+    if (renderer != "remix" && renderer != "openremix") throw std::runtime_error("Unknown renderer");
+    openremix_ = renderer == "openremix";
+#ifdef _WIN32
+    if (openremix_) throw std::runtime_error("The OpenRemix toolkit integration currently requires Linux");
+#endif
     auto path = native_path(message.at("library").get<std::string>());
     checked(remixapi_lib_loadRemixDllAndInitialize(path.c_str(), &api_, &library_), "Load runtime");
     remixapi_StartupInfo info{};
     info.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
     width_ = message.value("width", 1280u); height_ = message.value("height", 720u);
     if (message.contains("render_settings")) {
-      const auto preferences = studio::RenderSettings::parse(message.at("render_settings"));
+      const auto preferences = studio::RenderSettings::parse(message.at("render_settings"), openremix_);
       width_ = preferences.width; height_ = preferences.height;
     }
     if (width_ < 16 || height_ < 16 || width_ > 8192 || height_ > 8192) throw std::runtime_error("Invalid viewport size");
@@ -107,16 +118,43 @@ public:
 #else
     info.windowTitle = "Remix render preview"; info.windowWidth = width_; info.windowHeight = height_;
 #endif
+    remixapi_EditorStartupEXT editor{REMIXAPI_STRUCT_TYPE_EDITOR_STARTUP_EXT, nullptr, 1, true, true, true};
+    if (openremix_) {
+#ifndef _WIN32
+      if (!dlsym(library_, "remixapi_EditorConfigureSharedFrame")) throw std::runtime_error("OpenRemix requires the editor integration build");
+#endif
+      editor.headless = message.contains("frame_channel");
+      info.pNext = &editor;
+    }
     info.editorModeEnabled = true;
     info.combineGuiInFinalColor = false;
     checked(api_.Startup(&info), "Startup");
     running_ = true;
     remixapi_FeatureAvailability features{};
-    if (api_.GetFeatureAvailability && api_.GetFeatureAvailability(&features) == REMIXAPI_ERROR_CODE_SUCCESS) {
+    if (!openremix_ && api_.GetFeatureAvailability && api_.GetFeatureAvailability(&features) == REMIXAPI_ERROR_CODE_SUCCESS) {
       dlss_ = (features.availableFeatures & REMIXAPI_FEATURE_DLSS_SUPER_RESOLUTION_BIT) != 0;
       ray_reconstruction_ = dlss_ && (features.availableFeatures & REMIXAPI_FEATURE_DLSS_RAY_RECONSTRUCTION_BIT) != 0;
     }
 #ifndef _WIN32
+    if (openremix_) {
+      auto backend = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(dlsym(library_, "remixapi_GetBackendCapabilitiesEXT"));
+      auto reconstruction = reinterpret_cast<remixapi_ErrorCode (*)(remixapi_ReconstructionDiagnosticsEXT*)>(dlsym(library_, "remixapi_GetReconstructionDiagnosticsEXT"));
+      auto denoising = reinterpret_cast<PFN_remixapi_GetDenoisingCapabilitiesEXT>(dlsym(library_, "remixapi_GetDenoisingCapabilitiesEXT"));
+      query_backend_ = backend; query_reconstruction_ = reconstruction;
+      query_denoising_ = reinterpret_cast<PFN_remixapi_GetDenoisingStatisticsEXT>(dlsym(library_, "remixapi_GetDenoisingStatisticsEXT"));
+      query_sharc_ = reinterpret_cast<PFN_remixapi_GetSharcStatisticsEXT>(dlsym(library_, "remixapi_GetSharcStatisticsEXT"));
+      query_shadows_ = reinterpret_cast<PFN_remixapi_GetShadowStatisticsEXT>(dlsym(library_, "remixapi_GetShadowStatisticsEXT"));
+      query_local_lights_ = reinterpret_cast<PFN_remixapi_GetLocalLightStatisticsEXT>(dlsym(library_, "remixapi_GetLocalLightStatisticsEXT"));
+      if (!backend || !reconstruction || !denoising) throw std::runtime_error("OpenRemix capability extensions are unavailable");
+      remixapi_BackendCapabilitiesEXT caps{}; caps.structSize = sizeof(caps);
+      checked(backend(&caps), "Query OpenRemix backends"); pathtrace_ = caps.supportedBackends & 2;
+      remixapi_ReconstructionDiagnosticsEXT up{}; up.structSize = sizeof(up);
+      checked(reconstruction(&up), "Query OpenRemix reconstruction"); dlss_ = up.capabilities & 2; ray_reconstruction_ = up.capabilities & 4;
+      remixapi_DenoisingCapabilitiesEXT denoise{}; denoise.structSize = sizeof(denoise);
+      checked(denoising(&denoise), "Query OpenRemix temporal support"); fsr_ = pathtrace_ && denoise.taaSupported;
+      nrd_ = denoise.reblurShSupported; taa_ = denoise.taaSupported;
+      nis_ = false;
+    }
     if (message.contains("frame_channel")) {
       auto configure = reinterpret_cast<ConfigureSharedFrame>(dlsym(library_, "remixapi_EditorConfigureSharedFrame"));
       if (!configure) throw std::runtime_error("Runtime lacks the editor shared-frame patch");
@@ -145,6 +183,7 @@ public:
       shared_ = true;
     }
 #endif
+    if (!openremix_) {
     checked(api_.SetConfigVariable("rtx.fallbackLightMode", "0"), "Disable fallback lighting");
     // The pinned native fork's RTXDI path gives black analytical lighting in the
     // embedded viewport. Its RIS path is covered by our rendered-image test.
@@ -153,10 +192,11 @@ public:
     // them. Otherwise the Quality layer outranks SetConfigVariable's User
     // layer (the native Low preset disables stochastic alpha blending).
     checked(api_.SetConfigVariable("rtx.graphicsPreset", "4"), "Select custom viewport settings");
+    }
     api_.SetUIState(REMIXAPI_UI_STATE_NONE);
     camera_ = {{"position", {0, 2, 5}}, {"forward", {0, 0, -1}}, {"up", {0, 1, 0}}, {"right", {1, 0, 0}}, {"fov", 60.0}};
     Json result{{"status", "ready"}, {"presentation", shared_ ? "shared_vulkan" : "native_window"}, {"width", width_}, {"height", height_},
-      {"capabilities", {{"dlss", dlss_}, {"ray_reconstruction", ray_reconstruction_}, {"nis", nis_}}}};
+      {"capabilities", {{"dlss", dlss_}, {"ray_reconstruction", ray_reconstruction_}, { "nis", nis_}, {"fsr31", fsr_}, {"pathtrace", pathtrace_}, {"nrd", nrd_}, {"taa", taa_}, {"renderer", renderer}}}};
     if (message.contains("render_settings")) result["render_settings"] = render_settings(message.at("render_settings"));
     return result;
   }
@@ -165,14 +205,14 @@ public:
     for (auto light : lights_) api_.DestroyLight(light);
     for (const auto& material : materials_) api_.DestroyMaterial(material.second);
     meshes_.clear(); lights_.clear(); materials_.clear(); instances_.clear(); blend_states_.clear();
-    mesh_cache_.clear(); instance_origins_.clear(); light_origins_.clear(); previewed_lights_.clear();
+    mesh_cache_.clear(); instance_origins_.clear(); light_origins_.clear(); previewed_lights_.clear(); moving_instances_.clear();
   }
   void scene(const Json& scene) {
     require_running();
     const auto meters_per_unit = scene.value("meters_per_unit", 0.01);
     if (!std::isfinite(meters_per_unit) || meters_per_unit <= 0) throw std::runtime_error("Invalid USD scene units");
     auto scale = std::to_string(0.01 / meters_per_unit);
-    checked(api_.SetConfigVariable("rtx.sceneScale", scale.c_str()), "Set USD scene scale");
+    if (!openremix_) checked(api_.SetConfigVariable("rtx.sceneScale", scale.c_str()), "Set USD scene scale");
     clear();
     try {
       Json fallback{{"id", "default"}, {"albedo", {0.7, 0.7, 0.7}}};
@@ -232,6 +272,10 @@ public:
     size_t updated = 0;
     for (size_t i = 0; i < instances_.size(); ++i) if (matches(instance_origins_[i].first)) {
       instances_[i].transform = transformed(delta, instance_origins_[i].second);
+      bool moving = false;
+      for (unsigned row = 0; row < 3; ++row) for (unsigned col = 0; col < 4; ++col)
+        moving |= instances_[i].transform.matrix[row][col] != instance_origins_[i].second.matrix[row][col];
+      if (moving) moving_instances_.insert(i); else moving_instances_.erase(i);
       ++updated;
     }
     for (size_t i = 0; i < lights_.size(); ++i) if (matches(light_origins_[i].at("id").get<std::string>())) {
@@ -245,15 +289,22 @@ public:
   }
   void settings(const Json& data) {
     require_running();
-    for (auto it = data.begin(); it != data.end(); ++it) checked(api_.SetConfigVariable(it.key().c_str(), it.value().get<std::string>().c_str()), "Set render setting");
+    for (auto it = data.begin(); it != data.end(); ++it) {
+      if (openremix_ && it.key().compare(0, 11, "rtx.native.") != 0) throw std::runtime_error("OpenRemix accepts only native renderer settings");
+      checked(api_.SetConfigVariable(it.key().c_str(), it.value().get<std::string>().c_str()), "Set render setting");
+    }
   }
   Json render_settings(const Json& data) {
     require_running();
-    const auto effective = studio::RenderSettings::parse(data).effective(dlss_, ray_reconstruction_, nis_);
+    const auto requested = studio::RenderSettings::parse(data, openremix_);
+    const auto effective = openremix_ ? requested.effective_openremix(pathtrace_, dlss_, ray_reconstruction_, fsr_) : requested.effective(dlss_, ray_reconstruction_, nis_);
     if (effective.width != width_ || effective.height != height_) throw std::runtime_error("Changing viewport resolution requires restarting the renderer");
-    render_variables_ = effective.variables();
+    render_variables_ = openremix_ ? effective.openremix_variables() : effective.variables();
     settings(render_variables_);
-    return effective.json();
+    auto result = effective.json(openremix_);
+    requested_settings_ = requested;
+    effective_settings_ = result;
+    return result;
   }
   Json frame() {
     require_running();
@@ -262,11 +313,13 @@ public:
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
     if (!IsWindow(window_)) return {{"status", "closed"}};
 #else
+    if (!(openremix_ && shared_)) {
     checked(api_.PumpEvents(), "PumpEvents");
     remixapi_WindowState state{};
     checked(api_.GetWindowState(&state), "GetWindowState");
     if (state.closeRequested) return {{"status", "closed"}};
     if (!shared_) { width_ = state.drawableWidth; height_ = state.drawableHeight; }
+    }
 #endif
     remixapi_CameraInfoParameterizedEXT parameters{};
     parameters.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
@@ -282,18 +335,74 @@ public:
       // Attach only for the call: vector growth and transform previews must not
       // leave stored pNext pointers referring to moved or expired extensions.
       auto instance = instances_[i]; instance.pNext = &blend_states_[i];
+      remixapi_InstanceIdentityEXT identity{};
+      if (openremix_) {
+        identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT; identity.pNext = instance.pNext;
+        identity.instanceId = hash64(instance_origins_[i].first + ":" + std::to_string(instance.categoryFlags));
+        // The toolkit submits frozen USD snapshots. Static receivers allow
+        // SHARC reuse; only an active transform preview needs dynamic storage.
+        identity.classification = moving_instances_.count(i) ? REMIXAPI_INSTANCE_DYNAMIC_EXT : REMIXAPI_INSTANCE_STATIC_EXT;
+        identity.rasterVisible = true;
+        instance.pNext = &identity;
+      }
       checked(api_.DrawInstance(&instance), "DrawInstance");
     }
     for (auto light : lights_) checked(api_.DrawLightInstance(light), "DrawLightInstance");
     remixapi_PresentInfo present{}; present.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
     checked(api_.Present(&present), "Present");
-    if (frame_ == 0) {
+    if (frame_ == 0 && !openremix_) {
       // Switching to Custom migrates Quality values over User values at the
       // first frame boundary. Reapply the editor's settings after migration.
       settings(render_variables_);
       checked(api_.SetConfigVariable("rtx.enableStochasticAlphaBlend", "True"), "Enable alpha blending in the viewport");
     }
-    return {{"status", "presented"}, {"revision", revision_}, {"frame", ++frame_}};
+    Json result{{"status", "presented"}, {"revision", revision_}, {"frame", ++frame_}};
+    if (openremix_) {
+      remixapi_BackendCapabilitiesEXT backend{}; backend.structSize = sizeof(backend);
+      remixapi_ReconstructionDiagnosticsEXT reconstruction{}; reconstruction.structSize = sizeof(reconstruction);
+      checked(query_backend_(&backend), "Query effective backend");
+      checked(query_reconstruction_(&reconstruction), "Query effective reconstruction");
+      effective_settings_["backend"] = backend.activeBackend ? "pathtrace" : "raster";
+      effective_settings_["upscaler"] = reconstruction.activeBackend >= 2 ? "dlss" : reconstruction.activeBackend == 1 ? "fsr31" : "none";
+      effective_settings_["ray_reconstruction"] = reconstruction.activeBackend == 3;
+      effective_settings_["fallback_reason"] = requested_settings_.backend == "pathtrace" && backend.activeBackend == 0 ? backend.unavailableReason : requested_settings_.backend == "pathtrace" && requested_settings_.upscaler != "none" ? reconstruction.fallbackReason : "";
+      Json runtime = Json::object();
+      const bool tracing = backend.activeBackend != 0;
+      if (query_denoising_) {
+        remixapi_DenoisingStatisticsEXT state{}; state.structSize = sizeof(state);
+        checked(query_denoising_(&state), "Query active denoising");
+        runtime["nrd"] = tracing && state.activeDenoiser != 0;
+        runtime["taa"] = tracing && state.activeTaa != 0;
+        runtime["denoising_reason"] = state.unavailableReason;
+      }
+      if (query_shadows_) {
+        remixapi_ShadowStatisticsEXT state{}; state.structSize = sizeof(state);
+        checked(query_shadows_(&state), "Query active shadow filter");
+        runtime["sigma"] = tracing && state.active != 0;
+        runtime["sigma_reason"] = state.unavailableReason;
+      }
+      if (query_sharc_) {
+        remixapi_SharcStatisticsEXT state{}; state.structSize = sizeof(state);
+        checked(query_sharc_(&state), "Query active radiance cache");
+        runtime["sharc"] = tracing && state.active != 0;
+        runtime["sharc_caching"] = tracing && state.active && state.updatePaths;
+        runtime["sharc_reason"] = state.unavailableReason;
+        runtime["sharc_memory_mib"] = double(state.memoryBytes) / (1024 * 1024);
+      }
+      if (query_local_lights_) {
+        remixapi_LocalLightStatisticsEXT state{}; state.structSize = sizeof(state);
+        checked(query_local_lights_(&state), "Query active local lighting");
+        runtime["local_denoiser"] = tracing && state.denoiserActive != 0;
+        runtime["active_lights"] = tracing ? state.activeLights : 0;
+        const auto& options = requested_settings_.pathtrace;
+        const bool filter = options.at("localFireflyFilter").get<bool>();
+        const bool receivesLocal = state.activeLights && (state.denoiserActive || options.at("bounces").get<int>() > 0);
+        runtime["local_firefly_filter"] = filter && runtime.value("nrd", false) && receivesLocal && reconstruction.activeBackend != 3;
+      }
+      effective_settings_["runtime"] = std::move(runtime);
+      result["render_settings"] = effective_settings_;
+    }
+    return result;
   }
 private:
   void require_running() { if (!running_) throw std::runtime_error("Start the renderer first"); }
@@ -327,14 +436,37 @@ private:
     glass.transmittanceColor = vector3(data.value("transmittance", Json::array({1, 1, 1})));
     glass.transmittanceMeasurementDistance = 1.f;
     info.pNext = data.value("kind", std::string("opaque")) == "translucent" ? static_cast<void*>(&glass) : static_cast<void*>(&opaque);
+    remixapi_MaterialNormalEncodingEXT normal_encoding{};
+    if (openremix_) { normal_encoding.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_NORMAL_ENCODING_EXT; normal_encoding.pNext = info.pNext; normal_encoding.encoding = uint32_t(data.value("normal_encoding", 0)) + 1; info.pNext = &normal_encoding; }
     remixapi_MaterialHandle handle{};
     checked(api_.CreateMaterial(&info, &handle), "CreateMaterial");
     materials_.emplace(data.at("id").get<std::string>(), handle);
   }
   void mesh(const Json& data) {
+    const auto groups = editor::category_surface_groups(data);
+    if (groups.size() == 1) {
+      mesh_group(data, groups.begin()->first);
+      return;
+    }
+    for (const auto& [flags, indices] : groups) {
+      // Keep the USD id on every group so selection transform previews still
+      // move all material subsets together.
+      Json group = Json::object();
+      for (auto item = data.begin(); item != data.end(); ++item)
+        if (item.key() != "surfaces") group[item.key()] = item.value();
+      group["surfaces"] = Json::array();
+      for (auto index : indices) group["surfaces"].push_back(data.at("surfaces").at(index));
+      mesh_group(group, flags);
+    }
+  }
+  void mesh_group(const Json& data, uint32_t flags) {
+    // Keep hidden/ignored geometry in the editor snapshot, but do not submit
+    // it. The native runtime can allocate a zero-sized material buffer when
+    // its first frame contains only hidden surfaces.
+    if (flags & (REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN | REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE)) return;
     const auto geometry_hash = hash64(data.at("surfaces").dump());
     if (auto cached = mesh_cache_.find(geometry_hash); cached != mesh_cache_.end()) {
-      add_instance(data, cached->second);
+      add_instance(data, cached->second, flags);
       return;
     }
     std::vector<std::vector<remixapi_HardcodedVertex>> vertices;
@@ -374,13 +506,12 @@ private:
     remixapi_MeshHandle handle{};
     checked(api_.CreateMesh(&info, &handle), "CreateMesh"); meshes_.push_back(handle);
     mesh_cache_[geometry_hash] = handle;
-    add_instance(data, handle);
+    add_instance(data, handle, flags);
   }
-  void add_instance(const Json& data, remixapi_MeshHandle handle) {
+  void add_instance(const Json& data, remixapi_MeshHandle handle, uint32_t flags) {
     remixapi_InstanceInfo instance{}; instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
     instance.mesh = handle; instance.transform = transform(data.at("transform")); instance.doubleSided = data.value("double_sided", false);
-    if (data.value("ignore_alpha", false)) instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL;
-    if (data.value("alpha_blend_to_cutout", false)) instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT;
+    instance.categoryFlags = flags;
     instances_.push_back(instance);
     blend_states_.push_back(blend_state(data.value("alpha_state", Json::object())));
     instance_origins_.emplace_back(data.at("id").get<std::string>(), instance.transform);
@@ -421,10 +552,19 @@ private:
       usd.pConeSoftness = &softness; usd.pFocus = &focus;
     }
     remixapi_LightHandle light{};
-    checked(api_.CreateLight(&info, &light), "CreateLight"); return light;
+    checked(api_.CreateLight(&info, &light), ("CreateLight " + data.at("id").get<std::string>() + " (" + type + ", " + data.value("texture", std::string()) + ")").c_str()); return light;
   }
   remixapi_Interface api_{};
   remixapi_HMODULE library_{};
+  PFN_remixapi_GetBackendCapabilitiesEXT query_backend_ = nullptr;
+  PFN_remixapi_GetDenoisingStatisticsEXT query_denoising_ = nullptr;
+  PFN_remixapi_GetSharcStatisticsEXT query_sharc_ = nullptr;
+  PFN_remixapi_GetShadowStatisticsEXT query_shadows_ = nullptr;
+  PFN_remixapi_GetLocalLightStatisticsEXT query_local_lights_ = nullptr;
+  remixapi_ErrorCode (*query_reconstruction_)(remixapi_ReconstructionDiagnosticsEXT*) = nullptr;
+  Json effective_settings_;
+  studio::RenderSettings requested_settings_;
+  bool openremix_ = false, pathtrace_ = false, fsr_ = false, nrd_ = false, taa_ = false;
   bool running_ = false;
   bool shared_ = false;
   bool dlss_ = false;
@@ -448,6 +588,7 @@ private:
   std::vector<remixapi_LightHandle> lights_;
   std::vector<Json> light_origins_;
   std::set<std::string> previewed_lights_;
+  std::set<size_t> moving_instances_;
 #ifdef _WIN32
   HWND window_ = nullptr;
 #endif

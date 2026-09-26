@@ -169,7 +169,36 @@ def remix(jobs):
         ENV.update(saved)
 
 
-def editor(jobs):
+def openremix(jobs, source, library=None):
+    if WINDOWS:
+        raise RuntimeError("The OpenRemix toolkit integration currently targets Linux")
+    if library:
+        if not library.is_file(): raise RuntimeError(f"OpenRemix library not found: {library}")
+        (ROOT / "build").mkdir(exist_ok=True)
+        (ROOT / "build/runtime_paths.json").write_text(json.dumps({"openremix": str(library.resolve())}) + "\n")
+        return
+    if not (source / "public/include/remix/remix_editor_ext.h").exists():
+        raise RuntimeError("Set --openremix-source to the OpenRemix checkout containing the editor/USD integration")
+    build = WORK / "build/openremix"
+    args = ["meson", "setup"]
+    if (build / "meson-private/coredata.dat").exists(): args += ["--reconfigure"]
+    compiler_files = list((WORK / "build/usd/CMakeFiles").glob("*/CMakeCXXCompiler.cmake"))
+    if not compiler_files:
+        raise RuntimeError("Build the OpenUSD dependency first: bootstrap.py deps")
+    gnu_stl = any('set(CMAKE_CXX_COMPILER_ID "GNU")' in path.read_text() for path in compiler_files)
+    saved = ENV.copy(); ENV.update(CC="clang", CXX="clang++")
+    try:
+        run([*args, build, source, "-Dbuildtype=release", "-Dusd=true", f"-Dusd_gnu_stl={str(gnu_stl).lower()}",
+             f"-Dusd_root={DEPS / 'usd'}", f"-Dusd_tbb_root={DEPS / 'tbb2021'}",
+             f"-Djson_include={ROOT / 'build/_deps/json-src/include'}", "-Dgpu_tests=true"])
+        run(["meson", "compile", "-C", build, "-j", jobs])
+        (ROOT / "build").mkdir(exist_ok=True)
+        (ROOT / "build/runtime_paths.json").write_text(json.dumps({"openremix": str(build / "src/native/libremix.so")}) + "\n")
+    finally:
+        ENV.clear(); ENV.update(saved)
+
+
+def editor(jobs, openremix_source=None, openremix_library=None):
     source = DEPS / "remix"
     if not source.exists():
         source = ROOT / "ref/dxvk-remix-gmod"
@@ -178,6 +207,8 @@ def editor(jobs):
              f"-DGODOT_CPP_DIR={DEPS / 'godot-cpp'}", f"-DREMIX_SOURCE_DIR={source}"]
     if (DEPS / "godot/thirdparty/vulkan/include").exists():
         flags += [f"-DVulkan_INCLUDE_DIR={DEPS / 'godot/thirdparty/vulkan/include'}"]
+    if openremix_source: flags += [f"-DOPENREMIX_SOURCE_DIR={openremix_source.resolve()}"]
+    if openremix_library: flags += [f"-DOPENREMIX_LIBRARY={openremix_library.resolve()}"]
     cmake(ROOT, ROOT / "build", flags, jobs, install=False)
 
 
@@ -191,8 +222,10 @@ def godot_binary():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", choices=["all", "deps", "godot", "remix", "editor", "test", "gpu-test", "run", "portable"], nargs="?", default="all")
+    parser.add_argument("target", choices=["all", "deps", "godot", "remix", "openremix", "editor", "test", "gpu-test", "run", "portable"], nargs="?", default="all")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 4, 8))
+    parser.add_argument("--openremix-source", type=Path, default=Path(os.environ.get("OPENREMIX_SOURCE_DIR", DEPS / "openremix")))
+    parser.add_argument("--openremix-library", type=Path, default=Path(os.environ["OPENREMIX_RUNTIME_PATH"]) if "OPENREMIX_RUNTIME_PATH" in os.environ else None)
     args = parser.parse_args()
     if platform.machine().lower() not in ["x86_64", "amd64"]:
         parser.error("The Remix editor currently requires x86_64")
@@ -202,16 +235,18 @@ def main():
             parser.error("Portable packaging currently supports Linux x86_64")
         if not (BIN / "patchelf").exists() and not shutil.which("patchelf"):
             run([BIN / "python", "-m", "pip", "install", "patchelf==0.17.2.4"])
-        run([sys.executable, ROOT / "scripts/package_portable.py"])
+        run([sys.executable, ROOT / "scripts/package_portable.py", "--openremix-source", args.openremix_source, "--openremix-library", args.openremix_library or WORK / "build/openremix/src/native/libremix.so"])
         return
     if args.target in ["all", "test", "gpu-test"]:
         ENV["REMIX_STUDIO_SETTINGS_DIR"] = tempfile.mkdtemp(prefix="studio-test-settings-", dir=WORK)
     if args.target in ["all", "deps"]: dependencies(args.jobs)
     if args.target in ["all", "godot"]: godot(args.jobs)
     if args.target in ["all", "remix"]: remix(args.jobs)
-    if args.target in ["all", "editor"]: editor(args.jobs)
+    if args.target in ["all", "editor"]: editor(args.jobs, args.openremix_source, args.openremix_library)
+    if args.target in ["all", "openremix"]: openremix(args.jobs, args.openremix_source, args.openremix_library)
     if args.target in ["all", "test"]:
         run(["ctest", "--test-dir", ROOT / "build", "--output-on-failure"])
+        run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/large_scene_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/ingestion_smoke.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/drop_ingestion_test.gd"])
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/mesh_revert_test.gd"])
@@ -230,6 +265,7 @@ def main():
         run([godot_binary(), "--headless", "--path", ROOT / "app", "--script", "res://tests/parent_picker_test.gd"])
     if args.target == "gpu-test":
         stage_remix_features()
+        run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/capture_categories_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/alpha_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/render_settings_ui_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/keyboard_transform_ui_smoke.gd"])
@@ -243,6 +279,10 @@ def main():
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/layout_view_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/gpu_smoke.gd"])
         run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/capture_textures_smoke.gd"])
+        if not WINDOWS:
+            if args.openremix_library: ENV["OPENREMIX_RUNTIME_PATH"] = str(args.openremix_library.resolve())
+            run([godot_binary(), "--gpu-validation", "--gpu-abort", "--path", ROOT / "app", "--script", "res://tests/openremix_smoke.gd"])
+            run([godot_binary(), "--path", ROOT / "app", "--script", "res://tests/light_updates_smoke.gd", "--", "--openremix"])
     if args.target == "run":
         stage_remix_features()
         run([godot_binary(), "--path", ROOT / "app"])

@@ -1,6 +1,6 @@
 # Remix Studio
 
-A standalone Godot application for authoring RTX Remix replacements in OpenUSD. The document stays in USD; a separate `dxvk-remix` process renders the viewport. It does not use Omniverse Kit.
+A standalone Godot application for authoring RTX Remix replacements in OpenUSD. The document stays in USD; a separate Remix or OpenRemix worker renders the viewport. It does not use Omniverse Kit.
 
 This is an initial implementation, not full Toolkit parity. The embedded Vulkan viewport currently targets Linux x86_64. The editor and worker have Windows code paths, but Windows shared-frame transport and Windows builds have not been validated.
 
@@ -9,19 +9,71 @@ This is an initial implementation, not full Toolkit parity. The embedded Vulkan 
 On Linux, install a C++ toolchain with Clang, Python 3.12+, Git, a Vulkan loader/driver, and the normal Godot X11/Wayland development dependencies. Use a Vulkan ray-tracing capable GPU. Development and GPU testing were performed on an RTX 2080.
 
 ```sh
-python scripts/bootstrap.py all --jobs 8
+python scripts/bootstrap.py all --jobs 8 --openremix-source /path/to/openremix
 python scripts/bootstrap.py run
 ```
 
 The first build downloads and compiles OpenUSD 25.11, oneTBB, Assimp, Godot, godot-cpp, and the Remix SDK/runtime. It requires substantial disk space and build time. Everything goes under `.work`, `build`, and `app/bin`. Existing reference checkouts under `ref` are used as clone sources and are not modified. Revisions and source archive checksums are in `dependencies.lock.json`; engine/runtime changes are reproducible patches in `patches`.
 
-Individual build targets are `deps`, `godot`, `remix`, and `editor`. The editor uses the locally built runtime automatically, or the library named by `REMIX_RUNTIME_PATH`. `REMIX_RENDERER_WORKER` overrides the worker executable.
+Individual build targets are `deps`, `godot`, `remix`, `openremix`, and `editor`. The editor uses the locally built runtime automatically, or the library named by `REMIX_RUNTIME_PATH`. `REMIX_RENDERER_WORKER` overrides the worker executable.
 
 To launch the already built app directly:
 
 ```sh
 .work/deps/godot/bin/godot.linuxbsd.editor.x86_64.llvm --path app
 ```
+
+### OpenRemix on Linux
+
+Use an OpenRemix checkout containing `remix_editor_ext.h` and the optional USD loader:
+
+```sh
+python scripts/bootstrap.py openremix --openremix-source /path/to/openremix
+# Or register an independently built runtime:
+python scripts/bootstrap.py openremix --openremix-library /path/to/libremix.so
+```
+
+`OPENREMIX_SOURCE_DIR` and `OPENREMIX_RUNTIME_PATH` provide equivalent overrides.
+CMake accepts `OPENREMIX_SOURCE_DIR` and `OPENREMIX_LIBRARY`. Development runtime
+paths are written under `build/`; portable launchers resolve both runtimes locally.
+The Linux build enables OpenUSD 25.11. Its Clang flags match the toolkit's GCC-built
+OpenUSD/TBB ABI. The renderer's USD parser is CPU-only and remains optional for
+standalone OpenRemix builds.
+
+Render settings are saved separately for each renderer. Existing settings migrate
+to Remix. OpenRemix offers path tracing, unlit raster, DLSS/FSR, quality, Ray
+Reconstruction, and resolution, plus tabs for denoising, sampling, lighting,
+SHARC, and display transforms. Effective fallbacks never replace saved choices.
+REBLUR SH, SIGMA, and SHARC default on. The additional **PBR firefly filter
+(REBLUR)** defaults off; ordinary NRD anti-firefly processing is already enabled.
+The dialog reports live NRD/SIGMA/TAA, firefly filter, and SHARC status, including
+an enabled cache with no eligible work. RR replaces NRD/SIGMA while preserving
+their saved settings; turning RR off restores them. Progressive reference
+rendering bypasses temporal filters, reconstruction, and SHARC. Direct/indirect
+clamps use linear luminance, with zero disabling clamping; nonzero values can
+remove real highlights and bypass lighting reuse. Advanced changes apply in the
+existing worker. Settings remain separate from OpenRemix game profiles.
+Frozen snapshot meshes are static SHARC receivers. A mesh being transformed in
+a preview is temporarily dynamic; cancelling or committing returns it to the
+static scene so caching can resume.
+The embedded OpenRemix worker disables game profiles and automatic mods because
+it receives the toolkit's already-composed USD snapshot. Authored lighting controls
+the preview, without a fallback sun or fixed local-light range. Material rendering
+retains OpenRemix's documented approximations.
+
+For a bundle, supply the same `--openremix-source` and optionally
+`--openremix-library` to `bootstrap.py portable`. Each runtime has its own directory,
+dependencies, and license notices. `test_portable.py --gpu` checks both renderers
+with the source checkouts hidden. `app/tests/openremix_smoke.gd` checks shared GPU
+frames, resolution changes, recovery, and renderer switching. The optional native
+`openremix_parity_tests` target compares the direct loader with toolkit composition,
+and `openremix_mod_replay_tests` replays a toolkit-exported mod against captured hashes.
+`openremix_project_smoke.gd` loads a project read-only and renders its captured camera.
+`openremix_settings_smoke.gd` checks live NRD/firefly/SHARC controls and the
+transition between NRD and RR without restarting the worker.
+The OpenRemix GPU smoke test enables Godot's validation layer and aborts on API errors;
+install the Vulkan validation layers and enable `REMIX_VULKAN_VALIDATION=1` and
+`VK_LAYER_VALIDATE_SYNC=1` to validate the worker and shared-frame synchronization too.
 
 ## Portable Linux build
 
@@ -60,7 +112,7 @@ for headless checks. Test logs/screenshots remain in the reported temporary fold
 ## Workflow
 
 1. The welcome screen offers your recent projects with previews from their last successful Save. Choose **New from capture**, select a Remix capture, and create the project in a new directory. Or choose **Open** for an existing Toolkit workfile.
-2. Remix starts automatically when you open or create a project with the **Remix** toggle enabled. Turning it off pauses rendering and shows the Layout view; turning it on starts or resumes Remix. Toggle it off and on to retry after a renderer failure. Initial shader compilation can take tens of seconds. The camera defaults to **Drone**: press **Z** over the viewport to capture the mouse, look around with the mouse, and fly with **WASD**. **Q/E** moves down/up, **Shift** moves faster, and the wheel adjusts flight speed. Press **Z** or **Escape** to release the cursor. While released, middle/right drag looks around and the wheel zooms. Choose **Orbit** for orbit controls; **F** frames the selection in either mode. Controls work in both Layout and Remix views.
+2. The selected renderer starts automatically when you open or create a project with **Render** enabled. **Renderer** selects Remix (the existing default) or OpenRemix (path tracing by default). Switching restarts the worker and retains the composed scene, camera, selection, and unsaved edits. Turning it off pauses rendering and shows the Layout view; turning it on starts or resumes Remix. Toggle it off and on to retry after a renderer failure. Initial shader compilation can take tens of seconds. The camera defaults to **Drone**: press **Z** over the viewport to capture the mouse, look around with the mouse, and fly with **WASD**. **Q/E** moves down/up, **Shift** moves faster, and the wheel adjusts flight speed. Press **Z** or **Escape** to release the cursor. While released, middle/right drag looks around and the wheel zooms. Choose **Orbit** for orbit controls; **F** frames the selection in either mode. Controls work in both Layout and Remix views.
 3. **Add light** creates a light at the nearest surface in the centre of the view, with space for the emitter outside the surface. Area and spot lights face the surface. To place a mesh, ingest it, select it in the asset library, and choose **Add mesh**. Both start unattached. Use **Parent → Pick parent in viewport** in Properties, hover a mesh to highlight it, and click to attach. Escape or right-click cancels; **Detach** returns the object to the world. The picker works over the live Remix image and Layout view; middle-drag and the wheel still move the camera. Changing parent preserves the object's world pose; duplicates inherit the same parent and local transform. Picking captured geometry attaches to its stable mesh-hash root rather than the capture-only mesh child. **Replace mesh** and **Replace material** still use the selected captured asset.
 4. Select a scene object to use its grouped authoring controls: transforms and bound materials for meshes; radiance, color, temperature, shape, and cone controls for lights; texture channels and surface settings for materials. Commit numeric edits with Enter, focus loss, or release of a drag; use ↺ to reset an active-layer property override. Choose **Move** or **Rotate** above the viewport and drag the colored world axes or rotation rings. The center square moves in the view plane. **Snap** uses whole scene units and 15° increments; **Escape** or right-click cancels a drag. Light guides show the physical sphere, rectangle, disk, or cylinder, with emission arrows and spotlight cones including their soft edge. Distant and environment lights use orientation symbols. Guides and transform handles remain visible during Drone flight; release the cursor to manipulate them. Gizmos work in Layout and Remix views, preview live, and commit one undo step on release. Edits and attachments to captured assets affect every instance of the same hash.
 5. To restore a captured mesh, select its replacement in the viewport or scene tree and choose **Revert mesh replacement** in Properties. This restores matching captured instances, keeps added meshes and lights, and supports Undo/Redo. Lights or meshes parented inside the replacement move back under the captured mesh without changing their world pose. The ingested asset remains in the library.
@@ -77,6 +129,25 @@ When installed mods already replace an attached mesh/light hash, live publishing
 Live publishing includes unsaved replacement opinions, excludes captures, and links textures and MDL dependencies without copying their data. It leaves project saving and Undo history unchanged. The game keeps the last published state when the editor closes, including unsaved edits; Save is still required to retain those edits in the project. Generated USD and asset links live in `<project>.studio-live/`; `<project>.studio-link.json` remembers the destination. Keep the project and source assets in place while linked. After unlinking, the live cache may be deleted. Use **Package mod** for a portable copy. On Windows, creating symlinks requires Developer Mode or suitable permissions.
 
 Use **Add capture** above the scene tree to attach another Remix capture to the open project. The **Capture** picker switches the active scene; hover an entry to see its full path. Only one capture composes at a time. Replacements and ingested assets stay shared, pending inspector edits are committed before switching, and each capture remembers its own camera. Adding and switching captures support Undo/Redo. **Save** persists the capture list and active capture in the workfile; capture files remain external, unchanged references. Missing captures stay listed but cannot be selected. Packaged mods exclude both capture geometry and the editor capture list.
+
+The Remix viewport automatically reads mesh categories from the capture and the nearest
+`rtx.conf` found by walking up from the capture's directory (including the usual
+`<game>/rtx-remix/captures` layout). It reads only category hash lists, including decals,
+terrain, particles, water, sky, and alpha overrides. Other game render settings do not
+replace the toolkit's settings. The status output reports the configuration source.
+Both legacy `remix_config` and namespaced `remix:remix_config` embedded capture settings
+are supported, so captures moved away from their game still retain their saved categories.
+
+Texture lists match the captured albedo texture hash; `rtx.skyBoxGeometries` matches
+mesh hashes. As in Remix, positive hashes add categories and `-0x...` entries remove
+them from inherited settings; an empty list adds no overrides. The game's file takes
+precedence for hashes it mentions, and explicit USD category edits in project layers
+take precedence over both. Material replacements retain their original captured texture
+identity. Different material subsets can carry different categories. Switching captures
+or reopening a project refreshes its configuration; a full scene refresh also rereads the
+file. This does not modify the game configuration, capture, or published mod.
+Categories are passed through the public Remix API; effects that require the original
+game's raster passes, such as terrain texture baking, remain limited by the captured data.
 
 **Ctrl+T** places the selected object on the surface under the mouse, preserving rotation, scale, and parent attachment. With the mouse captured for Drone mode, it uses the centre crosshair. The moved object's own mesh is excluded from the depth test; meshes rest on their bounds and lights clear their emitter dimensions. Placement is one undo step. If no mesh is hit, placement tries the stage's ground plane; if that also misses, Ctrl+T leaves the object unchanged and Add light falls back to the camera focus distance.
 
@@ -100,7 +171,7 @@ The Remix viewport preserves material filtering and U/V wrap modes. Materials wi
 
 Capture transparency uses each mesh instance's alpha-test, blend, texture-factor, and vertex-opacity data, including shared meshes drawn with different transparency states. In a material's **Opacity** group, disable **Use captured alpha state** to author overrides. For cutouts, choose **Greater** (or **Greater or equal**) and a threshold from 0–255. For smooth transparency, turn on **Enable blending**, choose **Alpha**, and leave alpha testing at **Always (no cutout)**. Remix's additive, multiply, color, and reverse/inverted blend modes are also available. Textured materials read opacity from the base-color texture's alpha channel; **Opacity** is the fallback for materials without that texture. Meshes also expose **Ignore alpha channel** and **Force cutout**. Changes support Save, Undo, Redo, and Reset. glTF MASK and BLEND imports author the matching material settings. Asset thumbnails approximate common cutout/blend modes; the Remix viewport is the rendering reference.
 
-**Render settings** above the viewport controls upscaling, quality, Ray Reconstruction, and output resolution. **Automatic** chooses DLSS when supported and TAAU otherwise; **Off** renders at native resolution. Quality presets control the internal render resolution. Ray Reconstruction is shown only when the active runtime reports support, and requires DLSS. Unavailable upscalers are disabled (the pinned Linux build does not include NIS). A saved unsupported selection falls back to TAAU while retaining the preference. Output resolution offers presets from 960×540 through 4K and custom dimensions; it is independent of UI DPI scaling. Apply saves preferences across all projects and app restarts in `render_settings.json` beside the recent-project history. Upscaler changes apply live; resolution changes reconnect the viewport while retaining the document and camera. Cancel discards unapplied changes.
+**Render settings** above the viewport controls upscaling, quality, Ray Reconstruction, and output resolution. **Automatic** chooses DLSS when supported, otherwise FSR for OpenRemix (or native resolution if unavailable) and TAAU for Remix; **Off** renders at native resolution. Quality presets control the internal render resolution. Ray Reconstruction is shown only when the active runtime reports support, and requires DLSS. Unavailable upscalers are disabled (the pinned Linux build does not include NIS). Saved unsupported selections use the renderer’s available fallback while retaining the preference. Output resolution offers presets from 960×540 through 4K and custom dimensions; it is independent of UI DPI scaling. Apply saves preferences across all projects and app restarts in `render_settings.json` beside the recent-project history. Upscaler changes apply live; resolution changes reconnect the viewport while retaining the document and camera. Cancel discards unapplied changes.
 
 The build/run helper places NVIDIA's downloaded NGX feature libraries beside `libremix.so` so DLSS and Ray Reconstruction can be discovered. An externally supplied runtime must include its corresponding feature libraries; capability detection also checks hardware and driver support.
 
@@ -142,9 +213,9 @@ Unsupported USD content is retained when opening and saving a project. The previ
 
 ## Architecture and limits
 
-`native/document.cpp` owns the OpenUSD stage, layers, edit transactions, and packaging. `native/ingestion.cpp` converts source assets into staged USD assets before publishing them. The GDExtension exposes this to the standalone UI in `app/scripts` and runs ingestion on a background thread. Texture conversion uses Godot's codecs and compressors.
+`native/document.cpp` owns the OpenUSD stage, layers, edit transactions, and packaging. `native/ingestion.cpp` converts source assets into staged USD assets before publishing them. The GDExtension exposes this to the standalone UI in `app/scripts` and runs ingestion on a background thread. Command results pass directly into Godot dictionaries and arrays, avoiding a full JSON string and Godot's signed 32-bit string/parser limit when opening large captures. Texture conversion uses Godot's codecs and compressors.
 
-`native/scene.cpp` composes visible geometry and lighting into a renderer snapshot. `native/renderer_main.cpp` creates Remix SDK materials/meshes/lights and submits instances each frame. Repeated geometry within a snapshot shares a Remix mesh. Light edits send a small lighting snapshot and update only changed lights, preserving Remix mesh/material resources and the Layout geometry/picking cache. This includes light creation, deletion, and undo/redo; edits to lights with geometry descendants use the full scene path. Editor lights remain dynamic so repeated edits keep updating their illumination. Invalid captured UV components use zero in the preview without changing the USD assets. Geometry changes send complete JSON snapshots split into bounded IPC frames, so captures can exceed 64 MiB. Protocol v2 uses the high bit of each little-endian length header to mark continuation frames; a message is decoded and applied only after its final frame arrives. The editor and worker must be updated together. Snapshots still need to fit in memory; incremental binary geometry streaming and large-capture performance work remain.
+`native/scene.cpp` composes visible geometry and lighting into a renderer snapshot. `native/renderer_main.cpp` creates Remix SDK materials/meshes/lights and submits instances each frame. Repeated geometry within a snapshot shares a Remix mesh. Light edits send a small lighting snapshot and update only changed lights, preserving Remix mesh/material resources and the Layout geometry/picking cache. This includes light creation, deletion, and undo/redo; edits to lights with geometry descendants use the full scene path. Editor lights remain dynamic so repeated edits keep updating their illumination. Invalid captured UV components use zero in the preview without changing the USD assets. Geometry changes send complete JSON snapshots, encoded in small batches into bounded IPC frames without constructing a single scene-sized string. Transfers can exceed both 64 MiB and 2 GiB. Protocol v2 uses the high bit of each little-endian length header to mark continuation frames; a message is decoded and applied only after its final frame arrives. The editor and worker must be updated together. Snapshots still need to fit in memory; incremental binary geometry streaming and large-capture performance work remain.
 
 The layout view uploads each unique mesh to Godot once per scene snapshot and draws wireframes on the GPU. It caches the resulting viewport image until the camera, selection, scene, or view size changes. Repeated instances share GPU geometry and a picking BVH, built lazily on first use. Selection first rejects mesh bounding boxes, then queries the native triangle BVH; framing uses cached world bounds. Large snapshots still take time to compose and upload when the scene changes, but orbiting does not walk their triangles in GDScript.
 
@@ -180,6 +251,19 @@ python scripts/bootstrap.py gpu-test
 ```
 
 Native tests cover capture immutability, composition, shared instance edits, transaction rollback, undo/redo, material and mesh replacement, and packaging. Protocol tests cover normal sessions, invalid versions, truncated continuations, oversized frames, UTF-8 across frame boundaries, transfers and replies above 64 MiB, and recoverable command errors. A headless Godot test exercises large transfers through the real client and worker. The Godot ingestion test checks DDS formats, mipmaps, channel values, glTF ingestion, and material dependency packaging. The GPU test checks visible rendered geometry, invalid captured UV handling, and worker restart while retaining unsaved edits; it needs an active desktop session and supported GPU. Test screenshots and generated projects are retained under `.work/integration` and `.work/ingestion`.
+
+`large_scene_test.gd` checks direct native scene transfer, Unicode paths, bounded JSON encoding, cancellation, and UI recovery after a failed scene response. To also load a real large project, build its Layout geometry, and stream the complete snapshot to the worker without allocating Remix GPU geometry, run:
+
+```sh
+.work/deps/godot/bin/godot.linuxbsd.editor.x86_64.llvm --headless --path app --script res://tests/large_scene_test.gd -- --project=/absolute/path/to/project.usda
+```
+
+The optional project is opened read-only; this regression can require substantial memory. Its generated test fixtures are retained under `.work/large-scene`.
+
+Category tests cover game-config discovery, embedded settings, hash additions/exclusions,
+USD overrides, material subsets, capture switching, and read-only source handling.
+The category GPU smoke test checks visible results of changing a hash classification,
+including a capture whose meshes are all hidden. Its images are in `.work/categories-gpu`.
 
 Model import tests cover FBX texture paths with Windows separators, spaces and
 absolute paths, plus missing-texture cleanup. Added and replaced meshes retain

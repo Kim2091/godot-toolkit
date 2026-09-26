@@ -24,6 +24,31 @@ int main() {
       try { RenderSettings::parse(invalid); } catch (const std::exception&) { rejected = true; }
       check(rejected, "Malformed render settings must be rejected before altering the runtime");
     }
+    const auto open = RenderSettings::parse({{"upscaler", "dlss"}}, true);
+    const auto openFallback = open.effective_openremix(true, false, false, true);
+    check(openFallback.backend == "pathtrace" && openFallback.upscaler == "fsr31", "OpenRemix defaults and FSR fallback");
+    check(open.effective_openremix(false, true, true, true).backend == "raster", "Unsupported tracing falls back to raster");
+    const auto variables = openFallback.openremix_variables();
+    for (auto it = variables.begin(); it != variables.end(); ++it) check(it.key().rfind("rtx.native.", 0) == 0, "No dxvk variables sent to OpenRemix");
+    check(open.upscaler == "dlss", "Runtime fallback preserves saved preference");
+    check(open.pathtrace.at("denoiser") == "reblur-sh" && open.pathtrace.at("sharc") == true && open.pathtrace.at("localFireflyFilter") == false,
+      "Existing OpenRemix preferences inherit native NRD, SHARC and opt-in firefly defaults");
+    const auto configured = RenderSettings::parse({{"pathtrace", {{"localFireflyFilter", true}, {"samples", 4.0}, {"localDirectClamp", 2.5}, {"sharc", false}}}}, true);
+    const auto native = configured.openremix_variables();
+    check(native.at("rtx.native.pathtrace.localFireflyFilter") == "1" && native.at("rtx.native.pathtrace.sharc") == "0" &&
+      native.at("rtx.native.pathtrace.samples") == "4" && native.at("rtx.native.pathtrace.localDirectClamp") == "2.5",
+      "Godot numeric JSON and boolean preferences map to valid native configuration text");
+    check(configured.effective_openremix(false, false, false, false).pathtrace == configured.pathtrace,
+      "Raster or reconstruction fallbacks must not overwrite saved tracing options");
+    check(!configured.variables().contains("rtx.native.pathtrace.sharc") && !configured.json().contains("pathtrace"),
+      "Remix settings do not contain OpenRemix options");
+    for (const auto& invalid : {Json{{"samples", 1.5}}, Json{{"bounces", -1}}, Json{{"samples", true}}, Json{{"sharcCapacityLog2", 23}},
+        Json{{"localFireflyFilter", "true"}}, Json{{"sharc", 1}}, Json{{"localDirectClamp", -1}}, Json{{"indirectClamp", 1000001}},
+        Json{{"denoiser", "nrd"}}, Json{{"separateLocalLighting", 1.5}}, Json{{"sharcReset", true}}, Json::array()}) {
+      bool rejected = false;
+      try { RenderSettings::parse({{"pathtrace", invalid}}, true); } catch (const std::exception&) { rejected = true; }
+      check(rejected, "Reject invalid native settings before altering the runtime");
+    }
     std::cout << "Render settings validation and GPU fallback passed\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -7,6 +7,7 @@ var directory := OS.get_environment("REMIX_STUDIO_PORTABLE_TEST_DIR")
 var failures := 0
 var frames := 0
 var deadline := 0
+var openremix_upscaler := OS.get_environment("REMIX_STUDIO_TEST_UPSCALER")
 
 func check(condition: bool, message: String) -> void:
 	if not condition:
@@ -27,6 +28,11 @@ func _run() -> void:
 		quit(1)
 		return
 	app = load("res://main.tscn").instantiate()
+	if OS.get_environment("REMIX_STUDIO_TEST_RENDERER") == "openremix":
+		if openremix_upscaler.is_empty(): openremix_upscaler = "none"
+		app.render_settings = load("res://scripts/render_settings.gd").new(directory.path_join("settings.json"))
+		app.render_settings.select_renderer("openremix")
+		app.render_settings.save_settings({"backend": "pathtrace", "upscaler": openremix_upscaler, "quality": "balanced", "width": 320, "height": 180})
 	root.add_child(app)
 	check(app.document != null, "Bundled GDExtension failed to load")
 	if app.document == null:
@@ -76,7 +82,7 @@ func _run() -> void:
 			surface.material = "portable_emission"
 	app.viewport.frame_selection(true)
 	app.renderer.response_received.connect(_response)
-	deadline = Time.get_ticks_msec() + 180000
+	deadline = Time.get_ticks_msec() + 600000
 
 func _response(response: Dictionary) -> void:
 	if not response.get("ok", false):
@@ -91,6 +97,9 @@ func _response(response: Dictionary) -> void:
 func _capture() -> void:
 	await RenderingServer.frame_post_draw
 	check(app.viewport.rendered_texture != null, "Bundled Godot could not import the Remix Vulkan texture")
+	if OS.get_environment("REMIX_STUDIO_TEST_RENDERER") == "openremix":
+		check(app.renderer.effective_settings.get("upscaler") == openremix_upscaler,
+			"Bundled OpenRemix silently fell back from requested reconstruction")
 	var screenshot := root.get_texture().get_image()
 	screenshot.save_png(directory.path_join("portable-viewport.png"))
 	var area: Rect2 = root.get_final_transform() * app.viewport.get_global_transform_with_canvas() * app.viewport._view_rect()

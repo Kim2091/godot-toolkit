@@ -177,3 +177,21 @@ index c9d566f215..30e8b50486 100644
  	virtual Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) = 0;
  	virtual void command_queue_free(CommandQueueID p_cmd_queue) = 0;
  
+diff --git a/servers/rendering/rendering_device_graph.cpp b/servers/rendering/rendering_device_graph.cpp
+--- a/servers/rendering/rendering_device_graph.cpp
++++ b/servers/rendering/rendering_device_graph.cpp
+@@ -1969,6 +1969,14 @@
+ 	int32_t command_index;
+ 	RecordedDriverCallbackCommand *command = static_cast<RecordedDriverCallbackCommand *>(_allocate_command(sizeof(RecordedDriverCallbackCommand), command_index));
+ 	command->type = RecordedCommand::TYPE_DRIVER_CALLBACK;
++	// Copy callbacks may be flushed without a later draw command. Declare their
++	// stage so the target layout transition synchronizes the callback's writes.
++	for (uint32_t i = 0; i < p_usages.size(); i++) {
++		const ResourceUsage usage = p_usages[i];
++		if (usage == RESOURCE_USAGE_COPY_FROM || usage == RESOURCE_USAGE_COPY_TO) {
++			command->self_stages = command->self_stages | RDD::PIPELINE_STAGE_COPY_BIT;
++		}
++	}
+ 	command->callback = p_callback;
+ 	command->userdata = p_userdata;
+ 	_add_command_to_graph((ResourceTracker **)p_trackers.ptr(), (ResourceUsage *)p_usages.ptr(), p_trackers.size(), command_index, command);

@@ -1,0 +1,307 @@
+[
+  {
+    "key": "denoiser",
+    "label": "NRD denoiser",
+    "group": "Denoising",
+    "default": "reblur-sh",
+    "hint": "REBLUR diffuse SH and PBR denoising. Ray Reconstruction replaces NRD; the saved choice resumes without RR.",
+    "choices": {
+      "reblur-sh": "REBLUR SH",
+      "off": "Off"
+    }
+  },
+  {
+    "key": "localDenoiser",
+    "label": "Denoise local lighting",
+    "group": "Denoising",
+    "default": true,
+    "hint": "Denoise authored and emissive lighting with REBLUR."
+  },
+  {
+    "key": "localFireflyFilter",
+    "label": "PBR firefly filter (REBLUR)",
+    "group": "Denoising",
+    "default": false,
+    "hint": "Extra local-light firefly suppression for PBR materials. Requires REBLUR receiving local lighting; bypassed by RR and progressive accumulation. Ordinary NRD anti-firefly processing is already enabled."
+  },
+  {
+    "key": "sigma",
+    "label": "SIGMA sun shadows",
+    "group": "Denoising",
+    "default": true,
+    "hint": "Denoise distant-light shadows. Ray Reconstruction replaces this filter."
+  },
+  {
+    "key": "blueNoiseShadows",
+    "label": "Blue noise sun shadows",
+    "group": "Denoising",
+    "default": true,
+    "hint": "Use blue noise with filtered sun shadows; bypassed by RR."
+  },
+  {
+    "key": "taa",
+    "label": "Native resolution TAA",
+    "group": "Denoising",
+    "default": true,
+    "hint": "Temporal antialiasing at native resolution. Bypassed when FSR/DLSS reconstruct the image or progressive accumulation is enabled."
+  },
+  {
+    "key": "localDirectClamp",
+    "label": "Local direct clamp",
+    "group": "Denoising",
+    "default": 0.0,
+    "hint": "Maximum linear luminance per primary local-light sample. 0 disables. Lower values can remove real highlights and bypass PBR lighting reuse.",
+    "min": 0,
+    "max": 1000000,
+    "step": 0.1
+  },
+  {
+    "key": "indirectClamp",
+    "label": "Indirect clamp",
+    "group": "Denoising",
+    "default": 0.0,
+    "hint": "Maximum linear luminance per indirect path. 0 disables. Lower values can remove real highlights and bypass water/PBR lighting reuse.",
+    "min": 0,
+    "max": 1000000,
+    "step": 0.1
+  },
+  {
+    "key": "primaryVisibility",
+    "label": "Primary visibility",
+    "group": "Sampling",
+    "default": "raster",
+    "hint": "Raster G-buffer or ray queries for primary surfaces. Both modes use path-traced lighting.",
+    "choices": {
+      "raster": "Raster G-buffer",
+      "ray": "Ray traced"
+    }
+  },
+  {
+    "key": "samples",
+    "label": "Samples per pixel",
+    "group": "Sampling",
+    "default": 1,
+    "hint": "More path samples reduce noise and increase render time.",
+    "min": 1,
+    "max": 16,
+    "step": 1
+  },
+  {
+    "key": "bounces",
+    "label": "Maximum indirect bounces",
+    "group": "Sampling",
+    "default": 2,
+    "hint": "Maximum traced indirect surface interactions. SHARC can supply a longer cached lighting tail.",
+    "min": 0,
+    "max": 4,
+    "step": 1
+  },
+  {
+    "key": "russianRoulette",
+    "label": "Adaptive indirect termination",
+    "group": "Sampling",
+    "default": false,
+    "hint": "Probabilistically stop low-contribution paths. May reduce work and increase noise."
+  },
+  {
+    "key": "rouletteMinBounces",
+    "label": "Bounces before termination",
+    "group": "Sampling",
+    "default": 1,
+    "hint": "Minimum indirect bounces before adaptive termination. Must be below the maximum to have an effect.",
+    "min": 1,
+    "max": 4,
+    "step": 1
+  },
+  {
+    "key": "waterIndirectReuse",
+    "label": "Reuse water indirect samples",
+    "group": "Sampling",
+    "default": true,
+    "hint": "Share diffuse water lighting with compatible temporal modes. Bypassed by RR, raw reference rendering and indirect clamping."
+  },
+  {
+    "key": "pbrLocalReuse",
+    "label": "PBR lighting reuse (experimental)",
+    "group": "Sampling",
+    "default": false,
+    "hint": "Reuse local lighting on similar rough surfaces. Bypassed by RR and luminance clamps; may change lighting and temporal noise."
+  },
+  {
+    "key": "accumulate",
+    "label": "Progressive reference rendering",
+    "group": "Sampling",
+    "default": false,
+    "hint": "Accumulate samples while the camera is still. Bypasses denoising, reconstruction, TAA and SHARC; movement resets accumulation."
+  },
+  {
+    "key": "localLights",
+    "label": "Local lighting",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Evaluate authored local lights and emissive lighting."
+  },
+  {
+    "key": "torchLights",
+    "label": "Authored local lights",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Evaluate sphere, spot and area lights authored in the scene."
+  },
+  {
+    "key": "emissiveLights",
+    "label": "Emissive lighting",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Cast light from emissive geometry. Visible emissive textures remain visible when disabled."
+  },
+  {
+    "key": "localSamples",
+    "label": "Local light samples",
+    "group": "Lighting",
+    "default": 1,
+    "hint": "Minimum direct local-light sample count.",
+    "min": 1,
+    "max": 16,
+    "step": 1
+  },
+  {
+    "key": "emissiveCandidates",
+    "label": "Emissive candidates",
+    "group": "Lighting",
+    "default": 4,
+    "hint": "Compare unshadowed emissive candidates while retaining one shadow ray per local-light sample.",
+    "min": 1,
+    "max": 8,
+    "step": 1
+  },
+  {
+    "key": "adaptiveLocalSampling",
+    "label": "Adaptive local-light sampling",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Raise the sample budget near important light clusters; configured counts remain minimums."
+  },
+  {
+    "key": "blueNoiseLocalLights",
+    "label": "Blue noise local lights",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Blue noise for primary local-light samples with NRD local denoising. Bypassed by RR."
+  },
+  {
+    "key": "localGuiding",
+    "label": "Guide by recent visibility",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Guide light sampling using recent visibility while retaining exploration."
+  },
+  {
+    "key": "emissiveSolidAngleSampling",
+    "label": "Nearby emissive sampling (experimental)",
+    "group": "Lighting",
+    "default": false,
+    "hint": "Sample nearby area lights with the same shadow-ray count; adds GPU work."
+  },
+  {
+    "key": "separateLocalLighting",
+    "label": "Authored / emissive sampling",
+    "group": "Lighting",
+    "default": 0,
+    "hint": "Separate lighting families can use separate denoiser histories. Per-family mode may double shadow rays. RR combines shared budgets.",
+    "choices": {
+      "0": "Combined",
+      "1": "Separate, shared ray budget",
+      "2": "Separate, samples per family",
+      "3": "Combined, separate pass"
+    }
+  },
+  {
+    "key": "sky",
+    "label": "Sky illumination",
+    "group": "Lighting",
+    "default": true,
+    "hint": "Include sky illumination in lighting."
+  },
+  {
+    "key": "sharc",
+    "label": "SHARC radiance cache",
+    "group": "SHARC",
+    "default": true,
+    "hint": "Reuse indirect lighting on static diffuse and rough PBR surfaces. Sharp surfaces continue tracing. Progressive reference rendering bypasses SHARC."
+  },
+  {
+    "key": "sharcSceneScale",
+    "label": "Cache scene scale",
+    "group": "SHARC",
+    "default": 50,
+    "hint": "World-space cache grid scale in renderer scene units.",
+    "min": 1,
+    "max": 200,
+    "step": 1
+  },
+  {
+    "key": "sharcDownscale",
+    "label": "Update downscale",
+    "group": "SHARC",
+    "default": 5,
+    "hint": "One update path per downscale tile. Lower values update more densely at higher GPU cost.",
+    "min": 1,
+    "max": 16,
+    "step": 1
+  },
+  {
+    "key": "sharcCapacityLog2",
+    "label": "Cache capacity (power of 2)",
+    "group": "SHARC",
+    "default": 22,
+    "hint": "Number of cache entries is 2 raised to this value. Larger caches require more GPU memory.",
+    "min": 16,
+    "max": 22,
+    "step": 1
+  },
+  {
+    "key": "sharcAccumulationFrames",
+    "label": "Cache accumulation frames",
+    "group": "SHARC",
+    "default": 32,
+    "hint": "Maximum cache history length. Longer history smooths noise but responds more slowly.",
+    "min": 1,
+    "max": 1024,
+    "step": 1
+  },
+  {
+    "key": "sharcStaleFrames",
+    "label": "Expire entries after frames",
+    "group": "SHARC",
+    "default": 64,
+    "hint": "Retire cache entries that have not been updated for this many frames.",
+    "min": 8,
+    "max": 1024,
+    "step": 1
+  },
+  {
+    "key": "prism",
+    "label": "Prism tonemapping",
+    "group": "Display",
+    "default": true,
+    "hint": "Map high dynamic range scene values to display output."
+  },
+  {
+    "key": "gamma22",
+    "label": "Gamma 2.2 output",
+    "group": "Display",
+    "default": true,
+    "hint": "Apply the renderer output gamma transform."
+  },
+  {
+    "key": "fsrSharpness",
+    "label": "FSR sharpening",
+    "group": "Display",
+    "default": 0.0,
+    "hint": "Sharpening strength, used only by FSR 3.1.",
+    "min": 0,
+    "max": 1,
+    "step": 0.05
+  }
+]

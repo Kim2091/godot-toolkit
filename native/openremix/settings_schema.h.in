@@ -1,0 +1,8 @@
+#pragma once
+
+// Shared with the Godot settings UI. Embedded at build time so the worker has
+// no runtime dependency on a checkout or a settings-schema file.
+inline const nlohmann::json& openremix_settings_schema() {
+  static const auto schema = nlohmann::json::parse(R"schema(@OPENREMIX_SETTINGS_SCHEMA@)schema");
+  return schema;
+}

@@ -43,18 +43,19 @@ def dependencies(binary):
             re.findall(r"^\s*(\S+) => (/.+?) \(0x", output, re.MULTILINE)}
 
 
-def notices(bundle):
+def notices(bundle, openremix_source):
     # Preserve component notices, including notices from bundled/static SDKs.
     sources = {
         "godot": DEPS / "godot", "godot-cpp": DEPS / "godot-cpp",
         "OpenUSD": DEPS / "OpenUSD-25.11", "oneTBB": DEPS / "oneTBB-2021.13.0",
         "assimp": DEPS / "assimp-6.0.2", "json": ROOT / "build/_deps/json-src",
+        "openremix": openremix_source,
         "remix": DEPS / "remix", "remix-sdk": DEPS / "remix-sdk/sources",
     }
     for name, source in sources.items():
         count = 0
         for directory, dirs, files in os.walk(source):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "_build", "node_modules"}]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "_build", "_work", "ref", "subprojects", "node_modules"}]
             for filename in files:
                 if any(word in filename.lower() for word in ("license", "copying", "copyright", "notice")):
                     path = Path(directory) / filename
@@ -63,6 +64,12 @@ def notices(bundle):
                         count += 1
         if not count:
             raise RuntimeError(f"No license notices found for {name}: {source}")
+    sdl_notices = list((openremix_source / "subprojects").glob("SDL3-*/LICENSE.txt")) + [
+        Path("/usr/share/licenses/sdl3/LICENSE"), Path("/usr/share/doc/libsdl3-0/copyright")]
+    sdl_notice = next((path for path in sdl_notices if path.is_file()), None)
+    if sdl_notice is None:
+        raise RuntimeError("The OpenRemix SDL3 license notice is required to package its runtime")
+    copy(sdl_notice, bundle / "licenses/openremix/SDL3.txt")
     for name in ("libstdc++", "libgcc"):
         candidates = [Path(f"/usr/share/licenses/{name}/RUNTIME.LIBRARY.EXCEPTION"),
                       Path("/usr/share/doc/gcc-14-base/copyright")]
@@ -79,7 +86,7 @@ def notices(bundle):
     shutil.copytree(ROOT / "patches", bundle / "licenses/source-patches")
 
 
-def package(output, name, patchelf):
+def package(output, name, patchelf, openremix_source, openremix_library):
     output.mkdir(parents=True, exist_ok=True)
     engine = next(iter(sorted((DEPS / "godot/bin").glob("godot.*editor*x86_64*"))), None)
     if engine is None:
@@ -91,7 +98,7 @@ def package(output, name, patchelf):
         # captures, previews and caches, which must never enter a release.
         for filename in ("project.godot", "main.tscn", "remix_editor.gdextension"):
             copy(ROOT / "app" / filename, bundle / "app" / filename)
-        for directory, suffixes in (("scripts", {".gd", ".uid"}), ("shaders", {".gdshader", ".uid"})):
+        for directory, suffixes in (("scripts", {".gd", ".uid", ".json"}), ("shaders", {".gdshader", ".uid"})):
             for path in (ROOT / "app" / directory).rglob("*"):
                 if path.is_file() and path.suffix in suffixes:
                     copy(path, bundle / "app" / path.relative_to(ROOT / "app"))
@@ -108,19 +115,37 @@ def package(output, name, patchelf):
         copy(ROOT / "scripts/portable/renderer.sh", bundle / "bin/remix-renderer")
         (bundle / "bin/remix-renderer").chmod(0o755)
         runtime = ROOT / ".work/build/remix/src/linux/libremix.so"
-        copy(runtime, bundle / "runtime/libremix.so")
+        copy(runtime, bundle / "runtime/remix/libremix.so")
         sdk = DEPS / "remix-sdk/prefix/lib"
         for feature in ("dlss", "dlssd", "dlssg"):
             libraries = list(sdk.glob(f"libnvidia-ngx-{feature}.so.*"))
             if not libraries:
                 raise RuntimeError(f"Missing NGX {feature} runtime in {sdk}")
             for library in libraries:
-                copy(library, bundle / "runtime" / library.name)
+                copy(library, bundle / "runtime/remix" / library.name)
+        copy(openremix_library, bundle / "runtime/openremix/libremix.so")
+        ngx = openremix_source / "third_party/dlss/lib/Linux_x86_64/rel"
+        for library in ngx.glob("libnvidia-ngx-*.so.*"):
+            copy(library, bundle / "runtime/openremix/dlss/310.9.1" / library.name)
+        # Runtime dependency closures stay isolated: SDL/NGX versions can differ.
+        for renderer in ("remix", "openremix"):
+            directory = bundle / "runtime" / renderer
+            pending_runtime = [p for p in directory.iterdir() if is_elf(p)]
+            seen_runtime = set()
+            for binary in pending_runtime:
+                for soname, source in dependencies(binary).items():
+                    if soname in seen_runtime or soname in SYSTEM_LIBRARIES or soname.startswith("ld-linux-"): continue
+                    seen_runtime.add(soname)
+                    destination = directory / soname
+                    copy(source, destination); pending_runtime.append(destination)
+            for binary in pending_runtime:
+                if "nvidia-ngx" not in binary.name:
+                    run(patchelf, "--set-rpath", "$ORIGIN:$ORIGIN/../../lib", binary)
         # Keep USD's relative LibraryPath/ResourcePath layout intact, including
         # schemas and dynamically loaded shader discovery plugins.
         shutil.copytree(DEPS / "usd/lib", bundle / "lib", ignore=shutil.ignore_patterns("cmake", "pkgconfig", "*.a"))
         shutil.copytree(DEPS / "usd/plugin", bundle / "plugin")
-        pending = [path for path in bundle.rglob("*") if is_elf(path)]
+        pending = [path for path in bundle.rglob("*") if is_elf(path) and "runtime" not in path.relative_to(bundle).parts]
         copied = {}
         for binary in pending:
             for soname, source in dependencies(binary).items():
@@ -136,7 +161,7 @@ def package(output, name, patchelf):
         minimum = (2, 0)
         for binary in (p for p in bundle.rglob("*") if is_elf(p)):
             relative_lib = os.path.relpath(bundle / "lib", binary.parent)
-            rpath = "$ORIGIN" if relative_lib == "." else "$ORIGIN/" + relative_lib
+            rpath = "$ORIGIN" if relative_lib == "." else "$ORIGIN:$ORIGIN/" + relative_lib
             # NGX feature binaries are signed. Rewriting even just their ELF
             # RPATH invalidates the signature and silently disables DLSS/RR.
             if not binary.name.startswith("libnvidia-ngx-"):
@@ -150,11 +175,13 @@ def package(output, name, patchelf):
         copy(ROOT / "scripts/portable/README.txt", bundle / "README.txt")
         with (bundle / "README.txt").open("a") as stream:
             stream.write(f"\nThis build requires glibc {glibc} or newer.\n")
-        notices(bundle)
+        notices(bundle, openremix_source)
         info = {"platform": "linux-x86_64", "glibc_minimum": glibc,
                 "godot": run(engine, "--version").strip(),
                 "source_revision": run("git", "-C", ROOT, "rev-parse", "HEAD").strip(),
                 "source_modified": bool(run("git", "-C", ROOT, "status", "--porcelain")),
+                "openremix_revision": run("git", "-C", openremix_source, "rev-parse", "HEAD").strip() if (openremix_source / ".git").exists() else None,
+                "openremix_modified": bool(run("git", "-C", openremix_source, "status", "--porcelain")) if (openremix_source / ".git").exists() else None,
                 "dependencies": json.loads((ROOT / "dependencies.lock.json").read_text()),
                 "system_libraries": sorted(SYSTEM_LIBRARIES)}
         (bundle / "build-info.json").write_text(json.dumps(info, indent=2) + "\n")
@@ -184,6 +211,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "dist")
     parser.add_argument("--name", default="RemixStudio-linux-x86_64")
+    parser.add_argument("--openremix-source", type=Path, default=Path(os.environ.get("OPENREMIX_SOURCE_DIR", ROOT / ".work/deps/openremix")))
+    parser.add_argument("--openremix-library", type=Path, default=Path(os.environ.get("OPENREMIX_RUNTIME_PATH", ROOT / ".work/build/openremix/src/native/libremix.so")))
     args = parser.parse_args()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         parser.error("Portable packaging currently supports Linux x86_64")
@@ -192,7 +221,7 @@ def main():
     patchelf = shutil.which("patchelf") or str(ROOT / ".work/tools/venv/bin/patchelf")
     if not Path(patchelf).is_file():
         parser.error("Install patchelf or run python scripts/bootstrap.py portable")
-    package(args.output.resolve(), args.name, patchelf)
+    package(args.output.resolve(), args.name, patchelf, args.openremix_source.resolve(), args.openremix_library.resolve())
 
 
 if __name__ == "__main__":

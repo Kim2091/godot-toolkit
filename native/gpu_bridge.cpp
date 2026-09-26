@@ -145,6 +145,10 @@ private:
       }
       Ref<RDTextureFormat> format; format.instantiate();
       format->set_format(RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+      // Texture2DRD creates both linear and sRGB views of this Godot-owned copy.
+      // Declare them up front so Vulkan allocates a mutable-format image.
+      format->add_shareable_format(RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+      format->add_shareable_format(RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB);
       format->set_width(descriptor.width); format->set_height(descriptor.height);
       // Viewport presentation stays on the GPU; explicit project saves may read
       // the finished frame once to generate a recent-project thumbnail.
