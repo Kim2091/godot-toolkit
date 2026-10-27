@@ -898,7 +898,7 @@ func _renderer_failed(message: String) -> void:
 		renderer_alert = AcceptDialog.new()
 		renderer_alert.title = "Renderer stopped"
 		add_child(renderer_alert)
-	renderer_alert.dialog_text = message + "\n\nThe Layout view stays available. Renderer log: " + ProjectSettings.globalize_path("user://renderer.log")
+	renderer_alert.dialog_text = message + "\n\nThe Layout view stays available. Renderer log: " + renderer.log_path
 	if not renderer_alert.visible:
 		renderer_alert.popup_centered()
 

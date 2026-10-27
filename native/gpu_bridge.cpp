@@ -61,14 +61,24 @@ public:
   void import_frame(const Dictionary& descriptor) {
     RenderingServer::get_singleton()->call_on_render_thread(callable_mp(this, &RemixGpuBridge::import_on_render_thread).bind(descriptor));
   }
-  void copy_frame() { RenderingServer::get_singleton()->call_on_render_thread(callable_mp(this, &RemixGpuBridge::copy_on_render_thread)); }
+  void copy_frame() {
+    auto* server = RenderingServer::get_singleton();
+    Callable submitted = callable_mp(this, &RemixGpuBridge::frame_submitted);
+    if (!server->is_connected("frame_post_draw", submitted)) server->connect("frame_post_draw", submitted);
+    server->call_on_render_thread(callable_mp(this, &RemixGpuBridge::copy_on_render_thread));
+  }
   void close_frame() {
     { std::lock_guard<std::mutex> lock(close_mutex_); closed_ = false; }
     RenderingServer::get_singleton()->call_on_render_thread(callable_mp(this, &RemixGpuBridge::close_and_notify));
     std::unique_lock<std::mutex> lock(close_mutex_);
     close_condition_.wait(lock, [this] { return closed_; });
   }
-  ~RemixGpuBridge() { close_socket(); }
+  ~RemixGpuBridge() {
+    close_socket();
+    auto* server = RenderingServer::get_singleton();
+    Callable submitted = callable_mp(this, &RemixGpuBridge::frame_submitted);
+    if (server && server->is_connected("frame_post_draw", submitted)) server->disconnect("frame_post_draw", submitted);
+  }
 protected:
   static void _bind_methods() {
     ClassDB::bind_method(D_METHOD("open_channel"), &RemixGpuBridge::open_channel);
@@ -230,18 +240,34 @@ private:
       call_deferred("emit_signal", "failed", String(error.what()));
     }
   }
+  // Each copy waits on ready and signals released in the next engine frame
+  // submission. The producer GPU-waits on released before it writes again, and
+  // a wait whose signal is not submitted yet loses the device, so frame_copied
+  // is emitted only after that submission, and one copy is pending at most.
   void copy_on_render_thread() {
     auto* rd = RenderingServer::get_singleton()->get_rendering_device();
     if (!rd || !target_.is_valid()) return;
+    if (copies_ != submitted_) {
+      close_on_render_thread();
+      call_deferred("emit_signal", "failed", "Remix frame copies overlapped (" + String::num_uint64(copies_) + " copied, " +
+        String::num_uint64(submitted_) + " released); the viewport stopped importing frames");
+      return;
+    }
     auto result = int64_t(rd->call("texture_copy_from_external", target_, uint64_t(image_), uint64_t(ready_), uint64_t(released_)));
     if (result != OK) call_deferred("emit_signal", "failed", "Could not copy the Remix GPU frame");
-    else call_deferred("emit_signal", "frame_copied");
+    else ++copies_;
+  }
+  void frame_submitted() {
+    if (copies_ == submitted_) return;
+    submitted_ = copies_.load();
+    emit_signal("frame_copied");
   }
   void close_on_render_thread() {
     if (!device_) return;
     // Ready waits are submitted only after the producer reports GPU completion.
     auto* rd = RenderingServer::get_singleton()->get_rendering_device();
     rd->call("external_frame_flush");
+    copies_ = 0; submitted_ = 0;
     if (texture_.is_valid()) { texture_->set_texture_rd_rid(RID()); texture_.unref(); }
     if (target_.is_valid()) rd->free_rid(target_);
     target_ = RID();
@@ -258,6 +284,7 @@ private:
   VkDeviceMemory memory_ = VK_NULL_HANDLE;
   VkSemaphore ready_ = VK_NULL_HANDLE, released_ = VK_NULL_HANDLE;
   RID target_;
+  std::atomic<uint64_t> copies_{0}, submitted_{0};
   Ref<Texture2DRD> texture_;
   std::mutex close_mutex_;
   std::condition_variable close_condition_;

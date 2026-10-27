@@ -3,6 +3,7 @@ extends Node
 const PROTOCOL_VERSION := 3
 const MAX_FRAME_BYTES := 64 * 1024 * 1024
 const MORE_FRAMES := 0x80000000
+const SHUTDOWN_TIMEOUT_MSEC := 3000
 const JsonStream = preload("res://scripts/json_stream.gd")
 
 signal status_changed(message: String)
@@ -28,14 +29,21 @@ var last_log := ""
 var generation := 0
 var presented_context: Dictionary = {}
 var copy_context: Dictionary = {}
+var device_lost := false
 var frame_texture: Texture2D
 var capabilities: Dictionary = {}
 var effective_settings: Dictionary = {}
 var renderer_id := "remix"
 var output_size := Vector2i(960, 540)
+var log_path := ProjectSettings.globalize_path("user://renderer.log")
+
+func _init() -> void:
+	var settings := OS.get_environment("REMIX_STUDIO_SETTINGS_DIR")
+	if not settings.is_empty(): log_path = settings.path_join("renderer.log")
 
 func start_worker(executable: String, library: String, render_settings: Dictionary = {}, selected_renderer := "remix") -> void:
 	stop_worker()
+	device_lost = false
 	renderer_id = selected_renderer
 	capabilities = {}
 	effective_settings = {}
@@ -70,7 +78,7 @@ func start_worker(executable: String, library: String, render_settings: Dictiona
 	writer = Thread.new()
 	writer.start(_exchange_loop.bind(generation))
 	log_reader = Thread.new()
-	log_reader.start(_read_log)
+	log_reader.start(_read_log.bind(generation))
 	var start := {"op": "start", "library": library, "renderer": renderer_id, "width": output_size.x, "height": output_size.y}
 	if not render_settings.is_empty(): start["render_settings"] = render_settings.duplicate(true)
 	if not endpoint.is_empty():
@@ -93,7 +101,14 @@ func send(message: Dictionary) -> void:
 			if message.op == "preview_transform": same = same and messages[i].get("path") == message.path
 			if same or (message.op == "scene" and messages[i].get("op") in ["preview_transform", "lights"]):
 				messages.remove_at(i)
-	messages.append(message)
+	# A queued frame renders every update sent before it, so updates go ahead of it.
+	var position := messages.size()
+	if message.get("op") != "frame":
+		for i in messages.size():
+			if messages[i].get("op") == "frame":
+				position = i
+				break
+	messages.insert(position, message)
 	mutex.unlock()
 
 func _read_exact(pipe: FileAccess, length: int) -> PackedByteArray:
@@ -193,6 +208,7 @@ func _deliver(response: Dictionary, worker_generation: int) -> void:
 		if response.get("result", {}).has("render_settings"):
 			effective_settings = response.result.render_settings
 		if shared_frames and response.get("result", {}).get("status") == "presented":
+			# The next frame waits until the copy's release is submitted.
 			copy_context = response.get("view_context", {}).duplicate(true)
 			gpu.copy_frame()
 		else:
@@ -202,6 +218,12 @@ func _deliver(response: Dictionary, worker_generation: int) -> void:
 			status_changed.emit("Renderer preview closed")
 	response_received.emit(response)
 
+func _request_frame() -> void:
+	if is_ready and not frame_pending and is_processing():
+		frame_pending = true
+		send({"op": "frame"})
+
+# The GPU bridge reports a copy once the engine frame that releases it is submitted.
 func _frame_copied() -> void:
 	if copy_context.is_empty():
 		return
@@ -209,10 +231,11 @@ func _frame_copied() -> void:
 	copy_context = {}
 	frame_pending = false
 	frame_presented.emit(presented_context)
+	_request_frame()
 
-func _read_log() -> void:
+func _read_log(worker_generation: int) -> void:
 	var pipe: FileAccess = process["stderr"]
-	var file := FileAccess.open("user://renderer.log", FileAccess.WRITE)
+	var file := FileAccess.open(log_path, FileAccess.WRITE)
 	while true:
 		var bytes := pipe.get_buffer(4096)
 		if bytes.is_empty():
@@ -220,11 +243,20 @@ func _read_log() -> void:
 		if file != null:
 			file.store_buffer(bytes)
 			file.flush()
+		if bytes.get_string_from_utf8().contains("device lost"):
+			_device_lost.call_deferred(worker_generation)
+
+# The runtime keeps answering after it lost its GPU device, but its frames never complete.
+func _device_lost(worker_generation: int) -> void:
+	if worker_generation != generation or device_lost:
+		return
+	device_lost = true
+	stop_worker()
+	status_changed.emit("Remix lost its GPU device")
+	failed.emit("Remix lost its GPU device. Restart the renderer to continue.")
 
 func _process(_delta: float) -> void:
-	if is_ready and not frame_pending:
-		frame_pending = true
-		send({"op": "frame"})
+	_request_frame()
 
 func stop_worker() -> void:
 	generation += 1
@@ -232,10 +264,23 @@ func stop_worker() -> void:
 	is_starting = false
 	effective_settings = {}
 	mutex.lock()
+	messages.clear()
+	mutex.unlock()
+	# Submit the pending copies first: their releases let the runtime finish its
+	# GPU work, and a worker that exits cleanly has signaled every ready.
+	if gpu != null:
+		gpu.close_frame()
+	var running: bool = not process.is_empty() and OS.is_process_running(process["pid"])
+	if running and writer != null and writer.is_started():
+		send({"op": "shutdown"})
+		var deadline := Time.get_ticks_msec() + SHUTDOWN_TIMEOUT_MSEC
+		while OS.is_process_running(process["pid"]) and Time.get_ticks_msec() < deadline:
+			OS.delay_msec(5)
+	mutex.lock()
 	stopping = true
 	messages.clear()
 	mutex.unlock()
-	if not process.is_empty() and OS.is_process_running(process["pid"]):
+	if running and OS.is_process_running(process["pid"]):
 		OS.kill(process["pid"])
 	if writer != null and writer.is_started():
 		writer.wait_to_finish()
@@ -243,8 +288,6 @@ func stop_worker() -> void:
 		log_reader.wait_to_finish()
 	writer = null
 	log_reader = null
-	if gpu != null:
-		gpu.close_frame()
 	frame_texture = null; presented_context = {}; copy_context = {}
 	texture_ready.emit(null)
 	process.clear()
