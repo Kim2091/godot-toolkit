@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <set>
 #include <array>
 #include <algorithm>
@@ -167,9 +168,10 @@ int element_index(const TfToken& interpolation, int face, int corner, int vertex
   return vertex;
 }
 // Project onto the dominant plane so concave polygon faces can be ear-clipped.
-std::vector<std::array<int, 3>> triangulate(const VtVec3fArray& points, const VtIntArray& indices, int start, int count) {
-  std::vector<std::array<int, 3>> triangles;
-  if (count < 3) return triangles;
+void triangulate(const VtVec3fArray& points, const VtIntArray& indices, int start, int count, std::vector<std::array<int, 3>>& triangles) {
+  triangles.clear();
+  if (count < 3) return;
+  if (count == 3) { triangles.push_back({start, start + 1, start + 2}); return; }
   GfVec3f normal(0);
   for (int i = 0; i < count; ++i) normal += GfCross(points[indices[start + i]], points[indices[start + (i + 1) % count]]);
   int axis = 0;
@@ -202,7 +204,6 @@ std::vector<std::array<int, 3>> triangulate(const VtVec3fArray& points, const Vt
     if (!found) throw std::runtime_error("Degenerate or self-intersecting polygon");
   }
   triangles.push_back({start + corners[0], start + corners[1], start + corners[2]});
-  return triangles;
 }
 uint64_t mix(uint64_t hash, const void* data, size_t size) {
   const auto* bytes = static_cast<const unsigned char*>(data);
@@ -261,11 +262,12 @@ struct SurfaceBuffers {
   UsdShadeMaterial material;
   std::vector<float> positions, normals, uvs;
   std::vector<uint32_t> colors;
-  std::vector<int32_t> indices;
+  std::vector<int32_t> indices, by_point;
   std::unordered_map<std::array<int, 5>, int32_t, CornerHash> corners;
 };
 // Corners share a vertex when they use the same point and primvar elements.
 // Faces without valid normals get a per-triangle key for their flat normal.
+// When every primvar is constant or per point, the point index is that key.
 Json prototype_json(const GeometrySource& s, const std::vector<UsdShadeMaterial>& bound, std::vector<UsdShadeMaterial>& surface_materials,
     std::set<std::string>& materials, Json& result) {
   std::vector<int> face_material(s.counts.size(), 0);
@@ -274,43 +276,67 @@ Json prototype_json(const GeometrySource& s, const std::vector<UsdShadeMaterial>
   std::vector<bool> hole(s.counts.size());
   for (int face : s.holes) if (face >= 0 && size_t(face) < hole.size()) hole[face] = true;
   const bool has_colors = !s.colors.empty() || !s.opacities.empty();
+  const auto& points = s.points;
+  const auto& indices = s.indices;
+  auto per_point = [](const TfToken& interpolation) {
+    return interpolation != UsdGeomTokens->uniform && interpolation != UsdGeomTokens->faceVarying;
+  };
+  const bool by_point = per_point(s.normal_interpolation) && per_point(s.uv_interpolation) && per_point(s.color_interpolation) &&
+    per_point(s.opacity_interpolation) && (s.normal_interpolation == UsdGeomTokens->constant ? !s.normals.empty() : s.normals.size() >= points.size());
   auto element = [](const TfToken& interpolation, int face, int corner, int vertex, size_t size) {
     if (interpolation.IsEmpty()) return -1;
     const int index = element_index(interpolation, face, corner, vertex);
     return index >= 0 && size_t(index) < size ? index : -1;
   };
   std::map<std::string, SurfaceBuffers> surfaces;
-  int corner = 0, flat = 0;
-  const auto& points = s.points;
-  const auto& indices = s.indices;
+  std::vector<SurfaceBuffers*> slots(s.materials.size());
+  int corner = 0;
+  std::vector<std::array<int, 3>> triangles;
   for (size_t face = 0; face < s.counts.size(); ++face) {
     const int count = s.counts[face], first = corner; corner += count;
     if (hole[face]) continue;
-    const auto& material = bound[face_material[face]];
-    const auto& id = s.materials[face_material[face]];
-    if (material && materials.insert(id).second) result["materials"].push_back(material_json(material, result["warnings"]));
-    auto& surface = surfaces[id]; surface.material = material;
-    for (auto triangle : triangulate(points, indices, first, count)) {
+    auto*& slot = slots[face_material[face]];
+    if (!slot) {
+      const auto& material = bound[face_material[face]];
+      const auto& id = s.materials[face_material[face]];
+      if (material && materials.insert(id).second) result["materials"].push_back(material_json(material, result["warnings"]));
+      slot = &surfaces[id]; slot->material = material;
+      if (by_point && slot->by_point.empty()) slot->by_point.assign(points.size(), -1);
+    }
+    auto& surface = *slot;
+    triangulate(points, indices, first, count, triangles);
+    for (auto triangle : triangles) {
       if (s.left_handed) std::swap(triangle[1], triangle[2]);
-      const auto geometric = GfCross(points[indices[triangle[1]]] - points[indices[triangle[0]]], points[indices[triangle[2]]] - points[indices[triangle[0]]]).GetNormalized();
-      const int flat_key = -2 - flat++;
+      std::optional<GfVec3f> geometric;
+      const int flat_key = -2 - int(surface.indices.size() / 3);
       for (int c : triangle) {
         const int vertex = indices[c];
-        const int n = element(s.normal_interpolation, int(face), c, vertex, s.normals.size());
-        const int u = element(s.uv_interpolation, int(face), c, vertex, s.uv.size());
-        const int ci = has_colors ? element(s.color_interpolation, int(face), c, vertex, s.colors.size()) : -1;
-        const int ai = has_colors ? element(s.opacity_interpolation, int(face), c, vertex, s.opacities.size()) : -1;
-        const auto [entry, inserted] = surface.corners.try_emplace({vertex, n >= 0 ? n : flat_key, u, ci, ai}, int32_t(surface.positions.size() / 3));
-        if (inserted) {
-          const auto& point = points[vertex];
-          const auto normal = n >= 0 ? s.normals[n] : geometric;
-          const auto texcoord = u >= 0 ? s.uv[u] : GfVec2f(0);
-          surface.positions.insert(surface.positions.end(), {point[0], point[1], point[2]});
-          surface.normals.insert(surface.normals.end(), {normal[0], normal[1], normal[2]});
-          surface.uvs.insert(surface.uvs.end(), {texcoord[0], texcoord[1]});
-          if (has_colors) surface.colors.push_back(packed_color(ci >= 0 ? s.colors[ci] : GfVec3f(1), ai >= 0 ? s.opacities[ai] : 1.f));
+        const auto next = int32_t(surface.positions.size() / 3);
+        int32_t index = by_point ? surface.by_point[vertex] : -1;
+        const int n = index >= 0 ? 0 : element(s.normal_interpolation, int(face), c, vertex, s.normals.size());
+        if (index < 0 && n < 0 && !geometric)
+          geometric = GfCross(points[indices[triangle[1]]] - points[indices[triangle[0]]], points[indices[triangle[2]]] - points[indices[triangle[0]]]).GetNormalized();
+        if (index < 0) {
+          const int u = element(s.uv_interpolation, int(face), c, vertex, s.uv.size());
+          const int ci = has_colors ? element(s.color_interpolation, int(face), c, vertex, s.colors.size()) : -1;
+          const int ai = has_colors ? element(s.opacity_interpolation, int(face), c, vertex, s.opacities.size()) : -1;
+          bool inserted = true;
+          if (by_point) index = surface.by_point[vertex] = next;
+          else {
+            const auto entry = surface.corners.try_emplace({vertex, n >= 0 ? n : flat_key, u, ci, ai}, next);
+            index = entry.first->second; inserted = entry.second;
+          }
+          if (inserted) {
+            const auto& point = points[vertex];
+            const auto normal = n >= 0 ? s.normals[n] : *geometric;
+            const auto texcoord = u >= 0 ? s.uv[u] : GfVec2f(0);
+            surface.positions.insert(surface.positions.end(), {point[0], point[1], point[2]});
+            surface.normals.insert(surface.normals.end(), {normal[0], normal[1], normal[2]});
+            surface.uvs.insert(surface.uvs.end(), {texcoord[0], texcoord[1]});
+            if (has_colors) surface.colors.push_back(packed_color(ci >= 0 ? s.colors[ci] : GfVec3f(1), ai >= 0 ? s.opacities[ai] : 1.f));
+          }
         }
-        surface.indices.push_back(entry->second);
+        surface.indices.push_back(index);
       }
     }
   }
