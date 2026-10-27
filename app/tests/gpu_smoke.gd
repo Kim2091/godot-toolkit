@@ -68,7 +68,12 @@ func _response(response: Dictionary) -> void:
 		app.renderer.send({"op": "settings", "settings": {"rtx.debugView.debugViewIdx": str(diagnostic_views[0])}})
 	if response.get("request_op") == "frame":
 		presented += 1
-		if presented == 8:
+		# After the restart only the spot light lights the scene. Resending the
+		# scene recreates its lights, which must survive the replaced ones; the
+		# capture waits until temporal history no longer holds the old light.
+		if restarting and presented == 4 and "--diagnostics" not in OS.get_cmdline_user_args():
+			app.renderer.send({"op": "scene", "scene": app.last_scene})
+		if presented == (60 if restarting and "--diagnostics" not in OS.get_cmdline_user_args() else 8):
 			_capture.call_deferred()
 
 func _capture() -> void:
@@ -100,6 +105,17 @@ func _capture() -> void:
 				lit_pixels += 1
 	if lit_pixels < 200:
 		push_error("Viewport contains no rendered geometry: " + str(lit_pixels) + " lit pixels")
+		app.renderer.stop_worker()
+		quit(1)
+		return
+	# Runtimes that log their light BVH builds report the light count the frame used.
+	var analytic: int = app.last_scene.lights.filter(func(light: Dictionary): return light.type != "DomeLight").size()
+	var built := -1
+	for line in FileAccess.get_file_as_string(app.renderer.log_path).split("\n"):
+		if line.contains("[LightBVH] build") and line.contains("lights="):
+			built = line.get_slice("lights=", 1).get_slice(" ", 0).to_int()
+	if built >= 0 and built != analytic:
+		push_error("Remix uses %d of the scene's %d lights" % [built, analytic])
 		app.renderer.stop_worker()
 		quit(1)
 		return

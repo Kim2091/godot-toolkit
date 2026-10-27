@@ -120,8 +120,13 @@ public:
   ~Renderer() {
     if (running_) { clear(); api_.Shutdown(); }
 #ifdef _WIN32
-    if (window_) DestroyWindow(window_);
-    if (library_) FreeLibrary(reinterpret_cast<HMODULE>(library_));
+    // The runtime keeps the window procedure it installed after Shutdown, so
+    // destroying the window or unloading the runtime calls into freed state.
+    // Process exit releases both.
+    if (!running_) {
+      if (window_) DestroyWindow(window_);
+      if (library_) FreeLibrary(reinterpret_cast<HMODULE>(library_));
+    }
 #else
     if (library_) dlclose(library_);
 #endif
@@ -175,6 +180,12 @@ public:
 #ifdef REMIX_PLUS_API
     // The Remix Plus API has no feature query; its runtime resolves unsupported upscalers itself.
     dlss_ = ray_reconstruction_ = !openremix_;
+    if (!openremix_) {
+      retained_api_.create = reinterpret_cast<PFN_remixapi_CreateRetainedInstances>(symbol("remixapi_CreateRetainedInstances"));
+      retained_api_.update = reinterpret_cast<PFN_remixapi_UpdateRetainedInstances>(symbol("remixapi_UpdateRetainedInstances"));
+      retained_api_.destroy = reinterpret_cast<PFN_remixapi_DestroyRetainedInstances>(symbol("remixapi_DestroyRetainedInstances"));
+      retained_api_.draw = reinterpret_cast<PFN_remixapi_DrawRetainedInstances>(symbol("remixapi_DrawRetainedInstances"));
+    }
 #else
     remixapi_FeatureAvailability features{};
     if (!openremix_ && api_.GetFeatureAvailability && api_.GetFeatureAvailability(&features) == REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -300,7 +311,19 @@ public:
 #endif
   }
 #endif
+  void* symbol(const char* name) {
+#ifdef _WIN32
+    return reinterpret_cast<void*>(GetProcAddress(library_, name));
+#else
+    return dlsym(library_, name);
+#endif
+  }
   void clear() {
+#ifdef REMIX_PLUS_API
+    // Retained instances must go before the meshes they draw.
+    if (!retained_.empty()) retained_api_.destroy(retained_.data(), uint32_t(retained_.size()));
+    retained_.clear();
+#endif
     for (auto mesh : meshes_) api_.DestroyMesh(mesh);
     for (auto light : lights_) api_.DestroyLight(light);
     for (const auto& material : materials_) api_.DestroyMaterial(material.second);
@@ -313,6 +336,15 @@ public:
     if (!std::isfinite(meters_per_unit) || meters_per_unit <= 0) throw std::runtime_error("Invalid USD scene units");
     auto scale = std::to_string(0.01 / meters_per_unit);
     if (!openremix_) checked(api_.SetConfigVariable("rtx.sceneScale", scale.c_str()), "Set USD scene scale");
+    // Light handles are the light hashes, and Remix applies DestroyLight only at
+    // the next Present. Destroying a light that this scene creates again would
+    // remove the new light, so only lights missing from the new scene go.
+    auto previous_lights = std::move(lights_);
+    lights_.clear(); light_origins_.clear();
+    auto destroy_replaced = [&] {
+      for (auto light : previous_lights)
+        if (std::find(lights_.begin(), lights_.end(), light) == lights_.end()) api_.DestroyLight(light);
+    };
     clear();
     try {
       Json fallback{{"id", "default"}, {"albedo", {0.7, 0.7, 0.7}}};
@@ -320,9 +352,23 @@ public:
       for (auto& m : scene.at("materials")) material(m);
       for (auto& m : scene.at("meshes")) mesh(m, scene.at("prototypes"));
       for (auto& light : scene.at("lights")) add_light(light);
+      destroy_replaced();
       revision_ = scene.at("revision").get<uint64_t>();
       geometry_revision_ = scene.value("geometry_revision", revision_);
-    } catch (...) { clear(); throw; }
+      retain_instances();
+    } catch (...) { destroy_replaced(); clear(); throw; }
+  }
+  // Registers the scene's draws once, so frames replay them with one call.
+  void retain_instances() {
+#ifdef REMIX_PLUS_API
+    if (!retained_api_ || instances_.empty()) return;
+    std::vector<remixapi_InstanceInfo> infos(instances_);
+    for (size_t i = 0; i < infos.size(); ++i) infos[i].pNext = &blend_states_[i];
+    std::vector<uint64_t> handles(infos.size());
+    auto code = retained_api_.create(infos.data(), uint32_t(infos.size()), handles.data());
+    if (code == REMIXAPI_ERROR_CODE_SUCCESS) retained_ = std::move(handles);
+    else std::cerr << "Retained instances unavailable (Remix code " << code << "); drawing per frame\n";
+#endif
   }
   void camera(const Json& data) { camera_ = data; }
   Json update_lights(const Json& request) {
@@ -370,14 +416,23 @@ public:
       if (!std::isfinite(value)) throw std::runtime_error("Non-finite preview transform");
     auto matches = [&](const std::string& id) { return id == path || id.rfind(path + "/", 0) == 0; };
     size_t updated = 0;
+#ifdef REMIX_PLUS_API
+    std::vector<remixapi_RetainedInstanceUpdate> retained;
+#endif
     for (size_t i = 0; i < instances_.size(); ++i) if (matches(instance_origins_[i].first)) {
       instances_[i].transform = transformed(delta, instance_origins_[i].second);
       bool moving = false;
       for (unsigned row = 0; row < 3; ++row) for (unsigned col = 0; col < 4; ++col)
         moving |= instances_[i].transform.matrix[row][col] != instance_origins_[i].second.matrix[row][col];
       if (moving) moving_instances_.insert(i); else moving_instances_.erase(i);
+#ifdef REMIX_PLUS_API
+      if (!retained_.empty()) retained.push_back({retained_[i], instances_[i].transform, REMIXAPI_RETAINED_UPDATE_TRANSFORM, true});
+#endif
       ++updated;
     }
+#ifdef REMIX_PLUS_API
+    if (!retained.empty()) checked(retained_api_.update(retained.data(), uint32_t(retained.size())), "UpdateRetainedInstances");
+#endif
     for (size_t i = 0; i < lights_.size(); ++i) if (matches(light_origins_[i].at("id").get<std::string>())) {
       // Remix keys lights by hash: creating the same ID updates its definition.
       // Always transform the baseline, so preview deltas never accumulate.
@@ -431,7 +486,13 @@ public:
     remixapi_CameraInfo camera{};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO; camera.pNext = &parameters; camera.type = REMIXAPI_CAMERA_TYPE_WORLD;
     checked(api_.SetupCamera(&camera), "SetupCamera");
-    for (size_t i = 0; i < instances_.size(); ++i) {
+#ifdef REMIX_PLUS_API
+    const bool replay = !retained_.empty();
+    if (replay) checked(retained_api_.draw(nullptr), "DrawRetainedInstances");
+#else
+    const bool replay = false;
+#endif
+    for (size_t i = 0; !replay && i < instances_.size(); ++i) {
       // Attach only for the call: vector growth and transform previews must not
       // leave stored pNext pointers referring to moved or expired extensions.
       auto instance = instances_[i]; instance.pNext = &blend_states_[i];
@@ -660,6 +721,16 @@ private:
   PFN_remixapi_GetShadowStatisticsEXT query_shadows_ = nullptr;
   PFN_remixapi_GetLocalLightStatisticsEXT query_local_lights_ = nullptr;
   remixapi_ErrorCode (*query_reconstruction_)(remixapi_ReconstructionDiagnosticsEXT*) = nullptr;
+#ifdef REMIX_PLUS_API
+  struct RetainedApi {
+    PFN_remixapi_CreateRetainedInstances create = nullptr;
+    PFN_remixapi_UpdateRetainedInstances update = nullptr;
+    PFN_remixapi_DestroyRetainedInstances destroy = nullptr;
+    PFN_remixapi_DrawRetainedInstances draw = nullptr;
+    explicit operator bool() const { return create && update && destroy && draw; }
+  } retained_api_;
+  std::vector<uint64_t> retained_;
+#endif
   Json effective_settings_;
   studio::RenderSettings requested_settings_;
   bool openremix_ = false, pathtrace_ = false, fsr_ = false, nrd_ = false, taa_ = false;
