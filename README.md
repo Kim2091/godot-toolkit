@@ -2,7 +2,7 @@
 
 A standalone Godot application for authoring RTX Remix replacements in OpenUSD. The document stays in USD; a separate Remix or OpenRemix worker renders the viewport. It does not use Omniverse Kit.
 
-This is an initial implementation, not full Toolkit parity. The embedded Vulkan viewport currently targets Linux x86_64. The editor and worker have Windows code paths, but Windows shared-frame transport and Windows builds have not been validated.
+This is an initial implementation, not full Toolkit parity. The embedded Vulkan viewport targets Linux x86_64 and, with a Remix Plus runtime, Windows x64. Other Windows runtimes use a separate preview window.
 
 ## Build and run
 
@@ -239,9 +239,15 @@ meson compile -C _Comp64Release d3d9
 meson install -C _Comp64Release --no-rebuild --tags output
 ```
 
-This stages the runtime in `_output`. The two narrow linker exclusions handle missing vendor PDB files and an unused delay-load declaration; other warnings remain errors. Build the `d3d9` target explicitly: the optional Hydra demo application at this revision has a separate `LNK4098` C-runtime conflict. The standalone Godot editor's Windows viewport transport is still unvalidated.
+This stages the runtime in `_output`. The two narrow linker exclusions handle missing vendor PDB files and an unused delay-load declaration; other warnings remain errors. Build the `d3d9` target explicitly: the optional Hydra demo application at this revision has a separate `LNK4098` C-runtime conflict.
 
-Windows currently has a separate native Remix preview window fallback. Windows external memory/handle transport and embedded viewport validation are still outstanding. The portable application bundle currently targets Linux only.
+The embedded Windows viewport needs a runtime that exports its output image through `remixapi_ConfigureExternalFrame`, which [Remix Plus](https://github.com/Kim2091/dxvk-remix) provides from rc2. Build the renderer worker against that runtime's API headers:
+
+```powershell
+cmake -B build -DREMIX_API_INCLUDE_DIR=/path/to/remix-plus/public/include -DREMIX_PLUS_API=ON
+```
+
+The runtime shares the image and two semaphores with the editor as Vulkan external memory (Win32 NT handles). With Remix Plus, the worker also draws the scene through retained instances, one call per frame. Other Windows runtimes, including OpenRemix, fall back to a separate native preview window until they provide an equivalent export. The portable application bundle currently targets Linux only.
 
 ## Validation
 
