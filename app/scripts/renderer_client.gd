@@ -1,6 +1,6 @@
 extends Node
 
-const PROTOCOL_VERSION := 2
+const PROTOCOL_VERSION := 3
 const MAX_FRAME_BYTES := 64 * 1024 * 1024
 const MORE_FRAMES := 0x80000000
 const JsonStream = preload("res://scripts/json_stream.gd")
@@ -111,8 +111,8 @@ func _exchange_loop(worker_generation: int) -> void:
 		if message.is_empty():
 			OS.delay_msec(4)
 			continue
-		# Preserve the existing wire format, but serialize scenes incrementally
-		# so neither Godot's String limit nor a second full payload copy applies.
+		# Serialize scenes incrementally so Godot's String limit never applies.
+		# Packed geometry travels as binary frames after the JSON text.
 		if not JsonStream.new().write(pipe, message, MAX_FRAME_BYTES, _is_stopping):
 			if not _is_stopping():
 				_deliver.call_deferred({"ok": false, "error": "Renderer disconnected during transfer. Unsaved document edits are retained."}, worker_generation)

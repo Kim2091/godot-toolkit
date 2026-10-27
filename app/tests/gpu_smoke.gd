@@ -43,14 +43,16 @@ func _run() -> void:
 	if "--light-below" in OS.get_cmdline_user_args():
 		app._command({"op": "transform", "path": app.selection, "translation": [0, -3, 0]})
 	app.viewport.frame_selection(true)
-	# Captured NaN/Inf UVs become null in JSON and must not abort the scene load.
-	app.last_scene.meshes[0].surfaces[0].vertices[0][6] = null
-	app.last_scene.meshes[0].surfaces[0].vertices[1][7] = null
+	# Captured NaN/Inf UVs must not abort the scene load.
+	var uvs: PackedVector2Array = app.last_scene.prototypes[0].surfaces[0].uvs
+	uvs[0] = Vector2(NAN, uvs[0].y); uvs[1] = Vector2(uvs[1].x, INF)
+	app.last_scene.prototypes[0].surfaces[0].uvs = uvs
 	if not restarting:
 		app.last_scene.materials.append({"id": "smoke_emission", "albedo": [1, 0.2, 0.1], "emissive": [1, 0.2, 0.1], "emissive_intensity": 10})
 		for mesh in app.last_scene.meshes:
 			mesh.double_sided = false
-			for surface in mesh.surfaces:
+		for prototype in app.last_scene.prototypes:
+			for surface in prototype.surfaces:
 				surface.material = "smoke_emission"
 	app.renderer.response_received.connect(_response)
 	app.renderer.status_changed.connect(func(message: String): print(message))
@@ -129,8 +131,8 @@ func _capture() -> void:
 		restarting = true
 		presented = 0
 		app.last_scene.materials.clear()
-		for mesh in app.last_scene.meshes:
-			for surface in mesh.surfaces:
+		for prototype in app.last_scene.prototypes:
+			for surface in prototype.surfaces:
 				surface.material = "default"
 		app.render_toggle.button_pressed = false
 		app.render_toggle.button_pressed = true

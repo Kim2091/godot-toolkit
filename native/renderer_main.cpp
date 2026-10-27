@@ -6,6 +6,7 @@
 #include "openremix/remix_reconstruction_ext.h"
 #include "alpha_state.h"
 #include "render_categories.h"
+#include "scene_buffers.h"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -34,6 +35,17 @@ uint64_t hash64(const std::string& value) {
   uint64_t h = 14695981039346656037ull;
   for (unsigned char c : value) { h ^= c; h *= 1099511628211ull; }
   return h ? h : 1;
+}
+template<typename Bytes> uint64_t hash_bytes(uint64_t h, const Bytes& bytes) {
+  for (unsigned char c : bytes) { h ^= c; h *= 1099511628211ull; }
+  return h;
+}
+// Describes every binary value of a message, so transports can be verified without a GPU.
+void describe_buffers(const Json& value, Json& result) {
+  if (value.is_binary()) {
+    const auto& bytes = value.get_binary();
+    result.push_back({{"type", editor::buffer_type_name(bytes.has_subtype() ? bytes.subtype() : 0)}, {"size", bytes.size()}, {"hash", hash_bytes(14695981039346656037ull, bytes)}});
+  } else if (value.is_structured()) for (const auto& item : value) describe_buffers(item, result);
 }
 remixapi_Float3D vector3(const Json& v) { return {v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()}; }
 remixapi_InstanceInfoBlendEXT blend_state(const Json& values) {
@@ -218,7 +230,7 @@ public:
       Json fallback{{"id", "default"}, {"albedo", {0.7, 0.7, 0.7}}};
       material(fallback);
       for (auto& m : scene.at("materials")) material(m);
-      for (auto& m : scene.at("meshes")) mesh(m);
+      for (auto& m : scene.at("meshes")) mesh(m, scene.at("prototypes"));
       for (auto& light : scene.at("lights")) add_light(light);
       revision_ = scene.at("revision").get<uint64_t>();
       geometry_revision_ = scene.value("geometry_revision", revision_);
@@ -442,71 +454,69 @@ private:
     checked(api_.CreateMaterial(&info, &handle), "CreateMaterial");
     materials_.emplace(data.at("id").get<std::string>(), handle);
   }
-  void mesh(const Json& data) {
-    const auto groups = editor::category_surface_groups(data);
-    if (groups.size() == 1) {
-      mesh_group(data, groups.begin()->first);
-      return;
-    }
-    for (const auto& [flags, indices] : groups) {
-      // Keep the USD id on every group so selection transform previews still
-      // move all material subsets together.
-      Json group = Json::object();
-      for (auto item = data.begin(); item != data.end(); ++item)
-        if (item.key() != "surfaces") group[item.key()] = item.value();
-      group["surfaces"] = Json::array();
-      for (auto index : indices) group["surfaces"].push_back(data.at("surfaces").at(index));
-      mesh_group(group, flags);
+  // Each category group of an instance draws its own Remix mesh. Instances
+  // share one mesh per prototype and surface selection.
+  void mesh(const Json& data, const Json& prototypes) {
+    const auto index = data.at("prototype").get<size_t>();
+    const auto& prototype = prototypes.at(index);
+    if (data.at("surfaces").size() != prototype.at("surfaces").size()) throw std::runtime_error("Mesh surfaces do not match their prototype");
+    for (const auto& [flags, selection] : editor::category_surface_groups(data)) {
+      // Keep hidden/ignored geometry in the editor snapshot, but do not submit
+      // it. The native runtime can allocate a zero-sized material buffer when
+      // its first frame contains only hidden surfaces.
+      if (flags & (REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN | REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE)) continue;
+      auto cached = mesh_cache_.find({index, selection});
+      if (cached == mesh_cache_.end()) cached = mesh_cache_.emplace(std::make_pair(index, selection), create_mesh(prototype, selection)).first;
+      // The USD id stays on every group, so transform previews move all subsets together.
+      if (cached->second) add_instance(data, cached->second, flags);
     }
   }
-  void mesh_group(const Json& data, uint32_t flags) {
-    // Keep hidden/ignored geometry in the editor snapshot, but do not submit
-    // it. The native runtime can allocate a zero-sized material buffer when
-    // its first frame contains only hidden surfaces.
-    if (flags & (REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN | REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE)) return;
-    const auto geometry_hash = hash64(data.at("surfaces").dump());
-    if (auto cached = mesh_cache_.find(geometry_hash); cached != mesh_cache_.end()) {
-      add_instance(data, cached->second, flags);
-      return;
-    }
+  remixapi_MeshHandle create_mesh(const Json& prototype, const std::vector<size_t>& selection) {
     std::vector<std::vector<remixapi_HardcodedVertex>> vertices;
     std::vector<std::vector<uint32_t>> indices;
     std::vector<remixapi_MeshInfoSurfaceTriangles> surfaces;
-    for (const auto& surface : data.at("surfaces")) {
-      vertices.emplace_back(); indices.push_back(surface.at("indices").get<std::vector<uint32_t>>());
-      const auto colors = surface.value("colors", Json::array());
-      if (!colors.empty() && colors.size() != surface.at("vertices").size()) throw std::runtime_error("Invalid mesh vertex colors");
-      for (const auto& v : surface.at("vertices")) {
-        if (v.size() != 8) throw std::runtime_error("Invalid mesh vertex");
-        remixapi_HardcodedVertex vertex{};
-        for (int i = 0; i < 3; ++i) { vertex.position[i] = v[i].get<float>(); vertex.normal[i] = v[i + 3].get<float>(); }
-        // Some captures contain NaN/Inf UVs, serialized as JSON null. Keep the
-        // mesh renderable with a zero fallback for just the invalid component.
-        for (int i = 0; i < 2; ++i) {
-          const auto uv = v[i + 6].is_null() ? 0.f : v[i + 6].get<float>();
-          vertex.texcoord[i] = std::isfinite(uv) ? uv : 0.f;
-        }
+    uint64_t geometry_hash = 14695981039346656037ull;
+    for (auto index : selection) {
+      const auto& surface = prototype.at("surfaces").at(index);
+      const auto positions = editor::read_buffer<float>(surface.at("positions"));
+      const auto normals = editor::read_buffer<float>(surface.at("normals"));
+      const auto uvs = editor::read_buffer<float>(surface.at("uvs"));
+      const auto colors = surface.contains("colors") ? editor::read_buffer<uint32_t>(surface.at("colors")) : std::vector<uint32_t>();
+      const size_t count = positions.size() / 3;
+      if (positions.size() % 3 || normals.size() != positions.size() || uvs.size() != count * 2 || (!colors.empty() && colors.size() != count))
+        throw std::runtime_error("Invalid mesh vertex data");
+      indices.push_back(editor::read_buffer<uint32_t>(surface.at("indices")));
+      if (indices.back().size() % 3) throw std::runtime_error("Mesh indices must form triangles");
+      const auto& material = surface.at("material").get_ref<const std::string&>();
+      for (const auto* name : {"positions", "normals", "uvs", "colors", "indices"})
+        if (surface.contains(name)) geometry_hash = hash_bytes(geometry_hash, surface.at(name).get_binary());
+      geometry_hash = hash_bytes(geometry_hash, material);
+      vertices.emplace_back(count);
+      for (size_t v = 0; v < count; ++v) {
+        auto& vertex = vertices.back()[v];
+        for (int i = 0; i < 3; ++i) { vertex.position[i] = positions[v * 3 + i]; vertex.normal[i] = normals[v * 3 + i]; }
+        // Some captures contain NaN/Inf UVs. Keep the mesh renderable with a
+        // zero fallback for just the invalid component.
+        for (int i = 0; i < 2; ++i) vertex.texcoord[i] = std::isfinite(uvs[v * 2 + i]) ? uvs[v * 2 + i] : 0.f;
         // Match Remix's USD importer: captures store V flipped from runtime texture coordinates.
         vertex.texcoord[1] = 1.f - vertex.texcoord[1];
-        vertex.color = colors.empty() ? 0xffffffffu : colors.at(vertices.back().size()).get<uint32_t>();
-        vertices.back().push_back(vertex);
+        vertex.color = colors.empty() ? 0xffffffffu : colors[v];
       }
-      for (auto index : indices.back()) if (index >= vertices.back().size()) throw std::runtime_error("Mesh index is out of bounds");
+      for (auto i : indices.back()) if (i >= count) throw std::runtime_error("Mesh index is out of bounds");
       // USD uses counter-clockwise fronts; the Remix external mesh API uses clockwise fronts.
       for (size_t i = 0; i + 2 < indices.back().size(); i += 3) std::swap(indices.back()[i + 1], indices.back()[i + 2]);
       remixapi_MeshInfoSurfaceTriangles info{};
       info.vertices_values = vertices.back().data(); info.vertices_count = vertices.back().size();
       info.indices_values = indices.back().data(); info.indices_count = indices.back().size();
-      info.material = materials_.at(surface.at("material").get<std::string>());
+      info.material = materials_.at(material);
       surfaces.push_back(info);
     }
-    if (surfaces.empty()) return;
+    if (surfaces.empty()) return {};
     remixapi_MeshInfo info{}; info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-    info.hash = geometry_hash; info.surfaces_values = surfaces.data(); info.surfaces_count = uint32_t(surfaces.size());
+    info.hash = geometry_hash ? geometry_hash : 1; info.surfaces_values = surfaces.data(); info.surfaces_count = uint32_t(surfaces.size());
     remixapi_MeshHandle handle{};
     checked(api_.CreateMesh(&info, &handle), "CreateMesh"); meshes_.push_back(handle);
-    mesh_cache_[geometry_hash] = handle;
-    add_instance(data, handle, flags);
+    return handle;
   }
   void add_instance(const Json& data, remixapi_MeshHandle handle, uint32_t flags) {
     remixapi_InstanceInfo instance{}; instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -581,7 +591,7 @@ private:
   Json render_variables_ = Json::object();
   std::map<std::string, remixapi_MaterialHandle> materials_;
   std::vector<remixapi_MeshHandle> meshes_;
-  std::map<uint64_t, remixapi_MeshHandle> mesh_cache_;
+  std::map<std::pair<size_t, std::vector<size_t>>, remixapi_MeshHandle> mesh_cache_;
   std::vector<remixapi_InstanceInfo> instances_;
   std::vector<remixapi_InstanceInfoBlendEXT> blend_states_;
   std::vector<std::pair<std::string, remixapi_Transform>> instance_origins_;
@@ -621,6 +631,7 @@ int main() {
         else if (op == "settings") renderer.settings(request.at("settings"));
         else if (op == "render_settings") response["result"] = renderer.render_settings(request.at("settings"));
         else if (op == "frame") response["result"] = renderer.frame();
+        else if (op == "inspect_buffers") { response["result"] = Json::array(); describe_buffers(request.value("data", Json()), response["result"]); }
         else if (op == "shutdown") shutdown = true;
         else throw std::runtime_error("Unknown renderer operation: " + op);
       } catch (const std::exception& error) { response["ok"] = false; response["error"] = error.what(); }
