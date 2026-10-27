@@ -142,11 +142,16 @@ public:
     info.combineGuiInFinalColor = false;
     checked(api_.Startup(&info), "Startup");
     running_ = true;
+#ifdef REMIX_PLUS_API
+    // The Remix Plus API has no feature query; its runtime resolves unsupported upscalers itself.
+    dlss_ = ray_reconstruction_ = !openremix_;
+#else
     remixapi_FeatureAvailability features{};
     if (!openremix_ && api_.GetFeatureAvailability && api_.GetFeatureAvailability(&features) == REMIXAPI_ERROR_CODE_SUCCESS) {
       dlss_ = (features.availableFeatures & REMIXAPI_FEATURE_DLSS_SUPER_RESOLUTION_BIT) != 0;
       ray_reconstruction_ = dlss_ && (features.availableFeatures & REMIXAPI_FEATURE_DLSS_RAY_RECONSTRUCTION_BIT) != 0;
     }
+#endif
 #ifndef _WIN32
     if (openremix_) {
       auto backend = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(dlsym(library_, "remixapi_GetBackendCapabilitiesEXT"));
