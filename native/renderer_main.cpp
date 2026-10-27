@@ -27,6 +27,27 @@
 
 using Json = nlohmann::json;
 static_assert(sizeof(EditorSharedFrame) == sizeof(remixapi_EditorSharedFrame));
+#if defined(_WIN32) && defined(REMIX_PLUS_API)
+#ifndef REMIXAPI_EXTERNAL_FRAME_VERSION
+// Remix Plus external frame export, for headers that do not declare it yet.
+#define REMIXAPI_EXTERNAL_FRAME_VERSION 1u
+#define REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT ((remixapi_StructType)0x4E560003)
+#define REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE ((remixapi_ErrorCode)0x4E560001)
+typedef struct remixapi_ExternalFrameEXT {
+  remixapi_StructType sType; void* pNext;
+  uint32_t version;
+  uint32_t width, height;
+  uint32_t format;
+  uint32_t memoryTypeIndex;
+  uint64_t allocationSize;
+  uint8_t deviceUUID[16];
+  void* memoryHandle;
+  void* readySemaphore;
+  void* releasedSemaphore;
+} remixapi_ExternalFrameEXT;
+#endif
+using ConfigureExternalFrame = remixapi_ErrorCode(REMIXAPI_CALL*)(remixapi_ExternalFrameEXT*);
+#endif
 namespace {
 void checked(remixapi_ErrorCode code, const char* operation) {
   if (code != REMIXAPI_ERROR_CODE_SUCCESS) throw std::runtime_error(std::string(operation) + " failed (Remix code " + std::to_string(code) + ")");
@@ -84,6 +105,11 @@ remixapi_Transform transformed(const remixapi_Transform& delta, const remixapi_T
 #ifdef _WIN32
 using NativePath = std::wstring;
 NativePath native_path(const std::string& value) { return std::filesystem::u8path(value).wstring(); }
+LRESULT CALLBACK preview_window_procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  // The swapchain follows the client area, so it may exceed the desktop size.
+  if (message == WM_GETMINMAXINFO) { reinterpret_cast<MINMAXINFO*>(lparam)->ptMaxTrackSize = {16384, 16384}; return 0; }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
 #else
 using NativePath = std::string;
 NativePath native_path(const std::string& value) { return value; }
@@ -119,12 +145,16 @@ public:
     }
     if (width_ < 16 || height_ < 16 || width_ > 8192 || height_ > 8192) throw std::runtime_error("Invalid viewport size");
 #ifdef _WIN32
+    // An exported frame replaces the preview window, which stays hidden but keeps its swapchain.
+    const bool export_frame = message.contains("frame_process");
     const wchar_t* class_name = L"GodotRemixRenderer";
-    WNDCLASSW window_class{}; window_class.lpfnWndProc = DefWindowProcW;
+    WNDCLASSW window_class{}; window_class.lpfnWndProc = preview_window_procedure;
     window_class.hInstance = GetModuleHandleW(nullptr); window_class.lpszClassName = class_name;
     RegisterClassW(&window_class);
-    window_ = CreateWindowExW(0, class_name, L"Remix render preview", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-      CW_USEDEFAULT, CW_USEDEFAULT, int(width_), int(height_), nullptr, nullptr, window_class.hInstance, nullptr);
+    RECT bounds{0, 0, LONG(width_), LONG(height_)};
+    AdjustWindowRect(&bounds, WS_OVERLAPPEDWINDOW, FALSE);
+    window_ = CreateWindowExW(0, class_name, L"Remix render preview", WS_OVERLAPPEDWINDOW | (export_frame ? 0 : WS_VISIBLE),
+      CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left, bounds.bottom - bounds.top, nullptr, nullptr, window_class.hInstance, nullptr);
     if (!window_) throw std::runtime_error("Could not create renderer window");
     info.hwnd = reinterpret_cast<remixapi_HWND>(window_);
 #else
@@ -199,6 +229,12 @@ public:
       if (sendmsg(connection, &message, MSG_NOSIGNAL) != sizeof(frame)) throw std::runtime_error("Could not send GPU frame handles");
       shared_ = true;
     }
+#else
+    Json exported, export_error;
+    if (export_frame) {
+      try { exported = export_frame_to(message.at("frame_process").get<uint32_t>()); shared_ = true; }
+      catch (const std::exception& error) { export_error = error.what(); ShowWindow(window_, SW_SHOWNORMAL); }
+    }
 #endif
     if (!openremix_) {
     checked(api_.SetConfigVariable("rtx.fallbackLightMode", "0"), "Disable fallback lighting");
@@ -214,9 +250,56 @@ public:
     camera_ = {{"position", {0, 2, 5}}, {"forward", {0, 0, -1}}, {"up", {0, 1, 0}}, {"right", {1, 0, 0}}, {"fov", 60.0}};
     Json result{{"status", "ready"}, {"presentation", shared_ ? "shared_vulkan" : "native_window"}, {"width", width_}, {"height", height_},
       {"capabilities", {{"dlss", dlss_}, {"ray_reconstruction", ray_reconstruction_}, { "nis", nis_}, {"fsr31", fsr_}, {"pathtrace", pathtrace_}, {"nrd", nrd_}, {"taa", taa_}, {"renderer", renderer}}}};
+#ifdef _WIN32
+    if (shared_) result["frame"] = exported;
+    if (!export_error.is_null()) result["frame_error"] = export_error;
+#endif
     if (message.contains("render_settings")) result["render_settings"] = render_settings(message.at("render_settings"));
     return result;
   }
+#ifdef _WIN32
+  // Exports the runtime's output image and semaphores into the editor process.
+  // The editor owns the duplicated NT handles; the worker closes its own.
+  Json export_frame_to(DWORD process_id) {
+#ifdef REMIX_PLUS_API
+    auto configure = reinterpret_cast<ConfigureExternalFrame>(GetProcAddress(library_, "remixapi_ConfigureExternalFrame"));
+    if (!configure) throw std::runtime_error("The runtime does not export editor frames");
+    remixapi_ExternalFrameEXT frame{};
+    frame.sType = REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT; frame.version = REMIXAPI_EXTERNAL_FRAME_VERSION;
+    auto code = configure(&frame);
+    HANDLE handles[]{frame.memoryHandle, frame.readySemaphore, frame.releasedSemaphore};
+    struct Owned { HANDLE* h; ~Owned() { for (int i = 0; i < 3; ++i) if (h[i]) CloseHandle(h[i]); } } owned{handles};
+    if (code == REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE)
+      throw std::runtime_error("The runtime cannot export editor frames on this GPU or with this output format");
+    if (code != REMIXAPI_ERROR_CODE_SUCCESS) throw std::runtime_error("The runtime could not export editor frames (Remix code " + std::to_string(code) + ")");
+    try {
+      if (!handles[0] || !handles[1] || !handles[2]) throw std::runtime_error("The runtime returned no frame handles");
+      constexpr uint32_t rgba8_unorm = 37;
+      if (frame.format != rgba8_unorm) throw std::runtime_error("The runtime exported an unsupported frame format");
+      if (frame.width != width_ || frame.height != height_)
+        throw std::runtime_error("The runtime exported a " + std::to_string(frame.width) + "x" + std::to_string(frame.height) + " frame instead of " +
+          std::to_string(width_) + "x" + std::to_string(height_));
+      HANDLE process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, process_id);
+      if (!process) throw std::runtime_error("Could not open the editor process (error " + std::to_string(GetLastError()) + ")");
+      struct Process { HANDLE h; ~Process() { CloseHandle(h); } } process_owner{process};
+      HANDLE shared[3]{};
+      for (int i = 0; i < 3; ++i) if (!DuplicateHandle(GetCurrentProcess(), handles[i], process, &shared[i], 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        auto error = GetLastError();
+        for (int j = 0; j < i; ++j) DuplicateHandle(process, shared[j], nullptr, nullptr, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        throw std::runtime_error("Could not share frame handles with the editor (error " + std::to_string(error) + ")");
+      }
+      static const char digits[] = "0123456789abcdef";
+      std::string uuid;
+      for (auto byte : frame.deviceUUID) { uuid += digits[byte >> 4]; uuid += digits[byte & 15]; }
+      return {{"width", frame.width}, {"height", frame.height}, {"memory_type", frame.memoryTypeIndex}, {"allocation_size", frame.allocationSize},
+        {"device_uuid", uuid}, {"memory", uint64_t(uintptr_t(shared[0]))}, {"ready", uint64_t(uintptr_t(shared[1]))}, {"released", uint64_t(uintptr_t(shared[2]))}};
+    } catch (...) { configure(nullptr); throw; }
+#else
+    (void)process_id;
+    throw std::runtime_error("This renderer build cannot export frames to the editor");
+#endif
+  }
+#endif
   void clear() {
     for (auto mesh : meshes_) api_.DestroyMesh(mesh);
     for (auto light : lights_) api_.DestroyLight(light);
@@ -612,7 +695,11 @@ private:
 
 int main() {
 #ifdef _WIN32
+#ifdef REMIX_PLUS_API
+  constexpr bool shared_frames = true;
+#else
   constexpr bool shared_frames = false;
+#endif
   editor::Channel channel(reinterpret_cast<intptr_t>(GetStdHandle(STD_INPUT_HANDLE)), reinterpret_cast<intptr_t>(GetStdHandle(STD_OUTPUT_HANDLE)));
 #else
   constexpr bool shared_frames = true;

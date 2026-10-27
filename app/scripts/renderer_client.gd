@@ -6,6 +6,7 @@ const MORE_FRAMES := 0x80000000
 const JsonStream = preload("res://scripts/json_stream.gd")
 
 signal status_changed(message: String)
+signal failed(message: String)
 signal response_received(response: Dictionary)
 signal texture_ready(texture: Texture2D)
 signal frame_presented(context: Dictionary)
@@ -44,6 +45,7 @@ func start_worker(executable: String, library: String, render_settings: Dictiona
 	if process.is_empty():
 		is_starting = false
 		status_changed.emit("Could not start the renderer worker.")
+		failed.emit("Could not start the renderer worker: " + executable)
 		return
 	stopping = false
 	if gpu == null:
@@ -58,17 +60,23 @@ func start_worker(executable: String, library: String, render_settings: Dictiona
 		gpu.failed.connect(func(message: String):
 			is_ready = false
 			is_starting = false
-			status_changed.emit(message))
+			status_changed.emit(message)
+			failed.emit(message))
 	var endpoint: String = gpu.open_channel()
-	shared_frames = not endpoint.is_empty()
+	# Windows workers duplicate their frame handles into this process instead of using a channel.
+	var rd := RenderingServer.get_rendering_device()
+	var exportable := OS.get_name() == "Windows" and rd != null and rd.has_method("texture_copy_from_external")
+	shared_frames = not endpoint.is_empty() or exportable
 	writer = Thread.new()
 	writer.start(_exchange_loop.bind(generation))
 	log_reader = Thread.new()
 	log_reader.start(_read_log)
 	var start := {"op": "start", "library": library, "renderer": renderer_id, "width": output_size.x, "height": output_size.y}
 	if not render_settings.is_empty(): start["render_settings"] = render_settings.duplicate(true)
-	if shared_frames:
+	if not endpoint.is_empty():
 		start["frame_channel"] = endpoint
+	elif exportable:
+		start["frame_process"] = OS.get_process_id()
 	send(start)
 	status_changed.emit("Starting %s…" % ("OpenRemix" if renderer_id == "openremix" else "Remix"))
 
@@ -166,15 +174,19 @@ func _deliver(response: Dictionary, worker_generation: int) -> void:
 		is_starting = false
 		frame_pending = false
 		status_changed.emit(response.get("error", "Renderer failed."))
+		failed.emit(response.get("error", "Renderer failed."))
 	elif response.get("request_op") == "start":
 		capabilities = response.get("result", {}).get("capabilities", {})
 		effective_settings = response.get("result", {}).get("render_settings", {})
+		var result: Dictionary = response.get("result", {})
+		shared_frames = shared_frames and result.get("presentation") == "shared_vulkan"
 		if shared_frames:
-			gpu.import_frame()
+			gpu.import_frame(result.get("frame", {}))
 		else:
 			is_ready = true
 			is_starting = false
-			status_changed.emit("Renderer preview running in its native window")
+			var reason: String = result.get("frame_error", "")
+			status_changed.emit("Renderer preview running in its native window" + ("" if reason.is_empty() else " (%s)" % reason))
 	elif response.get("request_op") == "render_settings":
 		effective_settings = response.get("result", {})
 	elif response.get("request_op") == "frame":
